@@ -25,7 +25,10 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 
 	// StateVersion names the shape of S as stored in snapshots. Change it
 	// whenever S changes shape; snapshots of any other version are ignored and
-	// state is rebuilt from events. Empty disables snapshots.
+	// state is rebuilt from events. Each version keeps its own snapshot, so
+	// processes running different versions side by side don't evict each
+	// other's; those of retired versions can be deleted. Empty disables
+	// snapshots.
 	StateVersion string
 	// SnapshotEvery is how many entries may accumulate past the last snapshot
 	// before another is taken. Defaults to 100.
@@ -142,7 +145,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) load(ctx context.Context, q querier, id str
 			snapSeq int64
 			data    []byte
 		)
-		err := q.QueryRow(ctx, `SELECT seq, state FROM cairn.snapshots WHERE stream = $1 AND version = $2`,
+		err := q.QueryRow(ctx, `SELECT seq, state FROM cairn.state_snapshots WHERE stream = $1 AND version = $2`,
 			stream.String(), a.StateVersion).Scan(&snapSeq, &data)
 		switch {
 		case err == nil && snapSeq <= seq:
@@ -269,9 +272,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) maybeSnapshot(ctx context.Context, tx *Tx, 
 		return fmt.Errorf("cairn: encoding snapshot of %s: %w", at.Stream, err)
 	}
 	if _, err := tx.Exec(ctx, `
-INSERT INTO cairn.snapshots (stream, seq, version, state) VALUES ($1, $2, $3, $4)
-ON CONFLICT (stream) DO UPDATE SET seq = excluded.seq, version = excluded.version,
-    state = excluded.state, taken_at = now()`,
+INSERT INTO cairn.state_snapshots (stream, seq, version, state) VALUES ($1, $2, $3, $4)
+ON CONFLICT (stream, version) DO UPDATE SET seq = excluded.seq, state = excluded.state, taken_at = now()`,
 		at.Stream.String(), at.Seq, a.StateVersion, data); err != nil {
 		return fmt.Errorf("cairn: saving snapshot of %s: %w", at.Stream, err)
 	}
