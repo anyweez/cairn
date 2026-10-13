@@ -290,6 +290,15 @@ removed, went back a version, changed shape without a version bump, or was
 bumped without an upcaster from each earlier version. Any of these would
 leave entries already in the ledger unreadable.
 
+## Performance
+
+`Handle` costs two round trips to Postgres, and one stream's lock is held for
+about one and a half of them, so throughput depends mostly on the link's
+latency and the connection pool's size. Set the pool size explicitly:
+pgxpool's default of 4 connections caps throughput long before anything else.
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) explains how to size a deployment,
+and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the measurements.
+
 ## Working on cairn
 
 ```sh
