@@ -11,6 +11,7 @@ measurements and how to reproduce them.
 | Call | Round trips |
 |---|---|
 | `Handle` | 2 |
+| `Handle` with a `Cache` holding the stream | 1, shared by the messages recorded together |
 | `Handle` with an idempotency key that matches | 2 |
 | `Load` | 1 |
 | `Transact` with `Lock`, `LoadLocked` and `Apply` on one stream | 5 |
@@ -40,6 +41,48 @@ That's about 160/s at a 3 ms round trip, and about 110/s at 6 ms. Different
 streams don't share a lock, so total throughput is limited by connections
 instead.
 
+## With a state cache
+
+Set `Aggregate.Cache` to a `ledger.NewStateCache(n)` to keep the state of up to
+`n` streams in memory. Each stream then has a lane in the process, and its
+messages are recorded one transaction at a time:
+
+- **A cached stream costs one round trip.** Its message is decided as soon as
+  it is its turn. One batch then begins the transaction, locks the stream on
+  condition that it is still at the cached seq (`cairn.lock_stream_at`),
+  writes the entry, effects, snapshot and views, and commits. The lock is
+  held for no round trip at all, only the commit's flush.
+- **Messages that arrive together are recorded together.** Those that queue
+  while a stream's transaction is in flight are decided in order and recorded
+  in its next transaction, up to 100 at a time. Each caller still returns
+  only once its own message is committed. Views and snapshots are written
+  once per transaction, from the state after its last message.
+- **A stale cache records nothing.** If another process has written the
+  stream, the lock fails, as does a duplicate idempotency key on its unique
+  index. Nothing is recorded, and the messages are decided again from the
+  stored state, in two round trips. A failure that spoils a shared
+  transaction is narrowed down by recording its messages one at a time. Only
+  failures the database reported are retried. When it is unknown whether a
+  commit happened, the callers get the error.
+
+At a 3 ms round trip, this took one caller on a hot stream from 99 to 170
+messages a second. Eight callers went from 154 to 654, about four messages
+to a transaction. Thirty-two streams on 32 connections went from 2,863 to
+5,322 ([BENCHMARKS.md](BENCHMARKS.md)).
+
+What it needs:
+
+- **Route each stream's traffic to one process.** Other processes' writes
+  make the cache stale, and a stale message costs three round trips instead
+  of two.
+- **Keep deciders pure.** Cached state is shared between messages, so
+  `Decide` and `Evolve` must not change the state they're given; spectest
+  holds deciders to this. The `State` in a `Handled` is the cached value
+  itself, so treat it as read-only.
+- **A view sees only the state after its transaction's last message.** A
+  view that fails for one message's state therefore fails that message only
+  when it is the last in its transaction.
+
 ## Sizing the pool
 
 Each `Handle` holds a connection for its whole transaction. By Little's law,
@@ -59,11 +102,13 @@ on average. Allow headroom for bursts.
 - **Count connections across instances.** Instances × `MaxConns` must stay
   under Postgres's `max_connections`, with room for everything else that
   connects.
-- **Waiting for a lock holds a connection.** A caller queued behind a hot
-  stream's lock keeps its connection idle until the lock is granted. Many
-  callers on one hot stream can therefore take a whole pool and stall
-  unrelated streams. Bound how long callers wait, with context deadlines or
-  `lock_timeout`, and keep hot streams' traffic on few instances.
+- **Waiting for a lock holds a connection.** Without a cache, a caller queued
+  behind a hot stream's lock keeps its connection idle until the lock is
+  granted. Many callers on one hot stream can therefore take a whole pool and
+  stall unrelated streams. With a cache, callers in one process wait in its
+  lane instead, and the stream uses one connection there. Bound how long
+  callers wait, with context deadlines or `lock_timeout`, and keep hot
+  streams' traffic on few instances.
 - **Read from replicas only where staleness is fine.** Advisory locks exist
   only on the primary, so every `Handle` goes there. `Load` against a replica
   works but can return stale state.
@@ -83,30 +128,11 @@ Already off the path: effect delivery (`Dispatcher`), projections and
 
 Ordered by payoff.
 
-1. **Cache state in memory, and decide before locking.**
-   - Keep `(seq, state)` per stream after each commit. When a message
-     arrives for a cached stream, decide it in Go right away. Then send one
-     batch: `BEGIN`, lock, a compare-and-set that fails unless the stream is
-     still at the cached seq, the writes, `COMMIT`. If the seq doesn't
-     match, run the two-trip path instead.
-   - That's one round trip, and no network time at all while the lock is
-     held: about the commit's flush.
-   - It is safe across processes because the compare-and-set runs under the
-     lock. It needs the decider to be pure, which cairn already requires.
-   - It pays off for streams whose traffic reaches one process, so route by
-     stream ID.
-2. **Commit several messages on one hot stream together.**
-   - Queue the messages that arrive for a stream while its commit is in
-     flight. Decide them in order, then record them in one transaction.
-   - Every caller still waits for that commit, so no guarantee weakens, and
-     one stream is no longer limited to one commit at a time.
-   - Views write a stream's whole state, so a batch of messages needs only
-     one view write.
-3. **Fewer round trips for the dispatcher.** It makes about two per effect
+1. **Fewer round trips for the dispatcher.** It makes about two per effect
    (restarting the lease, then recording the outcome). That's off the path a
    caller waits on, but it limits how fast effects are carried out over a
    slow link.
-4. **Decide whether refusals need a durable write.** A refused message costs a
+2. **Decide whether refusals need a durable write.** A refused message costs a
    write transaction and a flush. `SET LOCAL synchronous_commit = off` for
    transactions that record only refusals would save the flush, but not a
    round trip, so over a network it is worth little. If a crash loses a

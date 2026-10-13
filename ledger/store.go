@@ -75,7 +75,11 @@ type Entry struct {
 	Effects        []codec.Envelope
 	IdempotencyKey string
 	Meta           Meta
-	RecordedAt     time.Time
+	// RecordedAt is when the recording process recorded the entry, by its own
+	// clock: one transaction's entries share it. The log is ordered by TxID
+	// and Position, never by time, so clocks that differ between processes
+	// can't reorder it.
+	RecordedAt time.Time
 }
 
 // Cursor is a position in the global log.

@@ -118,3 +118,32 @@ Next to the baseline:
   that matters most for many streams.
 - **Tails are tighter.** No case's p99 was more than about twice its median
   except one `pool=4` run on the local connection.
+
+## With a state cache
+
+The same benchmark with `Aggregate.Cache` set, in the `/cache` runs. These
+were measured alongside fresh runs without it, from the same build, on
+2026-10-13. Medians of three 5-second runs.
+
+| Measured RTT | Workload | 2 round trips | Cache | Gain | Round trips per message |
+|---|---|---|---|---|---|
+| 3 ms | `hot/callers=1` | 99/s (9.3 ms) | 170/s (6.0 ms) | 1.7× | 1.0 |
+| 3 ms | `hot/callers=8` | 154/s | 654/s | 4.3× | 0.25 |
+| 3 ms | `spread`, pool 32 | 2,863/s | 5,322/s | 1.9× | 1.0 |
+| 3 ms | `spread`, pool 4 | 422/s | 753/s | 1.8× | 1.0 |
+| 6 ms | `hot/callers=1` | 61/s (16 ms) | 105/s (9.7 ms) | 1.7× | 1.0 |
+| 6 ms | `hot/callers=8` | 110/s | 427/s | 3.9× | 0.25 |
+| 6 ms | `spread`, pool 32 | 2,014/s | 3,701/s | 1.8× | 1.0 |
+| 6 ms | `spread`, pool 4 | 258/s | 469/s | 1.8× | 1.0 |
+
+- **A cached stream costs one round trip,** so latency and the connections
+  each message holds both roughly halve.
+- **A hot stream gains most.** Eight callers on one stream are recorded about
+  four messages to a transaction (0.25 round trips per message). That's 4×
+  without the cache, and over 25× the 13-round-trip baseline.
+- **On the local connection, `spread` with pool 4 is too noisy to compare.**
+  Both paths swing between about 1,300/s and 3,200/s from run to run, with
+  p99s of 130–210 ms in the slow runs. The Docker VM's disk stalling under
+  that many commits is the likely cause. Every other local case improved
+  with the cache: 2,194/s against 907/s for the hot stream with 8 callers,
+  and 7,840/s against 5,601/s for 32 streams on 32 connections.

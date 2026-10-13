@@ -296,7 +296,10 @@ leave entries already in the ledger unreadable.
 about one and a half of them, so throughput depends mostly on the link's
 latency and the connection pool's size. Set the pool size explicitly:
 pgxpool's default of 4 connections caps throughput long before anything else.
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) explains how to size a deployment,
+Set an aggregate's `Cache` to keep streams' state in memory. A cached stream
+costs one round trip, and messages that arrive together for one stream are
+recorded in one transaction; it pays off when each stream's traffic reaches
+one process. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) explains how to size a deployment,
 and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the measurements.
 
 ## Working on cairn
