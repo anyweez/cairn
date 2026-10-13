@@ -11,10 +11,13 @@ import (
 	"github.com/anyweez/cairn/spectest"
 )
 
-// Unreachable can only apply above 1000, and the counter below never gets
-// past 40.
-var Unreachable = spec.Rule{ID: "C1", Kind: spec.Never, Status: spec.Established,
-	Statement: "The counter passes 1000 and goes negative."}
+// unreachable can only apply above 1000, and the counter below never gets
+// past 40. It is a fixture, not one of cairn's rules, so it is built in a
+// function: the spec manifest lists package-level rules only.
+func unreachable() spec.Rule {
+	return spec.Rule{ID: "C1", Kind: spec.Never, Status: spec.Established,
+		Statement: "The counter passes 1000 and goes negative."}
+}
 
 // counter adds every message to its state.
 func counter(rule spec.Rule) spectest.Machine[int, int, int, int, struct{}] {
@@ -40,15 +43,15 @@ func TestVacuousEstablishedRuleFails(t *testing.T) {
 	if testing.Short() {
 		t.Skip("vacuity is only enforced on a full-length check")
 	}
-	msg, failed := spectest.Fails(t, counter(Unreachable).Check)
+	msg, failed := spectest.Fails(t, counter(unreachable()).Check)
 	if !failed || !strings.Contains(msg, "C1 is vacuous") {
 		t.Fatalf("a rule that never applies must fail the check, got %q", msg)
 	}
 }
 
 func TestAllowVacuous(t *testing.T) {
-	m := counter(Unreachable)
-	m.AllowVacuous = []string{Unreachable.ID}
+	m := counter(unreachable())
+	m.AllowVacuous = []string{unreachable().ID}
 	if msg, failed := spectest.Fails(t, m.Check); failed {
 		t.Fatalf("an allowed vacuous rule must pass: %s", msg)
 	}
@@ -60,7 +63,7 @@ func TestAllowVacuous(t *testing.T) {
 }
 
 func TestVacuousProposedRulePasses(t *testing.T) {
-	proposed := Unreachable
+	proposed := unreachable()
 	proposed.Status = spec.Proposed
 	if msg, failed := spectest.Fails(t, counter(proposed).Check); failed {
 		t.Fatalf("a proposed rule only reports vacuity: %s", msg)
