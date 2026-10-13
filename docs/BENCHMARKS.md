@@ -121,9 +121,9 @@ Next to the baseline:
 
 ## With a state cache
 
-The same benchmark with `Aggregate.Cache` set, in the `/cache` runs. These
-were measured alongside fresh runs without it, from the same build, on
-2026-10-13. Medians of three 5-second runs.
+A store's state cache is on by default. The plain runs turn it off with
+`StateCacheSize(0)`, and the `/cache` runs leave it on. Both were measured
+from the same build, on 2026-10-13. Medians of three 5-second runs.
 
 | Measured RTT | Workload | 2 round trips | Cache | Gain | Round trips per message |
 |---|---|---|---|---|---|
@@ -147,3 +147,28 @@ were measured alongside fresh runs without it, from the same build, on
   that many commits is the likely cause. Every other local case improved
   with the cache: 2,194/s against 907/s for the hot stream with 8 callers,
   and 7,840/s against 5,601/s for 32 streams on 32 connections.
+
+### One stream written by two processes
+
+`hot/callers=2/instances=2` splits one stream's callers between two stores,
+each with its own cache, as two processes behind a load balancer that doesn't
+route by stream would be. Both write at once, so neither process's cache
+stays current.
+
+| Measured RTT | No cache | Cache | Round trips per message, cached |
+|---|---|---|---|
+| 0.1 ms | 934/s | 911/s | 2.0 |
+| 3 ms | 175/s | 167/s | 2.0 |
+| 6 ms | 116/s | 113/s | 2.0 |
+
+- **The cache costs about what no cache does here,** within 3–5% at the
+  median, about the run-to-run noise. Once it has seen that a stream's cached
+  state is right less than three times in four, it reads before deciding,
+  which is the uncached path.
+- **The first version did much worse.** It went back to trusting the cache
+  after a single read found the stream where the cache had it. With two
+  writers racing, that happens by chance about half the time. It made 2.47
+  round trips a message and recorded 97/s at 3 ms, because each failed
+  attempt also waited behind the other process for the lock.
+  `TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache` fails
+  against that version.

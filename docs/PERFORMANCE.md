@@ -10,17 +10,19 @@ measurements and how to reproduce them.
 
 | Call | Round trips |
 |---|---|
-| `Handle` | 2 |
-| `Handle` with a `Cache` holding the stream | 1, shared by the messages recorded together |
-| `Handle` with an idempotency key that matches | 2 |
+| `Handle`, on a stream in the state cache | 1, shared by the messages recorded together |
+| `Handle`, on a stream not in it (its first message here, evicted, stale, or the cache off) | 2 |
+| `Handle` with an idempotency key that matches, not cached | 2 |
+| `Handle` with an idempotency key that matches, cached | 3 |
+| `Handle` on a stream another process wrote since this one did | 3, or 2 once the cache has seen it's shared |
 | `Load` | 1 |
 | `Transact` with `Lock`, `LoadLocked` and `Apply` on one stream | 5 |
 | `CatchUp`, per batch of up to `BatchSize` entries | 5 |
 
-`TestEachPathKeepsToItsRoundTrips` holds `Handle`, `Load` and `Transact` to
-these numbers.
+`TestEachPathKeepsToItsRoundTrips` holds the uncached paths to these numbers,
+and `cache_test.go` the cached ones.
 
-`Handle`'s two round trips:
+Without the cache, `Handle` makes two round trips:
 
 1. `BEGIN`; lock the stream and read its seq (`cairn.lock_streams`); read its
    snapshot; read the entries after the snapshot; look up the idempotency key.
@@ -32,8 +34,8 @@ from the first trip, and recording needs the decision, so with the decider in
 Go and a lock taken before reading, two is the floor.
 
 The stream's lock is granted partway through the first trip and held until
-the commit, about 1.5 round trips plus the commit's flush. **That sets how
-many messages one stream can take:**
+the commit, about 1.5 round trips plus the commit's flush. Without the cache,
+**that sets how many messages one stream can take:**
 
 > messages per second on one stream ≈ 1 ÷ (1.5 × RTT + commit flush + decide time)
 
@@ -41,17 +43,19 @@ That's about 160/s at a 3 ms round trip, and about 110/s at 6 ms. Different
 streams don't share a lock, so total throughput is limited by connections
 instead.
 
-## With a state cache
+## The state cache
 
-Set `Aggregate.Cache` to a `ledger.NewStateCache(n)` to keep the state of up to
-`n` streams in memory. Each stream then has a lane in the process, and its
-messages are recorded one transaction at a time:
+A store keeps the state of up to 10,000 streams in memory by default.
+`ledger.StateCacheSize(n)` sets the size, and `StateCacheSize(0)` turns the
+cache off. Each stream that an aggregate writes has a lane in the process,
+and its messages are recorded one transaction at a time:
 
 - **A cached stream costs one round trip.** Its message is decided as soon as
-  it is its turn. One batch then begins the transaction, locks the stream on
-  condition that it is still at the cached seq (`cairn.lock_stream_at`),
-  writes the entry, effects, snapshot and views, and commits. The lock is
-  held for no round trip at all, only the commit's flush.
+  it is its turn. One batch then locks the stream on condition that it is
+  still at the cached seq (`cairn.lock_stream_at`), and writes the entry,
+  effects, snapshot and views. Postgres runs that batch as one implicit
+  transaction, committed as it ends. The lock is held for no round trip at
+  all, only the commit's flush.
 - **Messages that arrive together are recorded together.** Those that queue
   while a stream's transaction is in flight are decided in order and recorded
   in its next transaction, up to 100 at a time. Each caller still returns
@@ -64,24 +68,38 @@ messages are recorded one transaction at a time:
   transaction is narrowed down by recording its messages one at a time. Only
   failures the database reported are retried. When it is unknown whether a
   commit happened, the callers get the error.
+- **A stream other processes write too is read before each decision.** Every
+  message shows whether the cached state would have been right. One decided
+  from the cache either succeeds or goes stale; one read first finds the
+  stream at the cached seq or past it. The cache keeps a moving average of
+  that for each stream, and decides from the cached state only while it was
+  right at least three times in four. Otherwise it reads first, in two round
+  trips, which is what no cache would cost. A stream that becomes one
+  process's alone is trusted again within about seven messages. Hot streams
+  still get their messages recorded together in each process.
 
 At a 3 ms round trip, this took one caller on a hot stream from 99 to 170
 messages a second. Eight callers went from 154 to 654, about four messages
 to a transaction. Thirty-two streams on 32 connections went from 2,863 to
 5,322 ([BENCHMARKS.md](BENCHMARKS.md)).
 
-What it needs:
+What it relies on:
 
-- **Route each stream's traffic to one process.** Other processes' writes
-  make the cache stale, and a stale message costs three round trips instead
-  of two.
-- **Keep deciders pure.** Cached state is shared between messages, so
-  `Decide` and `Evolve` must not change the state they're given; spectest
-  holds deciders to this. The `State` in a `Handled` is the cached value
-  itself, so treat it as read-only.
-- **A view sees only the state after its transaction's last message.** A
-  view that fails for one message's state therefore fails that message only
-  when it is the last in its transaction.
+- **Each stream's traffic mostly reaching one process.** That's where the
+  cache pays. Without it, the cache falls back to about what no cache costs.
+- **A faithful copy of the state.** `Handled.State` is never the cached value,
+  so a caller can't change what the next decision sees. It is copied by
+  `Aggregate.Clone` if set; otherwise by assignment, when the state has no
+  maps, slices, pointers or interfaces in it (`time.Time` is fine); otherwise
+  through JSON, when `StateVersion` is set, since snapshots already rely on
+  the state surviving JSON. An aggregate with none of these is not cached.
+  Set `Clone`, or `StateVersion`, to cache it.
+- **Pure deciders.** `Decide`, `Evolve` and views are handed the cached state,
+  so they must not change it. spectest holds deciders to this.
+- **Views that only care about the latest state.** A view sees only the state
+  after its transaction's last message. A view that fails for one message's
+  state therefore fails that message only when it is the last in its
+  transaction.
 
 ## Sizing the pool
 

@@ -27,9 +27,11 @@ import (
 // state. Whatever the cache holds, every decision is checked against the
 // stored seq under the stream's lock before it is recorded.
 //
-// A stream that keeps going stale, because other processes write it too, is
-// read from the store before each decision for a while, for longer each time
-// it turns out stale, so it costs about what it would with no cache.
+// Every message shows whether the cached state would have been right: decided
+// from the cache, it succeeds or goes stale; read first, the stored seq
+// matches the cached one or not. A stream whose cache is right less than
+// trustAbove of the time, because other processes write it too, is read
+// before each decision, and costs what it would with no cache.
 //
 // Messages that arrive for a stream while one of its transactions is in
 // flight wait for it, and are then decided in order and recorded together, in
@@ -48,9 +50,10 @@ type stateCache struct {
 type cachedState struct {
 	key   string
 	state any // a Loaded[S]
-	// misses counts the times in a row the state turned out stale; skip is
-	// how many more messages to decide from the stored state first.
-	misses, skip int
+	// right is a moving average of how often the cached state turned out to
+	// be the stream's: every message shows it, whether it was decided from
+	// the cache or from a read.
+	right float64
 }
 
 // laneKey names one aggregate's lane for one stream. Messages are only
@@ -60,9 +63,15 @@ type laneKey struct {
 	name string
 }
 
-// staleSkipMax is the most messages in a row a stale stream is read for
-// before its cached state is tried again.
-const staleSkipMax = 64
+// trustAbove is how often a stream's cached state must have been right for
+// the next message to be decided from it. A right guess costs one round trip
+// and a wrong one three, against two for reading first, so guessing pays above
+// half; the margin covers the lock waits a wrong guess adds for others.
+const trustAbove = 0.75
+
+// rightWeight is how much one message moves a stream's average: after about
+// seven messages the other way, a stream crosses trustAbove.
+const rightWeight = 1.0 / 8
 
 func newStateCache(streams int) *stateCache {
 	return &stateCache{
@@ -84,41 +93,35 @@ func (c *stateCache) begin(key string) (state any, trust bool) {
 	}
 	c.order.MoveToFront(e)
 	cs := e.Value.(*cachedState)
-	if cs.skip > 0 {
-		cs.skip--
-		return cs.state, false
-	}
-	return cs.state, true
+	return cs.state, cs.right >= trustAbove
 }
 
-// stale records that the state cached for key was not the stream's, so the
-// next messages are decided from the stored state: twice as many each time
-// this happens in a row.
-func (c *stateCache) stale(key string) {
+// observe records whether the state cached for key turned out to be the
+// stream's.
+func (c *stateCache) observe(key string, right bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
 		cs := e.Value.(*cachedState)
-		cs.misses++
-		cs.skip = min(1<<min(cs.misses, 6), staleSkipMax)
-	}
-}
-
-// put caches state for key. confirmed says the stream was found where the
-// cache had it, so the state can be trusted again at once.
-func (c *stateCache) put(key string, state any, confirmed bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if e, ok := c.entries[key]; ok {
-		cs := e.Value.(*cachedState)
-		cs.state = state
-		if confirmed {
-			cs.misses, cs.skip = 0, 0
+		o := 0.0
+		if right {
+			o = 1
 		}
+		cs.right += rightWeight * (o - cs.right)
+	}
+}
+
+// put caches state for key. A stream new to the cache is trusted until it
+// proves otherwise.
+func (c *stateCache) put(key string, state any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok {
+		e.Value.(*cachedState).state = state
 		c.order.MoveToFront(e)
 		return
 	}
-	c.entries[key] = c.order.PushFront(&cachedState{key: key, state: state})
+	c.entries[key] = c.order.PushFront(&cachedState{key: key, state: state, right: 1})
 	for c.order.Len() > c.size {
 		oldest := c.order.Back()
 		c.order.Remove(oldest)
@@ -315,14 +318,19 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 		}
 	}
 	results, before, after, err := a.runGroup(ctx, stream, reqs, cached)
-	hit := cached != nil && err == nil
-	if err != nil && cached != nil && retryable(err) {
+	switch {
+	case cached != nil && err == nil:
+		cache.observe(key, true)
+	case cached != nil && retryable(err):
 		// Stale, or a duplicate key: nothing was recorded. Decide again from
 		// the stored state.
 		if errors.Is(err, errStale) {
-			cache.stale(key)
+			cache.observe(key, false)
 		}
 		results, before, after, err = a.runGroup(ctx, stream, reqs, nil)
+	case prev != nil && err == nil:
+		// Read first, which shows whether the cache would have been right.
+		cache.observe(key, before.Seq == prev.Seq)
 	}
 	if err != nil {
 		cache.drop(key)
@@ -339,10 +347,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 		return
 	}
 
-	// Read from the store, the stream was where the cache had it: trust the
-	// cache again.
-	confirmed := hit || (cached == nil && prev != nil && before.Seq == prev.Seq)
-	cache.put(key, after, confirmed)
+	cache.put(key, after)
 	copyState := a.copier()
 	for i, r := range reqs {
 		res := results[i]

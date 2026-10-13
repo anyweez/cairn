@@ -45,7 +45,7 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 	}
 
 	stream := agg.Stream("a")
-	store.cache.put(agg.cacheKey(stream), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5}, true)
+	store.cache.put(agg.cacheKey(stream), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5})
 	h, err := agg.Handle(ctx, "a", bump{})
 	if err != nil {
 		t.Fatal(err)

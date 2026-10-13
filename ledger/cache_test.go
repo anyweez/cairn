@@ -387,3 +387,27 @@ func TestAStreamSharedWithAnotherProcessCostsNoMoreThanWithoutACache(t *testing.
 		t.Fatalf("a stream no one else writes took %d round trips, want 1", n)
 	}
 }
+
+// The same, with both processes writing at once, as behind a load balancer
+// that doesn't route by stream: a write by one between two of the other's is
+// a matter of timing, and the cache must still cost no more than none.
+func TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache(t *testing.T) {
+	pool, trips := tracedPool(t, 2)
+	const each = 150
+	var wg sync.WaitGroup
+	for range 2 {
+		agg := counterOn(ledger.New(pool, ledger.RequireActor(false)))
+		wg.Go(func() {
+			for range each {
+				if _, err := agg.Handle(ctx, "a", add{1, 1 << 30}); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if per := float64(trips.trips.Load()) / (2 * each); per > 2.15 {
+		t.Fatalf("%.2f round trips per message, want about 2", per)
+	}
+	checkStream(t, counterOn(ledger.New(pool, ledger.RequireActor(false))), "a", 2*each, 2*each)
+}
