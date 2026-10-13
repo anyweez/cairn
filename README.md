@@ -9,6 +9,80 @@ review attention goes to changes in that core. Everything else is checked
 mechanically: against generated inputs, and against the real history in the
 ledger.
 
+## When to use cairn
+
+Use cairn when **whether a write is allowed depends on the writes that came
+before it**: anywhere a correct-looking request can be refused because of
+what already happened.
+
+This is the most bug-prone code in an application, which is why it is worth
+covering. The same shapes of bug recur, they are easy for an agent to
+introduce, and they are hard to spot in review:
+
+- check-then-act races;
+- a side effect performed before the decision is recorded;
+- the same rule copied into two places that drift apart;
+- rules that live only in the UI;
+- lifecycles with no transition table, so any status can become any other;
+- concurrent edits where one silently overwrites the other.
+
+cairn rules each of these out by construction, or turns it into a rule that
+a human writes once and the checker enforces from then on.
+
+For a new subsystem, these questions decide it:
+
+1. **Can a valid-looking request be refused because of current state?** If
+   nothing is ever refused, cairn adds cost without adding trust.
+2. **Do you own the truth?** If an external system is authoritative, your
+   copy is a mirror. Use cairn for your decisions about that system ("merge
+   this pull request"), not for the mirror itself.
+3. **Is each entity's write rate modest, and does its history matter?**
+   Every entity is a stream, and streams only grow.
+4. **Would you want to re-run history against new code?** `Verify` is much
+   of the value.
+5. **Must a change cause something elsewhere, neither lost nor doubled?**
+   The outbox is reason enough, even when the rules are simple.
+
+Examples:
+
+- **In a web app:** orders, subscriptions and billing state, approvals and
+  workflows, bookings and reservations, membership and permission grants,
+  moderation, quotas, invitations.
+- **In a game server:** inventory, trades, currency, auctions, quest
+  progress, guild membership, rewards.
+
+Most subsystems are a decision core inside a CRUD shell. An issue's
+lifecycle belongs in cairn, and its comment text does not. Draw the line
+inside the subsystem, not around it.
+
+## When not to use cairn
+
+- **CRUD with no rules:** profile fields, content bodies, settings.
+- **Telemetry, metrics and logs:** high volume, nothing to decide.
+- **Caches and derived data:** a projection's job, not a stream's.
+- **Mirrors of an external system**, where that system is the source of
+  truth.
+- **Sessions, tokens and other data that must be deletable on demand.**
+  Entries are append-only, and there is no redaction path yet.
+- **High-frequency simulation:** game ticks, movement, physics, AI.
+
+For simulation, the rule is that **the simulation proposes and the ledger
+decides**. The tick loop stays in memory and fast. What it produces that
+must persist and be fair ("award this loot", "grant this XP") becomes a
+message to a stream, which can refuse it.
+
+The parts of a system that cairn doesn't cover still need a contract, just a
+different kind:
+
+| Kind of subsystem | Contract |
+|---|---|
+| Decisions over state you own | a cairn spec, plus `Verify` against history |
+| CRUD | schema and API contract tests |
+| Integrations | contract tests against the external API |
+| Simulation | deterministic replay and property tests |
+| UI | agent-driven or visual checks |
+| Telemetry | usually none |
+
 ## Core components
 
 | Package | What it is |
