@@ -17,7 +17,7 @@ import (
 
 // totalsView keeps one row per counter: its total, and the seq it was written
 // at, so a test can tell whether a write happened.
-func totalsView(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, effect]) ledger.View[counter] {
+func totalsView(t testing.TB, agg *ledger.Aggregate[counter, msg, int, event, effect]) ledger.View[counter] {
 	t.Helper()
 	if _, err := agg.Store.Pool().Exec(ctx,
 		`CREATE TABLE counter_totals (id text PRIMARY KEY, total int NOT NULL, seq bigint NOT NULL)`); err != nil {
