@@ -152,8 +152,13 @@ Every machine is held to the framework's rules (D1–D7) in addition to its own:
 
 Established rules fail the test with a shrunk counterexample. Proposed rules
 are reported with the shortest trace found. The rule-health table shows how
-often each rule actually applied. A rule that never applies is flagged as
-vacuous, because a check that is never exercised proves nothing.
+often each rule actually applied. An established rule that never applies
+fails the check as vacuous, because a check that is never exercised proves
+nothing: make the generator reach it, or list it in `AllowVacuous` if it
+genuinely can't apply to this machine. Vacuity is only enforced on a
+full-length check (rapid's default 100 runs). Under `-short` or a lowered
+`-rapid.checks` it is only reported, since a rarely applied rule can miss a
+short check by chance.
 
 ## Working on cairn
 

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -71,10 +72,23 @@ type Machine[S, M, R, Ev, Ef any] struct {
 
 	// Snapshots says the state is persisted as JSON, so it must round-trip.
 	Snapshots bool
+
+	// AllowVacuous lists the IDs of established rules that may pass without
+	// ever applying. Any other established rule that never applies in a full
+	// Check fails it: the generator never reaches the rule, so it proves
+	// nothing.
+	AllowVacuous []string
 }
 
+// vacuityRuns is how many runs a Check needs before an established rule that
+// never applied fails it. It is rapid's default check count. Shorter checks
+// (-short, a lowered -rapid.checks, a test deadline) only report vacuity,
+// since a rarely applied rule can miss a few runs by chance.
+const vacuityRuns = 100
+
 // Check runs the machine under rapid. Established rules fail the test, with a
-// shrunk counterexample; proposed rules and rule health are reported in the log.
+// shrunk counterexample, as does an established rule that never applies;
+// proposed rules and rule health are reported in the log.
 func (m Machine[S, M, R, Ev, Ef]) Check(t rapid.TB) {
 	t.Helper()
 	m.CheckReport(t)
@@ -116,6 +130,7 @@ func judge(rt *rapid.T, rep *report, trace *[]string, rule spec.Rule, v spec.Ver
 }
 
 func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, rep *report) {
+	rep.ran()
 	var trace []string
 	j := func(rule spec.Rule, v spec.Verdict) { judge(rt, rep, &trace, rule, v) }
 
@@ -391,11 +406,18 @@ type tally struct {
 
 type report struct {
 	mu    sync.Mutex
+	runs  int
 	order []string
 	rules map[string]*tally
 }
 
 func newReport() *report { return &report{rules: map[string]*tally{}} }
+
+func (r *report) ran() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.runs++
+}
 
 func (r *report) declare(rule spec.Rule) {
 	if _, ok := r.rules[rule.ID]; ok {
@@ -455,6 +477,35 @@ func (r *report) log(t rapid.TB) {
 	}
 }
 
+// gateVacuity fails t for every established rule that never applied, unless
+// allowed names it. Proposed rules only report, so their vacuity does too.
+func (r *report) gateVacuity(t rapid.TB, allowed []string) {
+	t.Helper()
+	for _, id := range allowed {
+		if _, ok := r.rules[id]; !ok {
+			t.Errorf("AllowVacuous names %s, which is not one of the machine's rules", id)
+		}
+	}
+	var vacuous []*tally
+	for _, id := range r.order {
+		tl := r.rules[id]
+		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, id) {
+			vacuous = append(vacuous, tl)
+		}
+	}
+	if len(vacuous) == 0 {
+		return
+	}
+	if r.runs < vacuityRuns {
+		t.Logf("vacuity not enforced: %d runs, fewer than %d", r.runs, vacuityRuns)
+		return
+	}
+	for _, tl := range vacuous {
+		t.Errorf("%s is vacuous: it never applied in %d runs, so the generator never reaches it (list it in AllowVacuous if that is expected)\n  rule: %s",
+			tl.rule.ID, r.runs, tl.rule.Statement)
+	}
+}
+
 // Violation is a proposed rule's first counterexample.
 type Violation struct {
 	Rule   spec.Rule
@@ -478,6 +529,7 @@ func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	}
 	rapid.Check(t, func(rt *rapid.T) { m.run(rt, rep) })
 	rep.log(t)
+	rep.gateVacuity(t, m.AllowVacuous)
 
 	var out []Violation
 	for _, id := range rep.order {
