@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Batch collects statements that callers hand to the ledger. The ledger sends
@@ -19,6 +20,7 @@ import (
 type Batch struct {
 	queued pgx.Batch
 	owners []string
+	checks []func(pgconn.CommandTag) error
 	owner  string
 }
 
@@ -26,6 +28,16 @@ type Batch struct {
 func (b *Batch) Queue(sql string, args ...any) {
 	b.queued.Queue(sql, args...)
 	b.owners = append(b.owners, b.owner)
+	b.checks = append(b.checks, nil)
+}
+
+// queueChecked adds one of the ledger's own statements, whose outcome decides
+// whether the transaction may go on. check sees its command tag; an error from
+// check stops reading the batch and is returned as it is, and the caller rolls
+// back whatever else the batch did.
+func (b *Batch) queueChecked(check func(pgconn.CommandTag) error, sql string, args ...any) {
+	b.Queue(sql, args...)
+	b.checks[len(b.checks)-1] = check
 }
 
 // Len is how many statements are queued.
@@ -49,10 +61,17 @@ func (b *Batch) send(ctx context.Context, tx pgx.Tx) error {
 		return nil
 	}
 	results := tx.SendBatch(ctx, &b.queued)
-	for i := range b.owners {
-		if _, err := results.Exec(); err != nil {
+	for i, check := range b.checks {
+		tag, err := results.Exec()
+		if err != nil {
 			_ = results.Close()
 			return b.failed(i, err)
+		}
+		if check != nil {
+			if err := check(tag); err != nil {
+				_ = results.Close()
+				return err
+			}
 		}
 	}
 	return results.Close()

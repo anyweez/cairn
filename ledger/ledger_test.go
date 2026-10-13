@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -465,15 +467,15 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 		Name:      "totals",
 		Kinds:     []string{"counter"},
 		BatchSize: 2,
-		Apply: func(ctx context.Context, tx pgx.Tx, e ledger.Entry) error {
+		Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
 			total := 0
 			if e.Refusal == nil {
 				total = int(e.Result[0] - '0')
 			}
-			_, err := tx.Exec(ctx, `
+			b.Queue(`
 INSERT INTO totals VALUES ($1, $2, 1)
 ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries = totals.entries + 1`, e.Stream, total)
-			return err
+			return nil
 		},
 	}
 
@@ -502,6 +504,107 @@ ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries =
 	}
 	if fmt.Sprint(got) != "[{counter/a 4 2} {counter/b 4 2}]" {
 		t.Fatalf("totals: %v", got)
+	}
+}
+
+// seenProjection records each entry it applies once, keyed by stream and seq,
+// so applying one twice fails.
+func seenProjection(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, effect]) ledger.Projection {
+	t.Helper()
+	if _, err := agg.Store.Pool().Exec(ctx,
+		`CREATE TABLE seen (stream text NOT NULL, seq bigint NOT NULL, PRIMARY KEY (stream, seq))`); err != nil {
+		t.Fatal(err)
+	}
+	return ledger.Projection{Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
+		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream, e.Seq)
+		return nil
+	}}
+}
+
+func countSeen(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, effect]) int {
+	t.Helper()
+	var n int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM seen`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// A statement that fails rolls back the whole batch of entries with the
+// checkpoint's advance, so the next catch-up starts from the same place.
+func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
+	agg := newCounter(t)
+	projection := seenProjection(t, agg)
+	for _, id := range []string{"a", "a", "b"} {
+		if _, err := agg.Handle(ctx, id, add{1, 9}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	apply := projection.Apply
+	broken := projection
+	broken.Apply = func(ctx context.Context, b *ledger.Batch, e ledger.Entry) error {
+		if err := apply(ctx, b, e); err != nil {
+			return err
+		}
+		if e.Stream == "counter/a" && e.Seq == 2 {
+			b.Queue(`INSERT INTO seen VALUES ($1, NULL)`, e.Stream)
+		}
+		return nil
+	}
+	n, err := agg.Store.CatchUp(ctx, broken)
+	if n != 0 || err == nil || !strings.Contains(err.Error(), "projection seen at counter/a#2: statement 1:") {
+		t.Fatalf("want the failing entry and statement named, got %d, %v", n, err)
+	}
+	if got := countSeen(t, agg); got != 0 {
+		t.Fatalf("a failed batch left %d rows", got)
+	}
+
+	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 3 {
+		t.Fatalf("after the failure, caught up %d, %v; want all 3 from the start", n, err)
+	}
+}
+
+// Two runners of one projection that read the same batch race to advance its
+// checkpoint. The loser's writes, sent in the same round trip as its claim,
+// roll back with it, so every entry is applied once.
+func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
+	agg := newCounter(t)
+	projection := seenProjection(t, agg)
+	for _, id := range []string{"a", "b", "a", "c", "b"} {
+		if _, err := agg.Handle(ctx, id, add{1, 9}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Both runners read the checkpoint and their entries before either sends
+	// its batch.
+	var applied atomic.Int64
+	apply := projection.Apply
+	projection.Apply = func(ctx context.Context, b *ledger.Batch, e ledger.Entry) error {
+		if applied.Add(1) <= 2 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return apply(ctx, b, e)
+	}
+	var wg sync.WaitGroup
+	var total atomic.Int64
+	for range 2 {
+		wg.Go(func() {
+			n, err := agg.Store.CatchUp(ctx, projection)
+			if err != nil {
+				t.Error(err)
+			}
+			total.Add(int64(n))
+		})
+	}
+	wg.Wait()
+
+	if total.Load() != 5 || countSeen(t, agg) != 5 {
+		t.Fatalf("applied %d entries, %d rows; want 5 each", total.Load(), countSeen(t, agg))
+	}
+	if applied.Load() <= 5 {
+		t.Fatalf("Apply ran %d times: the runners never raced", applied.Load())
 	}
 }
 

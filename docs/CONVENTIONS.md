@@ -58,7 +58,7 @@ on wherever possible.
 | API | Status |
 |---|---|
 | `View.Write` | Takes a `Batch`. All views' statements go out in one round trip. |
-| `Projection.Apply` | Takes a `pgx.Tx`, so each entry costs at least one round trip, in batches of up to 100 entries. Next to convert. |
+| `Projection.Apply` | Takes a `Batch`. A batch of entries' statements goes out in one round trip, together with the checkpoint's advance. It also takes a `ctx`, for read models that live outside the database. |
 | `Store.Transact` / `Tx` | `Tx` embeds `pgx.Tx`, for transactions that span several streams. Callers compose cairn's own calls in it (`Lock`, `LoadLocked`, `Apply`). Those calls follow this rule as cairn's internals are batched. |
 
 cairn's own statements follow the same rule as they are rewritten to make
