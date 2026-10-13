@@ -18,6 +18,8 @@ ledger.
 | `ledger` | The Postgres shell. It takes per-stream locks, appends every decided message (refusals included) to an append-only log, queues effects in an outbox in the same transaction, runs projections over the global log, and re-decides stored history with `Verify`. |
 | `spec` / `spectest` | Rules (`Never` / `Can` / `Refines`, `Established` / `Proposed`) and a rapid-based checker. It holds every machine to the framework's own rules (deterministic, total, refusals carry nothing, no mutation of the given state, replayable) as well as to the machine's rules, and reports how often each rule actually applied. |
 | `blocks/fsm` | A lifecycle as a table of allowed transitions. `Decide` consults it, the spec enforces it, and review renders it. |
+| `ledger/ledgertest` | A fresh, migrated database for each test. |
+| `examples/decisions` | lore's decision register rebuilt on cairn, end to end. |
 
 ## A short demo
 
@@ -111,3 +113,56 @@ accounts.Handle(ctx, "alice", Withdraw{45}) // balance 5; WarnLowBalance goes to
 
 divergences, err := accounts.VerifyAll(ctx) // would today's code decide the same?
 ```
+
+## What the ledger guarantees
+
+- **One transaction per message.** A decided message, its events, its effects
+  and its snapshot commit together, or none of them do.
+- **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
+  transaction needs in one sorted call, so overlapping transactions cannot
+  deadlock.
+- **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
+  refusals free of events and effects.
+- **No gaps for readers of the global log.** `ReadAll` and projections hold
+  back entries from transactions that are still in flight until every older
+  transaction has finished, so a reader never skips past an entry that
+  commits late.
+- **Safe retries.** `IdempotencyKey` returns the first answer, refusals
+  included.
+- **Replay verification.** `Aggregate.Verify` re-decides every stored message
+  with today's code and reports each divergence. State between messages comes
+  from the stored events, so one divergence doesn't cascade.
+
+The library owns the `cairn` schema. Applications read from it through this
+package and never write to it directly.
+
+## What the checker guarantees
+
+Every machine is held to the framework's rules (D1–D7) in addition to its own:
+
+| Rule | Statement |
+|---|---|
+| D1 | Decide is deterministic. |
+| D2 | Decide and Evolve never panic. |
+| D3 | A refusal carries no events or effects. |
+| D4 | Decide and Evolve never modify the state they're given. This catches a map shared between states. |
+| D5 | Folding a run's events from the initial state reproduces the run. |
+| D6 | Messages, events and effects survive their codecs (when codecs are given). |
+| D7 | State survives a JSON snapshot round trip (when `Snapshots` is set). |
+
+Established rules fail the test with a shrunk counterexample. Proposed rules
+are reported with the shortest trace found. The rule-health table shows how
+often each rule actually applied. A rule that never applies is flagged as
+vacuous, because a check that is never exercised proves nothing.
+
+## Working on cairn
+
+```sh
+export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
+go test ./...
+```
+
+Without the database URL, ledger tests are skipped. In CI, set
+`CAIRN_REQUIRE_DATABASE=1` as well, so they fail instead of skipping.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and the open questions.
