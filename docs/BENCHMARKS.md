@@ -85,3 +85,36 @@ What the numbers show:
   isn't known yet. Candidates are snapshot writes (every 100th message on a
   stream) and the Docker VM's disk. Compare medians across changes until
   that's explained.
+
+## Handle in two round trips
+
+The same benchmark, machine and method, after `Handle` was rewritten to send
+its statements in two batches. The first begins the transaction, locks the
+stream and reads its snapshot, entries and idempotency key. The second
+records the entry, its effect, any snapshot and the view, and commits. Every
+run made 2.0 round trips per message.
+
+| Added latency | Measured RTT | `hot/callers=1` | `hot/callers=8` | `spread`, pool 32 | `spread`, pool 4 |
+|---|---|---|---|---|---|
+| 0 ms | 0.1 ms | 879/s (1.0 ms) | 868/s | 5,477/s | 1,991/s |
+| 2 ms | 3.0 ms | 100/s (9.2 ms) | 161/s | 3,036/s | 423/s |
+| 5 ms | 6.2 ms | 59/s (16 ms) | 109/s | 2,005/s | 249/s |
+
+Next to the baseline:
+
+| Measured RTT | `hot/callers=1` | `hot/callers=8` | `spread`, pool 32 | `spread`, pool 4 |
+|---|---|---|---|---|
+| 0.1 ms | 1.9× | 1.9× | 2.5× | 2.5× |
+| 3 ms | 5.5× | 6.7× | 6.0× | 6.2× |
+| 6.2 ms | 5.4× | 7.8× | 6.6× | 6.1× |
+
+- **The slower the link, the bigger the gain:** 2.5× or less on a local
+  connection, 5–8× at 3–6 ms.
+- **A hot stream now gains from more callers,** 1.6–1.8× instead of 1.3×. The
+  lock is held for about 1.5 of the 2 round trips, and none of that time
+  depends on how much a message writes.
+- **The pool still caps total throughput,** at about connections ÷ latency:
+  4 ÷ 9.2 ms ≈ 435/s, against 423/s measured. Pool size remains the setting
+  that matters most for many streams.
+- **Tails are tighter.** No case's p99 was more than about twice its median
+  except one `pool=4` run on the local connection.
