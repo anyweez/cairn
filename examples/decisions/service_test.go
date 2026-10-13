@@ -53,6 +53,11 @@ func TestRegisterOnTheLedger(t *testing.T) {
 	must(t, err)
 	refused(t, svc.Supersede(ctx, first, second, "ana"), NotAllowed) // the replacement is still open
 	refused(t, svc.Supersede(ctx, first, "", "ana"), Invalid)
+	// Reading a replacement that does not exist leaves no stream behind.
+	refused(t, svc.Supersede(ctx, first, "dec-missing", "ana"), NotAllowed)
+	if streams, err := svc.Register.Store.Streams(ctx, "decision"); err != nil || len(streams) != 2 {
+		t.Fatalf("only the two real decisions have streams: %v, %v", streams, err)
+	}
 	state, err = svc.Get(ctx, second)
 	must(t, err)
 	must(t, svc.RecordOutcome(ctx, second, "cy", state.Options[0].ID, "metrics held"))

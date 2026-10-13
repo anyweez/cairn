@@ -170,18 +170,27 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	var written int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM cairn.entries`).Scan(&written); err != nil {
+		t.Fatal(err)
+	}
 
+	// The cutoff is the oldest transaction running anywhere on the server, so
+	// another database's transaction can hold entries back for a while: keep
+	// reading until every entry has arrived.
 	last := map[string]int64{}
-	for cursor, total := (ledger.Cursor{}), 0; ; {
+	deadline := time.Now().Add(10 * time.Second)
+	for cursor, total := (ledger.Cursor{}), 0; total < written; {
 		entries, next, err := agg.Store.ReadAll(ctx, cursor, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(entries) == 0 {
-			if total == 0 {
-				t.Fatal("read nothing")
+			if time.Now().After(deadline) {
+				t.Fatalf("read %d of %d entries", total, written)
 			}
-			break
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		for _, e := range entries {
 			if e.Seq != last[e.Stream]+1 {
@@ -191,6 +200,51 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		}
 		total += len(entries)
 		cursor = next
+	}
+}
+
+// Transaction IDs order the log as numbers, including across a change in their
+// number of digits.
+func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
+	agg := newCounter(t)
+	pool := agg.Store.Pool()
+	if _, err := agg.Handle(ctx, "first", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+	var current uint64
+	if err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()::text::bigint`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	next := uint64(10)
+	for next <= current {
+		next *= 10
+	}
+	if next-current > 2_000_000 {
+		t.Skipf("transaction ID %d is too far from %d to cross cheaply", current, next)
+	}
+	// Each iteration commits, so each one uses up a transaction ID.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(
+		`DO $$ BEGIN FOR i IN 1..%d LOOP PERFORM pg_current_xact_id(); COMMIT; END LOOP; END $$`, next-current)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agg.Handle(ctx, "second", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []ledger.Entry
+	cursor := ledger.Cursor{}
+	for deadline := time.Now().Add(10 * time.Second); len(entries) < 2 && time.Now().Before(deadline); {
+		more, next, err := agg.Store.ReadAll(ctx, cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(more) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		entries, cursor = append(entries, more...), next
+	}
+	if len(entries) != 2 || entries[0].Stream != "counter/first" || entries[1].Stream != "counter/second" {
+		t.Fatalf("got %d entries, first %v", len(entries), entries)
 	}
 }
 
@@ -233,9 +287,18 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	entries, _, err = agg.Store.ReadAll(ctx, cursor, 10)
-	if err != nil {
-		t.Fatal(err)
+	// The cutoff is the oldest transaction running anywhere on the server, so
+	// another database's transaction can hold entries back a little longer.
+	entries = nil
+	for deadline := time.Now().Add(10 * time.Second); len(entries) < 2 && time.Now().Before(deadline); {
+		more, next, err := agg.Store.ReadAll(ctx, cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(more) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		entries, cursor = append(entries, more...), next
 	}
 	if len(entries) != 2 || entries[0].Stream != "counter/slow" || entries[1].Stream != "counter/fast" {
 		t.Fatalf("got %+v", entries)
@@ -255,6 +318,43 @@ func TestLockMustComeBeforeAnyWrite(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Lock after a write must fail: the transaction already has its place in the log")
+	}
+}
+
+func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
+	agg := newCounter(t)
+	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+		if err := tx.Lock(ctx, agg.Stream("read"), agg.Stream("written")); err != nil {
+			return err
+		}
+		read, err := agg.LoadLocked(ctx, tx, "read")
+		if err != nil {
+			return err
+		}
+		if read.Seq != 0 || read.State.Total != 0 {
+			t.Errorf("a stream that does not exist loads empty: %+v", read)
+		}
+		written, err := agg.LoadLocked(ctx, tx, "written")
+		if err != nil {
+			return err
+		}
+		_, err = agg.Apply(ctx, tx, &written, add{2, 9})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := agg.Store.Streams(ctx, "counter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(streams) != 1 || streams[0] != agg.Stream("written") {
+		t.Fatalf("only the stream written to exists, got %v", streams)
+	}
+
+	h, err := agg.Handle(ctx, "read", add{2, 9})
+	if err != nil || h.Entry.Seq != 1 {
+		t.Fatalf("the first write creates the stream: %+v, %v", h.Entry, err)
 	}
 }
 

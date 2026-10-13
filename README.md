@@ -120,7 +120,8 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   and its snapshot commit together, or none of them do.
 - **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
   transaction needs in one sorted call, so overlapping transactions cannot
-  deadlock.
+  deadlock. Locking a stream doesn't create it: a stream exists once its first
+  entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
   refusals free of events and effects.
 - **No gaps for readers of the global log.** `ReadAll` and projections hold
@@ -152,8 +153,13 @@ Every machine is held to the framework's rules (D1–D7) in addition to its own:
 
 Established rules fail the test with a shrunk counterexample. Proposed rules
 are reported with the shortest trace found. The rule-health table shows how
-often each rule actually applied. A rule that never applies is flagged as
-vacuous, because a check that is never exercised proves nothing.
+often each rule actually applied. An established rule that never applies
+fails the check as vacuous, because a check that is never exercised proves
+nothing: make the generator reach it, or list it in `AllowVacuous` if it
+genuinely can't apply to this machine. Vacuity is only enforced on a
+full-length check (rapid's default 100 runs). Under `-short` or a lowered
+`-rapid.checks` it is only reported, since a rarely applied rule can miss a
+short check by chance.
 
 ## Working on cairn
 

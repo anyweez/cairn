@@ -77,7 +77,9 @@ func messages(t *rapid.T, s State) Msg {
 	case Open:
 		kinds = append(kinds, "add_option", "save_position", "save_position", "save_position", "record_outcome", "record_outcome")
 	case Decided, Superseded:
-		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "supersede", "save_position")
+		// Reopen directly too: set_status rarely draws open, and DR7 applies
+		// only when a settled decision reopens.
+		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "reopen", "supersede", "save_position")
 	}
 	switch rapid.SampledFrom(kinds).Draw(t, "kind") {
 	case "create":
@@ -97,6 +99,8 @@ func messages(t *rapid.T, s State) Msg {
 		return RecordOutcome{By: member(), At: at(), Chosen: optionIDs(), Rationale: text("rationale")}
 	case "set_status":
 		return SetStatus{By: member(), To: status("to")}
+	case "reopen":
+		return SetStatus{By: member(), To: Open}
 	case "supersede":
 		return Supersede{
 			By:               member(),
