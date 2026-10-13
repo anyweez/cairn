@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -11,15 +12,10 @@ import (
 	"time"
 
 	"github.com/anyweez/cairn"
+	"github.com/anyweez/cairn/codec"
 	"github.com/anyweez/cairn/ledger"
+	"github.com/anyweez/cairn/ledger/ledgertest"
 )
-
-func cachedCounter(t *testing.T) *ledger.Aggregate[counter, msg, int, event, effect] {
-	t.Helper()
-	agg := newCounter(t)
-	agg.Cache = ledger.NewStateCache(100)
-	return agg
-}
 
 // handleAll sends msgs to one stream at once, and returns each one's outcome
 // in the order given.
@@ -50,9 +46,7 @@ func checkStream(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, e
 	if int64(len(entries)) != n {
 		t.Fatalf("%d entries, want %d", len(entries), n)
 	}
-	stored := *agg
-	stored.Cache = nil
-	loaded, err := stored.Load(ctx, id)
+	loaded, err := agg.Load(ctx, id)
 	if err != nil || loaded.State.Total != want {
 		t.Fatalf("stored total %d, %v; want %d", loaded.State.Total, err, want)
 	}
@@ -60,7 +54,6 @@ func checkStream(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, e
 
 func TestACachedStreamCostsOneRoundTrip(t *testing.T) {
 	agg, trips := tracedCounter(t, 1)
-	agg.Cache = ledger.NewStateCache(10)
 	agg.StateVersion, agg.SnapshotEvery = "v1", 3
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 
@@ -88,9 +81,9 @@ func TestACachedStreamCostsOneRoundTrip(t *testing.T) {
 // decision is never recorded: the message is decided again from the stored
 // state. (A cache ahead of the stream is tested inside the package.)
 func TestACacheNeverRecordsAgainstStaleState(t *testing.T) {
-	agg := cachedCounter(t)
-	other := *agg
-	other.Cache = nil
+	agg := newCounter(t)
+	// Another process: its own store, and its own cache.
+	other := counterOn(ledger.New(agg.Store.Pool(), ledger.RequireActor(false)))
 
 	if _, err := agg.Handle(ctx, "a", add{3, 5}); err != nil {
 		t.Fatal(err)
@@ -110,7 +103,7 @@ func TestACacheNeverRecordsAgainstStaleState(t *testing.T) {
 }
 
 func TestMessagesArrivingTogetherShareATransaction(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 	const n = 60
 	hs, errs := handleAll(agg, "a", slices.Repeat([]msg{add{1, 1000}}, n))
@@ -146,7 +139,7 @@ func TestMessagesArrivingTogetherShareATransaction(t *testing.T) {
 // Messages recorded together are decided in order, each against the state
 // the ones before it left.
 func TestMessagesRecordedTogetherSeeTheOnesBeforeThem(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	hs, errs := handleAll(agg, "a", slices.Repeat([]msg{add{1, 10}}, 30))
 	accepted := 0
 	for i := range hs {
@@ -164,7 +157,7 @@ func TestMessagesRecordedTogetherSeeTheOnesBeforeThem(t *testing.T) {
 }
 
 func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	first, err := agg.Handle(ctx, "a", add{4, 10}, ledger.IdempotencyKey("k"))
 	if err != nil {
 		t.Fatal(err)
@@ -191,9 +184,14 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 	}
 	checkStream(t, agg, "a", 2, 5)
 
-	// A retry that lost its metadata still gets its first answer.
-	agg.Store = ledger.New(agg.Store.Pool())
-	if h, err := agg.Handle(ctx, "a", add{1, 10}, ledger.IdempotencyKey("k")); err != nil || !h.Duplicate {
+	// A retry that lost its metadata still gets its first answer, though its
+	// stream is cached and the store requires an actor.
+	strict := counterOn(ledger.New(agg.Store.Pool()))
+	as := ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_ana"})
+	if _, err := strict.Handle(as, "b", add{1, 10}, ledger.IdempotencyKey("k3")); err != nil {
+		t.Fatal(err)
+	}
+	if h, err := strict.Handle(ctx, "b", add{1, 10}, ledger.IdempotencyKey("k3")); err != nil || !h.Duplicate {
 		t.Fatalf("a retry without an actor: %+v, %v", h, err)
 	}
 }
@@ -202,7 +200,7 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 // it shares with others. The others are then recorded one by one, and only
 // the message whose view fails is refused.
 func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	view := totalsView(t, agg)
 	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
 		switch at.State.Total {
@@ -241,7 +239,7 @@ func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 }
 
 func TestAPanickingDeciderReachesItsCaller(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	agg.Decider.Decide = func(s counter, m msg) cairn.Decision[int, event, effect] {
 		if m.(add).N == 13 {
 			panic("unlucky")
@@ -257,7 +255,7 @@ func TestAPanickingDeciderReachesItsCaller(t *testing.T) {
 }
 
 func TestACallerThatHasGivenUpIsNotRecorded(t *testing.T) {
-	agg := cachedCounter(t)
+	agg := newCounter(t)
 	gone, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, err := agg.Handle(gone, "a", add{1, 100}); !errors.Is(err, context.Canceled) {
@@ -267,8 +265,7 @@ func TestACallerThatHasGivenUpIsNotRecorded(t *testing.T) {
 }
 
 func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
-	agg := newCounter(t)
-	agg.Cache = ledger.NewStateCache(1)
+	agg := counterOn(ledgertest.NewStore(t, ledger.StateCacheSize(1)))
 	for i := range 6 {
 		for _, id := range []string{"a", "b", "c"} {
 			if h, err := agg.Handle(ctx, id, add{1, 100}); err != nil || h.State.Total != i+1 {
@@ -278,5 +275,115 @@ func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
 	}
 	for _, id := range []string{"a", "b", "c"} {
 		checkStream(t, agg, id, 6, 6)
+	}
+}
+
+// A state with a map in it, so that a caller holding one could change what
+// the cache holds.
+type basket struct{ Items map[string]int }
+
+type put struct{ Item string }
+
+type placed struct{ Item string }
+
+var basketDecider = cairn.Decider[basket, put, int, placed, struct{}]{
+	Initial: func() basket { return basket{} },
+	Decide: func(s basket, m put) cairn.Decision[int, placed, struct{}] {
+		return cairn.Accept[int, placed, struct{}](s.Items[m.Item]+1, []placed{{m.Item}})
+	},
+	Evolve: func(s basket, e placed) basket {
+		items := maps.Clone(s.Items)
+		if items == nil {
+			items = map[string]int{}
+		}
+		items[e.Item]++
+		return basket{Items: items}
+	},
+}
+
+func newBasket(t *testing.T, store *ledger.Store) *ledger.Aggregate[basket, put, int, placed, struct{}] {
+	t.Helper()
+	msgs, events, effects := codec.New[put](), codec.New[placed](), codec.New[struct{}]()
+	codec.Register[put](msgs, "put", 1)
+	codec.Register[placed](events, "placed", 1)
+	return &ledger.Aggregate[basket, put, int, placed, struct{}]{
+		Store: store, Kind: "basket", Decider: basketDecider, Messages: msgs, Events: events, Effects: effects,
+	}
+}
+
+// The state Handle returns is a copy, so a caller that changes it changes
+// nothing the next decision sees.
+func TestACallerCannotChangeTheCachedState(t *testing.T) {
+	for _, how := range []string{"Clone", "StateVersion"} {
+		agg := newBasket(t, ledgertest.NewStore(t))
+		if how == "Clone" {
+			agg.Clone = func(s basket) basket { return basket{Items: maps.Clone(s.Items)} }
+		} else {
+			agg.StateVersion = "basket/1"
+		}
+		h, err := agg.Handle(ctx, "a", put{"apple"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.State.Items["apple"] = 100
+		if h, err = agg.Handle(ctx, "a", put{"apple"}); err != nil || h.Result != 2 {
+			t.Fatalf("%s: decided %d, %v; the caller's change reached the cache", how, h.Result, err)
+		}
+	}
+}
+
+// With no faithful way to copy its state, an aggregate's streams are not
+// cached: each message costs the two round trips it would with no cache.
+func TestAStateThatCannotBeCopiedIsNotCached(t *testing.T) {
+	pool, trips := tracedPool(t, 1)
+	agg := newBasket(t, ledger.New(pool, ledger.RequireActor(false)))
+	for i := range 4 {
+		trips.reset()
+		h, err := agg.Handle(ctx, "a", put{"apple"})
+		if err != nil || h.Result != i+1 {
+			t.Fatalf("decided %d, %v", h.Result, err)
+		}
+		if n := trips.trips.Load(); i > 1 && n != 2 {
+			t.Fatalf("took %d round trips, want the uncached 2", n)
+		}
+		h.State.Items["apple"] = 100
+	}
+}
+
+// Two processes taking turns on one stream make every cached state stale.
+// The cache notices, and reads the stream instead, so a message costs about
+// the two round trips it would with no cache rather than three.
+func TestAStreamSharedWithAnotherProcessCostsNoMoreThanWithoutACache(t *testing.T) {
+	agg, trips := tracedCounter(t, 1)
+	other := counterOn(ledger.New(agg.Store.Pool(), ledger.RequireActor(false)))
+
+	const n = 200
+	var mine int64
+	for i := range n {
+		if _, err := other.Handle(ctx, "a", add{1, 1 << 30}); err != nil {
+			t.Fatal(err)
+		}
+		trips.reset()
+		if _, err := agg.Handle(ctx, "a", add{1, 1 << 30}); err != nil {
+			t.Fatal(err)
+		}
+		if i >= 10 {
+			mine += trips.trips.Load()
+		}
+	}
+	if per := float64(mine) / (n - 10); per > 2.1 {
+		t.Fatalf("%.2f round trips per message, want about 2", per)
+	}
+	checkStream(t, agg, "a", 2*n, 2*n)
+
+	// Once the stream is this process's alone, the cache is trusted again.
+	for range 80 {
+		trips.reset()
+		if _, err := agg.Handle(ctx, "a", add{1, 1 << 30}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := trips.trips.Load(); n != 1 {
+		t.Fatalf("a stream no one else writes took %d round trips, want 1", n)
 	}
 }

@@ -37,7 +37,6 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 			},
 			Evolve: func(s tally, _ bumped) tally { s.N++; return s },
 		},
-		Cache: NewStateCache(10),
 	}
 	for range 2 {
 		if _, err := agg.Handle(ctx, "a", bump{}); err != nil {
@@ -46,7 +45,7 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 	}
 
 	stream := agg.Stream("a")
-	agg.Cache.put(stream.String(), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5})
+	store.cache.put(agg.cacheKey(stream), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5}, true)
 	h, err := agg.Handle(ctx, "a", bump{})
 	if err != nil {
 		t.Fatal(err)

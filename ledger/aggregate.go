@@ -45,11 +45,14 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// different actor is not recorded, so the two can never disagree.
 	Actor func(M) string
 
-	// Cache, when set, keeps streams' state in memory between messages, so
-	// that Handle can record a message in one round trip, and records the
-	// messages that arrive together for one stream in one transaction. See
-	// StateCache.
-	Cache *StateCache
+	// Clone, when set, returns a copy of a state that shares nothing with it.
+	// The store's state cache needs one (see StateCacheSize), so that a
+	// caller can never change the state it keeps. Without Clone, a state with
+	// no maps, slices, pointers or interfaces in it is copied by assignment;
+	// otherwise one is copied through JSON when StateVersion is set, since
+	// snapshots already rely on it surviving JSON; otherwise the aggregate's
+	// streams are not cached.
+	Clone func(S) S
 }
 
 // Stream names one of this aggregate's streams.
@@ -101,18 +104,21 @@ func collect(opts []Option) options {
 // transaction. A refusal is recorded and committed, then returned as the error
 // (a *cairn.Refusal) alongside the populated Handled.
 //
-// It costs two round trips. The first begins the transaction, locks the
-// stream and reads it; the second records the decision and commits, or for a
-// duplicate, rolls back. With a Cache holding the stream, it costs one.
+// It costs one round trip when the store's state cache holds the stream: the
+// message is decided at once, and recorded on condition that the stream is
+// still where the cache has it. Otherwise it costs two. The first begins the
+// transaction, locks the stream and reads it; the second records the decision
+// and commits, or for a duplicate, rolls back. Messages that arrive together
+// for one stream are recorded together. See docs/PERFORMANCE.md.
 func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg M, opts ...Option) (Handled[S, R], error) {
 	o := collect(opts)
 	r := &request[S, M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
 
 	var res result[S, R]
-	if a.Cache != nil {
+	if a.Store.cache != nil && a.copier() != nil {
 		res = a.handleCached(ctx, a.Stream(id), r)
-	} else if results, _, err := a.runGroup(ctx, a.Stream(id), []*request[S, M, R]{r}, nil); err != nil {
+	} else if results, _, _, err := a.runGroup(ctx, a.Stream(id), []*request[S, M, R]{r}, nil); err != nil {
 		res.err = err
 	} else {
 		res = results[0]
@@ -147,7 +153,7 @@ type result[S, R any] struct {
 var errUnchecked = errors.New("cairn: the message needs its idempotency key looked up")
 
 // runGroup records reqs on one stream, in order, in one transaction, and
-// returns each one's result and the stream's state after them all.
+// returns each one's result and the stream's state before and after them.
 //
 // Given cached, the stream's state as this process last recorded it, it
 // decides every message first and sends everything in one round trip, which
@@ -159,10 +165,10 @@ var errUnchecked = errors.New("cairn: the message needs its idempotency key look
 // An error is the transaction's, and nothing in it was recorded when the
 // database reported it (see retryable). Each request's own result says
 // whether its message was refused, a duplicate, or failed before it was sent.
-func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[S, M, R], cached *Loaded[S]) ([]result[S, R], Loaded[S], error) {
+func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[S, M, R], cached *Loaded[S]) (results []result[S, R], before, after Loaded[S], err error) {
 	conn, err := a.Store.pool.Acquire(ctx)
 	if err != nil {
-		return nil, Loaded[S]{}, err
+		return nil, Loaded[S]{}, Loaded[S]{}, err
 	}
 	defer release(conn)
 
@@ -172,12 +178,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		at   Loaded[S]
 		dups = make([]*pendingDuplicate, len(reqs))
 	)
-	b.own(sqlStep("beginning a transaction"), `BEGIN`)
 	if cached != nil {
+		// One batch, which Postgres runs as one implicit transaction: it
+		// commits as the batch ends unless a statement fails, in which case
+		// it rolls back with nothing left to end.
 		l, at = queueLockAt(&b, stream, cached.Seq), *cached
 	} else {
+		b.own(sqlStep("beginning a transaction"), `BEGIN`)
 		if l, err = queueLock(&b, []Stream{stream}); err != nil {
-			return nil, Loaded[S]{}, err
+			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 		load := a.queueLoad(&b, stream)
 		for i, r := range reqs {
@@ -186,15 +195,16 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			}
 		}
 		if err := b.send(ctx, conn); err != nil {
-			return nil, Loaded[S]{}, err
+			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 		if at, err = a.finishLoad(ctx, conn, load, l.seqs[stream.String()]); err != nil {
-			return nil, Loaded[S]{}, err
+			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 		b = Batch{}
 	}
+	before = at
 
-	results := make([]result[S, R], len(reqs))
+	results = make([]result[S, R], len(reqs))
 	finishes := make([]func() Handled[S, R], len(reqs))
 	var cause *Entry
 	now := recordingTime()
@@ -231,29 +241,31 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	if !anyRecorded(finishes) {
 		// Nothing to record. A transaction already begun is rolled back as the
 		// connection is released.
-		return results, at, nil
+		return results, before, at, nil
 	}
 
 	// One snapshot and one write per view, of the state after every message:
 	// views replace a stream's rows from its whole state.
 	if err := a.queueSnapshot(&b, &at); err != nil {
-		return nil, Loaded[S]{}, err
+		return nil, Loaded[S]{}, Loaded[S]{}, err
 	}
 	if cause != nil {
 		if err := a.queueViews(&b, at, *cause); err != nil {
-			return nil, Loaded[S]{}, err
+			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 	}
-	b.own(commitStep, `COMMIT`)
+	if cached == nil {
+		b.own(commitStep, `COMMIT`)
+	}
 	if err := b.send(ctx, conn); err != nil {
-		return nil, Loaded[S]{}, viewError(err, at)
+		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, at)
 	}
 	for i, finish := range finishes {
 		if finish != nil {
 			results[i].h = finish()
 		}
 	}
-	return results, at, nil
+	return results, before, at, nil
 }
 
 func anyRecorded[S, R any](finishes []func() Handled[S, R]) bool {

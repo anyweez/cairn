@@ -31,6 +31,7 @@ import (
 type Store struct {
 	pool         *pgxpool.Pool
 	requireActor bool
+	cache        *stateCache
 }
 
 // StoreOption configures a Store.
@@ -40,9 +41,29 @@ type StoreOption func(*Store)
 // It is on by default, so every entry is attributed; tests turn it off.
 func RequireActor(required bool) StoreOption { return func(s *Store) { s.requireActor = required } }
 
+// DefaultStateCacheSize is how many streams' state a store keeps in memory
+// unless told otherwise.
+const DefaultStateCacheSize = 10_000
+
+// StateCacheSize sets how many streams' state the store keeps in memory
+// between messages, for every aggregate on it. Zero turns the cache off, and
+// Handle then reads every stream before deciding. See docs/PERFORMANCE.md.
+func StateCacheSize(streams int) StoreOption {
+	return func(s *Store) {
+		s.cache = nil
+		if streams > 0 {
+			s.cache = newStateCache(streams)
+		}
+	}
+}
+
 // New returns a store over pool. Call Migrate before first use.
+//
+// The store keeps the state of up to DefaultStateCacheSize streams in memory,
+// so that Handle can record a message to a stream it has recently recorded to
+// in one round trip; StateCacheSize changes that.
 func New(pool *pgxpool.Pool, opts ...StoreOption) *Store {
-	s := &Store{pool: pool, requireActor: true}
+	s := &Store{pool: pool, requireActor: true, cache: newStateCache(DefaultStateCacheSize)}
 	for _, opt := range opts {
 		opt(s)
 	}
