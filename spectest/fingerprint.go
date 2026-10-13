@@ -13,11 +13,33 @@ import (
 // into a map or slice it shares with the state it was given.
 func fingerprint(v any) string {
 	var b strings.Builder
-	walk(&b, reflect.ValueOf(v), map[uintptr]bool{})
+	walk(&b, reflect.ValueOf(v), map[visit]bool{})
 	return b.String()
 }
 
-func walk(b *strings.Builder, v reflect.Value, seen map[uintptr]bool) {
+// visit identifies a pointer, map or slice on the current path, so a value
+// that contains itself renders as <cycle> instead of recursing forever. A
+// slice is only the same value at the same length.
+type visit struct {
+	ptr  uintptr
+	kind reflect.Kind
+	len  int
+}
+
+// enter marks v as on the path, or reports that it already is.
+func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
+	k := visit{ptr: v.Pointer(), kind: v.Kind()}
+	if v.Kind() == reflect.Slice {
+		k.len = v.Len()
+	}
+	if seen[k] {
+		return k, false
+	}
+	seen[k] = true
+	return k, true
+}
+
+func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 	if !v.IsValid() {
 		b.WriteString("<nil>")
 		return
@@ -28,14 +50,14 @@ func walk(b *strings.Builder, v reflect.Value, seen map[uintptr]bool) {
 			b.WriteString("nil")
 			return
 		}
-		if seen[v.Pointer()] {
+		k, ok := enter(seen, v)
+		if !ok {
 			b.WriteString("<cycle>")
 			return
 		}
-		seen[v.Pointer()] = true
 		b.WriteByte('&')
 		walk(b, v.Elem(), seen)
-		delete(seen, v.Pointer())
+		delete(seen, k)
 	case reflect.Interface:
 		if v.IsNil() {
 			b.WriteString("nil")
@@ -52,14 +74,32 @@ func walk(b *strings.Builder, v reflect.Value, seen map[uintptr]bool) {
 		}
 		b.WriteByte('}')
 	case reflect.Slice, reflect.Array:
-		if v.Kind() == reflect.Slice && v.IsNil() {
-			b.WriteString("nil")
-			return
+		if v.Kind() == reflect.Slice {
+			if v.IsNil() {
+				b.WriteString("nil")
+				return
+			}
+			k, ok := enter(seen, v)
+			if !ok {
+				b.WriteString("<cycle>")
+				return
+			}
+			defer delete(seen, k)
 		}
 		b.WriteByte('[')
 		for i := range v.Len() {
 			walk(b, v.Index(i), seen)
 			b.WriteByte(',')
+		}
+		// A slice's spare capacity is memory a successor can share: appending
+		// to the given state's slice writes there without changing its length.
+		if v.Kind() == reflect.Slice && v.Cap() > v.Len() {
+			b.WriteByte('|')
+			spare := v.Slice(v.Len(), v.Cap())
+			for i := range spare.Len() {
+				walk(b, spare.Index(i), seen)
+				b.WriteByte(',')
+			}
 		}
 		b.WriteByte(']')
 	case reflect.Map:
@@ -67,6 +107,12 @@ func walk(b *strings.Builder, v reflect.Value, seen map[uintptr]bool) {
 			b.WriteString("nil")
 			return
 		}
+		k, ok := enter(seen, v)
+		if !ok {
+			b.WriteString("<cycle>")
+			return
+		}
+		defer delete(seen, k)
 		type kv struct{ k, v string }
 		entries := make([]kv, 0, v.Len())
 		iter := v.MapRange()
@@ -76,7 +122,14 @@ func walk(b *strings.Builder, v reflect.Value, seen map[uintptr]bool) {
 			walk(&vb, iter.Value(), seen)
 			entries = append(entries, kv{kb.String(), vb.String()})
 		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].k < entries[j].k })
+		// Distinct keys can render alike (two pointers to equal values), so
+		// ties sort by value to keep the order independent of map iteration.
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].k != entries[j].k {
+				return entries[i].k < entries[j].k
+			}
+			return entries[i].v < entries[j].v
+		})
 		b.WriteString("map[")
 		for _, e := range entries {
 			b.WriteString(e.k + ":" + e.v + ",")

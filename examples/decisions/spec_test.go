@@ -77,9 +77,12 @@ func messages(t *rapid.T, s State) Msg {
 	case Open:
 		kinds = append(kinds, "add_option", "save_position", "save_position", "save_position", "record_outcome", "record_outcome")
 	case Decided, Superseded:
-		// Reopen directly too: set_status rarely draws open, and DR7 applies
-		// only when a settled decision reopens.
-		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "reopen", "supersede", "save_position")
+		// set_status rarely draws a particular status, so the moves the rules
+		// guard are drawn directly, often enough to be tried in every check:
+		// reopening (DR7), moving sideways to deferred or dropped (DR1), and
+		// recording again (DR6).
+		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "reopen", "supersede", "save_position",
+			"sideways", "sideways", "sideways", "record_outcome", "record_outcome", "record_outcome")
 	}
 	switch rapid.SampledFrom(kinds).Draw(t, "kind") {
 	case "create":
@@ -101,6 +104,8 @@ func messages(t *rapid.T, s State) Msg {
 		return SetStatus{By: member(), To: status("to")}
 	case "reopen":
 		return SetStatus{By: member(), To: Open}
+	case "sideways":
+		return SetStatus{By: member(), To: rapid.SampledFrom([]Status{Deferred, Dropped}).Draw(t, "to")}
 	case "supersede":
 		return Supersede{
 			By:               member(),
