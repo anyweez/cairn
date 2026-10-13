@@ -51,6 +51,9 @@ var benchLoads = withCache([]benchLoad{
 	// One stream's callers split between two processes, as an unrouted load
 	// balancer would leave them: each process's cache keeps going stale.
 	{name: "hot/callers=2/instances=2", callers: 2, pool: 2, hot: true, instances: 2},
+	// More callers split the same way: the stream's lock caps them however
+	// many there are, where routed to one process they'd share transactions.
+	{name: "hot/callers=8/instances=2", callers: 8, pool: 8, hot: true, instances: 2},
 	// A stream per caller and a connection per caller: no contention.
 	{name: "spread/callers=32/pool=32", callers: 32, pool: 32},
 	// The same callers on pgxpool's default size on a 4-CPU host.
