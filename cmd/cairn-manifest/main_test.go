@@ -98,12 +98,12 @@ func TestCairnManifestIsCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := os.ReadFile(filepath.Join("../..", "spec.manifest.json"))
+	want, err := os.ReadFile(filepath.Join("../..", "spec.manifest.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != string(want) {
-		t.Fatal("spec.manifest.json is stale: run go -C cmd/cairn-manifest run . -dir ../..")
+		t.Fatal("spec.manifest.yaml is stale: run go -C cmd/cairn-manifest run . -dir ../..")
 	}
 }
 
@@ -126,7 +126,7 @@ func TestRunChecksTheBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := run("testdata/good", "-", write("same.json", same), []string{"./..."}); err != nil {
+	if err := run("testdata/good", "-", write("same.yaml", same), []string{"./..."}); err != nil {
 		t.Errorf("an unchanged base must pass: %v", err)
 	}
 
@@ -135,13 +135,21 @@ func TestRunChecksTheBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = run("testdata/good", "-", write("older.json", older), []string{"./..."})
+	err = run("testdata/good", "-", write("older.yaml", older), []string{"./..."})
 	if err == nil || !strings.Contains(err.Error(), "good.published changed shape without a version bump") {
 		t.Errorf("a reshaped codec must fail against the base, got %v", err)
 	}
 
-	if err := run("testdata/good", "-", write("bad.json", []byte("{")), []string{"./..."}); err == nil {
+	if err := run("testdata/good", "-", write("bad.yaml", []byte("codecs: [")), []string{"./..."}); err == nil {
 		t.Error("an unreadable base must fail, not pass")
+	}
+
+	// A base branch from before the switch to YAML has the manifest as JSON.
+	legacy := `{"rules": [], "tables": [], "codecs": [{"sum": "example.com/good.Event", "name": "good.published",
+		"version": 3, "type": "example.com/good.Published_", "upcasts": [1, 2], "fields": ["gone: int"]}]}`
+	err = run("testdata/good", "-", write("spec.manifest.json", []byte(legacy)), []string{"./..."})
+	if err == nil || !strings.Contains(err.Error(), "good.published changed shape without a version bump") {
+		t.Errorf("a JSON base must still be read and checked, got %v", err)
 	}
 }
 

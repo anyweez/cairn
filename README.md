@@ -163,7 +163,7 @@ short check by chance.
 
 ## The spec manifest
 
-[`spec.manifest.json`](spec.manifest.json) lists every rule, every type
+[`spec.manifest.yaml`](spec.manifest.yaml) lists every rule, every type
 stored in the ledger (its codec name, version, upcasters and JSON shape), and
 every fsm table. It's generated from the code and committed, so a review
 reads a change to the spec as a diff of that file: a rule added, demoted or

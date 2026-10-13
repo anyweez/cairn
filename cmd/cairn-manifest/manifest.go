@@ -22,48 +22,48 @@ const (
 
 // Manifest is a module's spec as a reviewer reads it.
 type Manifest struct {
-	Rules  []Rule  `json:"rules"`
-	Codecs []Codec `json:"codecs"`
-	Tables []Table `json:"tables"`
+	Rules  []Rule  `yaml:"rules"`
+	Codecs []Codec `yaml:"codecs"`
+	Tables []Table `yaml:"tables"`
 }
 
 // Rule is one spec.Rule declared as a package-level variable.
 type Rule struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"`
-	Status    string `json:"status"`
-	Statement string `json:"statement"`
-	Package   string `json:"package"`
+	ID        string `yaml:"id"`
+	Kind      string `yaml:"kind"`
+	Status    string `yaml:"status"`
+	Statement string `yaml:"statement"`
+	Package   string `yaml:"package"`
 }
 
 // Codec is one type registered with codec.Register outside a test file: a
 // type whose values are stored in the ledger.
 type Codec struct {
 	// Sum is the sum type the codec encodes, Name the registered name.
-	Sum     string `json:"sum"`
-	Name    string `json:"name"`
-	Version int    `json:"version"`
-	Type    string `json:"type"`
+	Sum     string `yaml:"sum"`
+	Name    string `yaml:"name"`
+	Version int    `yaml:"version"`
+	Type    string `yaml:"type"`
 	// Upcasts lists the versions that have an upcaster to the next one.
-	Upcasts []int `json:"upcasts,omitempty"`
+	Upcasts []int `yaml:"upcasts,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
 	// "?" after the name of an omitempty field.
-	Fields []string `json:"fields"`
+	Fields []string `yaml:"fields"`
 }
 
 func (c Codec) key() string { return c.Sum + " " + c.Name }
 
 // Table is one fsm table declared as a package-level variable.
 type Table struct {
-	Name  string `json:"name"`
-	Edges []Edge `json:"edges"`
+	Name  string `yaml:"name"`
+	Edges []Edge `yaml:"edges"`
 }
 
 // Edge is one allowed transition.
 type Edge struct {
-	From string `json:"from"`
-	On   string `json:"on"`
-	To   string `json:"to"`
+	From string `yaml:"from"`
+	On   string `yaml:"on"`
+	To   string `yaml:"to"`
 }
 
 // Extract loads the packages matching patterns in dir, with their tests, and
