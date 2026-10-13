@@ -133,6 +133,131 @@ func TestConcurrentHandlesOnOneStreamSerialize(t *testing.T) {
 	}
 }
 
+// Transactions that lock overlapping sets of streams queue behind one another.
+// The global log must still hand out each stream's entries in seq order, or a
+// projection would fold a stream's history out of order.
+func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
+	agg := newCounter(t)
+	ids := []string{"s0", "s1", "s2", "s3"}
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Go(func() {
+			for i := range 15 {
+				pair := []string{ids[(w+i)%len(ids)], ids[(w+2*i+1)%len(ids)]}
+				err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+					if err := tx.Lock(ctx, agg.Stream(pair[0]), agg.Stream(pair[1])); err != nil {
+						return err
+					}
+					for _, id := range pair {
+						at, err := agg.LoadLocked(ctx, tx, id)
+						if err != nil {
+							return err
+						}
+						if _, err := agg.Apply(ctx, tx, &at, add{1, 1 << 30}); err != nil {
+							return err
+						}
+						if pair[0] == pair[1] {
+							break
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	last := map[string]int64{}
+	for cursor, total := (ledger.Cursor{}), 0; ; {
+		entries, next, err := agg.Store.ReadAll(ctx, cursor, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) == 0 {
+			if total == 0 {
+				t.Fatal("read nothing")
+			}
+			break
+		}
+		for _, e := range entries {
+			if e.Seq != last[e.Stream]+1 {
+				t.Fatalf("%s#%d arrived after #%d", e.Stream, e.Seq, last[e.Stream])
+			}
+			last[e.Stream] = e.Seq
+		}
+		total += len(entries)
+		cursor = next
+	}
+}
+
+// An entry that commits after a later one must not be skipped by a reader that
+// has already moved its cursor past the later one.
+func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
+	agg := newCounter(t)
+	appended, release, done := make(chan struct{}), make(chan struct{}), make(chan error)
+	go func() {
+		done <- agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+			if err := tx.Lock(ctx, agg.Stream("slow")); err != nil {
+				return err
+			}
+			at, err := agg.LoadLocked(ctx, tx, "slow")
+			if err != nil {
+				return err
+			}
+			if _, err := agg.Apply(ctx, tx, &at, add{1, 10}); err != nil {
+				return err
+			}
+			close(appended)
+			<-release
+			return nil
+		})
+	}()
+	<-appended
+	if _, err := agg.Handle(ctx, "fast", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, cursor, err := agg.Store.ReadAll(ctx, ledger.Cursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("read %d entries past a transaction still in flight", len(entries))
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err = agg.Store.ReadAll(ctx, cursor, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Stream != "counter/slow" || entries[1].Stream != "counter/fast" {
+		t.Fatalf("got %+v", entries)
+	}
+}
+
+func TestLockMustComeBeforeAnyWrite(t *testing.T) {
+	agg := newCounter(t)
+	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE scratch (x int)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO scratch VALUES (1)`); err != nil {
+			return err
+		}
+		return tx.Lock(ctx, agg.Stream("late"))
+	})
+	if err == nil {
+		t.Fatal("Lock after a write must fail: the transaction already has its place in the log")
+	}
+}
+
 func TestIdempotencyKeyAnswersARetryWithoutDecidingAgain(t *testing.T) {
 	agg := newCounter(t)
 	first, err := agg.Handle(ctx, "a", add{4, 10}, ledger.IdempotencyKey("req-1"))
@@ -279,6 +404,80 @@ func TestOutboxRetriesUntilDelivered(t *testing.T) {
 	}
 	if fmt.Sprint(delivered) != "[counter/a#1.0=1@2 counter/a#2.0=2@1]" {
 		t.Fatalf("delivered %v", delivered)
+	}
+}
+
+// A dispatcher whose lease ran out must not record an outcome for an effect
+// another dispatcher has since claimed.
+func TestAnExpiredClaimCannotRecordAnOutcome(t *testing.T) {
+	agg := newCounter(t)
+	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	var slow *ledger.Dispatcher[effect]
+	fast := &ledger.Dispatcher[effect]{
+		Store: agg.Store, Kind: "counter", Effects: agg.Effects,
+		Handle: func(_ context.Context, d ledger.Delivery[effect]) error {
+			calls = append(calls, fmt.Sprintf("fast@%d", d.Attempt))
+			return nil
+		},
+	}
+	slow = &ledger.Dispatcher[effect]{
+		Store: agg.Store, Kind: "counter", Effects: agg.Effects, Lease: 50 * time.Millisecond,
+		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
+			calls = append(calls, fmt.Sprintf("slow@%d", d.Attempt))
+			<-ctx.Done() // outlives its lease
+			time.Sleep(50 * time.Millisecond)
+			if _, err := fast.DrainOnce(context.Background()); err != nil {
+				t.Error(err)
+			}
+			return errors.New("timed out")
+		},
+	}
+	if _, err := slow.DrainOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var attempts int
+	var done, failed bool
+	var lastError *string
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT attempts, done_at IS NOT NULL, failed_at IS NOT NULL, last_error
+FROM cairn.outbox`).Scan(&attempts, &done, &failed, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(calls) != "[slow@1 fast@2]" || attempts != 2 || !done || failed || lastError != nil {
+		t.Fatalf("calls %v, attempts %d, done %v, failed %v, last error %v", calls, attempts, done, failed, lastError)
+	}
+}
+
+// An effect whose dispatchers keep dying before recording an outcome is given
+// up on rather than claimed forever.
+func TestAnEffectClaimedTooOftenWithoutAnOutcomeIsFailed(t *testing.T) {
+	agg := newCounter(t)
+	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
+		t.Fatal(err)
+	}
+	// Two claims whose dispatchers died: attempts counted, nothing recorded.
+	if _, err := agg.Store.Pool().Exec(ctx, `UPDATE cairn.outbox SET attempts = 2`); err != nil {
+		t.Fatal(err)
+	}
+	d := &ledger.Dispatcher[effect]{
+		Store: agg.Store, Kind: "counter", Effects: agg.Effects, MaxAttempts: 2,
+		Handle: func(context.Context, ledger.Delivery[effect]) error {
+			t.Error("an effect past MaxAttempts must not be delivered again")
+			return nil
+		},
+	}
+	if _, err := d.DrainOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var failed bool
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT failed_at IS NOT NULL FROM cairn.outbox`).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if !failed {
+		t.Fatal("effect not marked failed")
 	}
 }
 

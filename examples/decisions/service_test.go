@@ -52,6 +52,7 @@ func TestRegisterOnTheLedger(t *testing.T) {
 	second, err := svc.Create(ctx, "ana", "Ship the beta to everyone?", "yes")
 	must(t, err)
 	refused(t, svc.Supersede(ctx, first, second, "ana"), NotAllowed) // the replacement is still open
+	refused(t, svc.Supersede(ctx, first, "", "ana"), Invalid)
 	state, err = svc.Get(ctx, second)
 	must(t, err)
 	must(t, svc.RecordOutcome(ctx, second, "cy", state.Options[0].ID, "metrics held"))

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -16,8 +17,14 @@ import (
 //	m := machine()
 //	m.Decider.Decide = mutant
 //	if _, failed := spectest.Fails(t, m.Check); !failed { t.Fatal("mutant survived") }
+//
+// Fails changes a process-wide rapid flag while it runs, so calls are
+// serialized; a parallel test running an ordinary Check at the same time only
+// loses its fail file.
 func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	t.Helper()
+	failsMu.Lock()
+	defer failsMu.Unlock()
 	// A mutant's failure is the expected outcome, not one to reproduce later:
 	// a saved fail file would be replayed against the next mutant of the same
 	// test name instead of letting it search.
@@ -37,6 +44,8 @@ func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	}()
 	return r.message.String(), r.failed
 }
+
+var failsMu sync.Mutex
 
 var errStop = &struct{ string }{"spectest: recorded failure"}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,36 +230,40 @@ func TestWinnerMayStillAnswerTheOutcome(t *testing.T) {
 
 // A mutant decider must fail the spec: this is how the rules prove they have teeth.
 func TestRegisterSpecCatchesMutants(t *testing.T) {
-	mutants := map[string]func(State, Msg) decision{
+	type mutant struct {
+		rule   string // the rule that must catch it
+		decide func(State, Msg) decision
+	}
+	mutants := map[string]mutant{
 		// Positions keep changing after the outcome is recorded.
-		"no freeze": func(s State, m Msg) decision {
+		"no freeze": {"DR5", func(s State, m Msg) decision {
 			if p, ok := m.(SavePosition); ok && s.Status == Decided && p.Body != "" && (p.Option == "" || s.option(p.Option)) {
 				return accept(s, PositionSaved{Member: p.By, Option: p.Option, Body: p.Body})
 			}
 			return decide(s, m)
-		},
+		}},
 		// Dropping a decided decision without reopening it.
-		"settled moves sideways": func(s State, m Msg) decision {
+		"settled moves sideways": {"DR1", func(s State, m Msg) decision {
 			if st, ok := m.(SetStatus); ok && s.Status == Decided && st.To == Dropped {
 				return decision{Result: Result{Status: Dropped}, Events: []Event{StatusChanged{From: s.Status, To: Dropped}}}
 			}
 			return decide(s, m)
-		},
+		}},
 		// Recording again overwrites the outcome in place.
-		"outcome rewritten": func(s State, m Msg) decision {
+		"outcome rewritten": {"DR6", func(s State, m Msg) decision {
 			if r, ok := m.(RecordOutcome); ok && s.Status == Decided && s.option(r.Chosen) && r.Rationale != "" {
 				return accept(s, DecisionRecorded{Outcome: Outcome{Chosen: r.Chosen, Rationale: r.Rationale, DecidedBy: r.By, DecidedAt: r.At}})
 			}
 			return decide(s, m)
-		},
+		}},
 	}
-	for name, mutant := range mutants {
+	for name, mut := range mutants {
 		t.Run(name, func(t *testing.T) {
 			m := machine()
-			m.Decider.Decide = mutant
+			m.Decider.Decide = mut.decide
 			msg, failed := spectest.Fails(t, m.Check)
-			if !failed {
-				t.Fatalf("the spec did not catch the %q mutant", name)
+			if !strings.Contains(msg, mut.rule+" violated") {
+				t.Fatalf("the %q mutant must be caught by %s; failed %v: %s", name, mut.rule, failed, firstLine(msg))
 			}
 			t.Logf("caught: %s", firstLine(msg))
 		})
@@ -275,9 +280,9 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 			}
 			return evolve(s, e)
 		}
-		msg, failed := spectest.Fails(t, m.Check)
-		if !failed {
-			t.Fatal("aliasing Evolve was not caught")
+		msg, _ := spectest.Fails(t, m.Check)
+		if !strings.Contains(msg, spectest.Isolated.ID+" violated") {
+			t.Fatalf("aliasing Evolve must be caught by %s: %s", spectest.Isolated.ID, firstLine(msg))
 		}
 		t.Logf("caught: %s", firstLine(msg))
 	})

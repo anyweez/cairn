@@ -142,9 +142,12 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, rep *report) {
 		decision := first.value
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state for %+v", msg))
 
-		second, _ := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
-		j(Deterministic, spec.Check(reflect.DeepEqual(decision, second.value),
-			"decided %+v, then %+v", decision, second.value))
+		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
+		j(Total, spec.Check(secondOK, "Decide panicked on its second call with %+v: %v", msg, second.panic))
+		if ok && secondOK {
+			j(Deterministic, spec.Check(reflect.DeepEqual(decision, second.value),
+				"decided %+v, then %+v", decision, second.value))
+		}
 
 		j(RefusalInert, spec.Check(!decision.Refused() || (len(decision.Events) == 0 && len(decision.Effects) == 0),
 			"refused %s but carried %d events and %d effects", decision.Refusal, len(decision.Events), len(decision.Effects)))
@@ -331,11 +334,32 @@ func (m model[MS, S, M, R]) start() refinementRun[S, M, R] {
 type modelRun[MS, S, M, R any] struct {
 	def   Model[MS, S, M, R]
 	state MS
+	// diverged is set at the model's first disagreement. A proposed model's run
+	// goes on, but there is no mapping back from the machine's state, so every
+	// later comparison would only repeat the first.
+	diverged bool
 }
 
-func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict { return r.def.Agree(impl, r.state) }
+func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict {
+	v := r.def.Agree(impl, r.state)
+	_, r.diverged = v.Failed()
+	return v
+}
 
 func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
+	if r.diverged {
+		return nil
+	}
+	verdicts := r.compare(msg, result, refusal, after)
+	for _, v := range verdicts {
+		if _, failed := v.Failed(); failed {
+			r.diverged = true
+		}
+	}
+	return verdicts
+}
+
+func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
 	next, want, wantRefusal := r.def.Step(r.state, msg)
 	code := func(r *cairn.Refusal) string {
 		if r == nil {

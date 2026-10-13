@@ -96,7 +96,14 @@ func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
 // Lock takes the write lock on every stream the transaction will touch,
 // creating streams that do not exist yet. Locks are taken in a fixed order,
 // which is why they must all be taken at once: two transactions that lock
-// overlapping streams can then never deadlock. Lock may be called once.
+// overlapping streams can then never deadlock. Lock may be called once, and
+// must come before the transaction's first write.
+//
+// The global log is ordered by transaction ID, and Postgres assigns that ID at
+// a transaction's first write. Every stream lock is therefore an advisory
+// lock taken while the transaction has no ID yet: a transaction that queues
+// behind another for a stream is assigned its ID after the other's, so its
+// entries follow the other's in the log as they do in the stream.
 func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
 	if tx.locked != nil {
 		return errors.New("cairn: Lock may be called once per transaction; pass every stream to one call")
@@ -104,12 +111,40 @@ func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
 	sorted := slices.Clone(streams)
 	slices.SortFunc(sorted, func(a, b Stream) int { return strings.Compare(a.String(), b.String()) })
 	sorted = slices.CompactFunc(sorted, func(a, b Stream) bool { return a == b })
-
-	tx.locked = make(map[string]int64, len(sorted))
-	for _, st := range sorted {
+	names := make([]string, len(sorted))
+	for i, st := range sorted {
 		if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
 			return fmt.Errorf("cairn: invalid stream %q", st)
 		}
+		names[i] = st.String()
+	}
+
+	var assigned bool
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id_if_assigned() IS NOT NULL`).Scan(&assigned); err != nil {
+		return fmt.Errorf("cairn: locking streams: %w", err)
+	}
+	if assigned {
+		return errors.New("cairn: Lock must come before the transaction's first write")
+	}
+	// Ordered by lock key, not by name, so that two streams whose keys collide
+	// are still taken in one global order.
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT hashtextextended(s, 0) AS k FROM unnest($1::text[]) AS s ORDER BY k`, names)
+	if err != nil {
+		return fmt.Errorf("cairn: locking streams: %w", err)
+	}
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return fmt.Errorf("cairn: locking streams: %w", err)
+	}
+	for _, k := range keys {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, k); err != nil {
+			return fmt.Errorf("cairn: locking streams: %w", err)
+		}
+	}
+
+	tx.locked = make(map[string]int64, len(sorted))
+	for _, st := range sorted {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO cairn.streams (stream, kind) VALUES ($1, $2) ON CONFLICT (stream) DO NOTHING`,
 			st.String(), st.Kind); err != nil {
@@ -276,6 +311,9 @@ WHERE (txid, position) > ($1::text::xid8, $2)
 		sql += ` AND kind = ANY($3)`
 		args = append(args, kinds)
 	}
+	if limit <= 0 {
+		limit = 100
+	}
 	sql += fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit)
 	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
@@ -284,8 +322,8 @@ WHERE (txid, position) > ($1::text::xid8, $2)
 	return scanEntries(rows)
 }
 
-// ReadAll returns up to limit entries after the cursor, in commit order,
-// optionally only of the given kinds. Entries from transactions still in
+// ReadAll returns up to limit entries after the cursor, in transaction order
+// (each stream's entries in seq order), optionally only of the given kinds. Entries from transactions still in
 // flight are held back until every older transaction has finished, so a
 // reader that advances its cursor past what it read never misses an entry.
 func (s *Store) ReadAll(ctx context.Context, after Cursor, limit int, kinds ...string) ([]Entry, Cursor, error) {
