@@ -217,7 +217,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 	if err := b.send(ctx, conn); err != nil {
 		return Loaded[S]{}, err
 	}
-	return a.finishLoad(ctx, a.Store.pool, load, seq)
+	// Any read finishLoad needs goes on this connection: asking the pool for
+	// another while holding this one can wait forever on a full pool.
+	return a.finishLoad(ctx, conn, load, seq)
 }
 
 // LoadLocked reads the state of a stream the transaction has locked.
