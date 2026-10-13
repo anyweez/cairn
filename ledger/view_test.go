@@ -24,7 +24,7 @@ func totalsView(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, ef
 	}
 	return ledger.View[counter]{
 		Name: "counter_totals",
-		Write: func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter]) error {
+		Write: func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter], _ ledger.Entry) error {
 			_, err := tx.Exec(ctx, `
 INSERT INTO counter_totals VALUES ($1, $2, $3)
 ON CONFLICT (id) DO UPDATE SET total = excluded.total, seq = excluded.seq`, at.Stream.ID, at.State.Total, at.Seq)
@@ -119,7 +119,7 @@ func TestARefusalLeavesTheViewAlone(t *testing.T) {
 func TestAFailingViewRefusesToRecordTheMessage(t *testing.T) {
 	agg := newCounter(t)
 	broken := errors.New("view is broken")
-	agg.Views = []ledger.View[counter]{{Name: "broken", Write: func(context.Context, pgx.Tx, ledger.Loaded[counter]) error {
+	agg.Views = []ledger.View[counter]{{Name: "broken", Write: func(context.Context, pgx.Tx, ledger.Loaded[counter], ledger.Entry) error {
 		return broken
 	}}}
 
@@ -170,10 +170,10 @@ func TestAWriteDuringRebuildIsNotOverwritten(t *testing.T) {
 	// The rebuild has read the stream, and pauses before writing its row.
 	read := make(chan struct{})
 	slow := view
-	slow.Write = func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter]) error {
+	slow.Write = func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter], cause ledger.Entry) error {
 		close(read)
 		time.Sleep(200 * time.Millisecond)
-		return view.Write(ctx, tx, at)
+		return view.Write(ctx, tx, at, cause)
 	}
 
 	var wg sync.WaitGroup

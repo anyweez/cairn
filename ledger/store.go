@@ -29,11 +29,25 @@ import (
 
 // Store is a ledger in one Postgres database.
 type Store struct {
-	pool *pgxpool.Pool
+	pool         *pgxpool.Pool
+	requireActor bool
 }
 
+// StoreOption configures a Store.
+type StoreOption func(*Store)
+
+// RequireActor says whether every message must have an actor in its metadata.
+// It is on by default, so every entry is attributed; tests turn it off.
+func RequireActor(required bool) StoreOption { return func(s *Store) { s.requireActor = required } }
+
 // New returns a store over pool. Call Migrate before first use.
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool, opts ...StoreOption) *Store {
+	s := &Store{pool: pool, requireActor: true}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
 
 // Pool returns the underlying pool, for projections that keep their read
 // models in the same database.
@@ -60,6 +74,7 @@ type Entry struct {
 	Events         []codec.Envelope
 	Effects        []codec.Envelope
 	IdempotencyKey string
+	Meta           Meta
 	RecordedAt     time.Time
 }
 
@@ -206,6 +221,16 @@ func (tx *Tx) append(ctx context.Context, stream Stream, e Entry) (Entry, error)
 	if e.IdempotencyKey != "" {
 		key = &e.IdempotencyKey
 	}
+	extra := []byte(`{}`)
+	if len(e.Meta.Extra) > 0 {
+		if extra, err = json.Marshal(e.Meta.Extra); err != nil {
+			return Entry{}, fmt.Errorf("cairn: encoding metadata for %s: %w", stream, err)
+		}
+	}
+	var occurred *time.Time
+	if !e.Meta.OccurredAt.IsZero() {
+		occurred = &e.Meta.OccurredAt
+	}
 
 	// The first entry creates the stream; Lock only reserved it.
 	if _, err := tx.Exec(ctx, `
@@ -217,10 +242,13 @@ ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
 
 	var txid string
 	err = tx.QueryRow(ctx, `
-INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, effects, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, effects, idempotency_key,
+    actor, via, correlation_id, causation_id, occurred_at, extra)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+    nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15)
 RETURNING position, txid::text, recorded_at`,
 		e.Stream, e.Kind, e.Seq, message, nullJSON(e.Result), refusal, events, effects, key,
+		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra,
 	).Scan(&e.Position, &txid, &e.RecordedAt)
 	if err != nil {
 		return Entry{}, fmt.Errorf("cairn: appending to %s: %w", stream, err)
@@ -262,7 +290,8 @@ func nullJSON(raw json.RawMessage) any {
 // the column in ORDER BY txid, which would then sort the log as text ("1000"
 // before "999").
 const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, message, result, refusal, events, effects,
-coalesce(idempotency_key, ''), recorded_at`
+coalesce(idempotency_key, ''), recorded_at,
+coalesce(actor, ''), coalesce(via, ''), coalesce(correlation_id, ''), coalesce(causation_id, ''), occurred_at, extra`
 
 func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	defer rows.Close()
@@ -273,10 +302,21 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 			txid                    string
 			message, events, effect []byte
 			result, refusal         []byte
+			occurred                *time.Time
+			extra                   []byte
 		)
 		if err := rows.Scan(&e.Position, &txid, &e.Stream, &e.Kind, &e.Seq, &message, &result, &refusal,
-			&events, &effect, &e.IdempotencyKey, &e.RecordedAt); err != nil {
+			&events, &effect, &e.IdempotencyKey, &e.RecordedAt,
+			&e.Meta.Actor, &e.Meta.Via, &e.Meta.CorrelationID, &e.Meta.CausationID, &occurred, &extra); err != nil {
 			return nil, err
+		}
+		if occurred != nil {
+			e.Meta.OccurredAt = *occurred
+		}
+		if string(extra) != "{}" {
+			if err := json.Unmarshal(extra, &e.Meta.Extra); err != nil {
+				return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
+			}
 		}
 		var err error
 		if e.TxID, err = strconv.ParseUint(txid, 10, 64); err != nil {

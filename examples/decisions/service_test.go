@@ -27,7 +27,8 @@ func must(t *testing.T, err error) {
 
 func TestRegisterOnTheLedger(t *testing.T) {
 	ctx := context.Background()
-	svc := NewService(ledgertest.NewStore(t))
+	// Every message names its sender, so the register needs no actor in context.
+	svc := NewService(ledgertest.NewStore(t, ledger.RequireActor(true)))
 
 	first, err := svc.Create(ctx, "ana", "Ship the beta?", "yes", "not yet")
 	must(t, err)
@@ -79,6 +80,13 @@ func TestRegisterOnTheLedger(t *testing.T) {
 	must(t, err)
 	if state.Status != Open || state.Outcome != nil || state.SupersededBy != "" || state.Positions["ben"].Committed != nil {
 		t.Fatalf("reopened decision: %+v", state)
+	}
+
+	// Each entry is attributed to the member its message names.
+	entries, err := svc.Register.Store.ReadStream(ctx, svc.Register.Stream(first), 0)
+	must(t, err)
+	if entries[0].Meta.Actor != "ana" || entries[2].Meta.Actor != "ben" || entries[3].Meta.Actor != "cy" {
+		t.Fatalf("actors: %q %q %q", entries[0].Meta.Actor, entries[2].Meta.Actor, entries[3].Meta.Actor)
 	}
 
 	// Every stored decision is one the current decider would make again.

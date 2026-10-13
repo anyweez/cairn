@@ -26,11 +26,36 @@ func NewService(store *ledger.Store) *Service {
 			Store: store, Kind: "decision", Decider: Decider,
 			Messages: msgs, Events: events, Effects: effects,
 			StateVersion: "decision/1",
+			Actor:        sender,
 		},
 		Now: time.Now,
 		// Random, so a restarted process never mints an ID already in the ledger.
 		NewID: func(prefix string) string { return prefix + rand.Text()[:16] },
 	}
+}
+
+// sender is the member a message names as its sender. The ledger records it
+// as the entry's actor, and refuses a request whose metadata names anyone else.
+func sender(m Msg) string {
+	switch m := m.(type) {
+	case Create:
+		return m.By
+	case Edit:
+		return m.By
+	case AddOption:
+		return m.By
+	case SavePosition:
+		return m.By
+	case RecordOutcome:
+		return m.By
+	case SetStatus:
+		return m.By
+	case Supersede:
+		return m.By
+	case Acknowledge:
+		return m.By
+	}
+	return ""
 }
 
 // Create files a decision with its seed options and returns its ID.

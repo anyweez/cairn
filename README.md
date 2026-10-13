@@ -107,6 +107,9 @@ accounts := &ledger.Aggregate[Account, Msg, int, Event, Effect]{
 	Messages: msgs, Events: events, Effects: effects, // codecs
 }
 
+// Usually set once per request, by middleware. Every entry needs an actor.
+ctx = ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_alice", Via: "api", CorrelationID: requestID})
+
 accounts.Handle(ctx, "alice", Deposit{50})
 accounts.Handle(ctx, "alice", Withdraw{80}) // refused, and the refusal is recorded
 accounts.Handle(ctx, "alice", Withdraw{45}) // balance 5; WarnLowBalance goes to the outbox
@@ -124,7 +127,19 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   whole state, which makes it safe to run again: `Aggregate.Rebuild` fills a
   new or changed view from current state, while messages keep arriving.
   Read models that combine streams use a projection instead, which is
-  eventually consistent.
+  eventually consistent. A view is also handed the entry that caused the
+  write, for display columns like `updated_by`.
+- **Every entry is attributed.** Each entry records who sent the message
+  (`Actor`), through what (`Via`), the flow it belongs to (`CorrelationID`),
+  what directly caused it (`CausationID`) and when the producer says it
+  happened (`OccurredAt`). Metadata comes from the context, set once per
+  request, or `WithMeta` for one message. A message with no actor is refused
+  unless the store is built with `RequireActor(false)`. Set `Aggregate.Actor`
+  when messages name their own sender, and a request whose metadata names
+  someone else is refused. A message recorded while carrying out an effect is
+  caused by that delivery, in the same flow. `Decide` never sees metadata:
+  what a decision depends on belongs in the message, where `Verify` can
+  replay it.
 - **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
   transaction needs in one sorted call, so overlapping transactions cannot
   deadlock. Locking a stream doesn't create it: a stream exists once its first

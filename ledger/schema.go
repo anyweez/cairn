@@ -92,6 +92,18 @@ CREATE TABLE cairn.checkpoints (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 `,
+	// 2: who sent each message, through what, and why.
+	`
+ALTER TABLE cairn.entries
+    ADD COLUMN actor          text,
+    ADD COLUMN via            text,
+    ADD COLUMN correlation_id text,
+    ADD COLUMN causation_id   text,
+    ADD COLUMN occurred_at    timestamptz,
+    ADD COLUMN extra          jsonb NOT NULL DEFAULT '{}';
+CREATE INDEX entries_actor ON cairn.entries (actor, position) WHERE actor IS NOT NULL;
+CREATE INDEX entries_correlation ON cairn.entries (correlation_id, position) WHERE correlation_id IS NOT NULL;
+`,
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every
