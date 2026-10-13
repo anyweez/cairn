@@ -391,7 +391,7 @@ func TestSnapshotsAreUsedAndIgnoredWhenTheirVersionChanges(t *testing.T) {
 		}
 	}
 	var seq int64
-	if err := agg.Store.Pool().QueryRow(ctx, `SELECT seq FROM cairn.snapshots WHERE stream = 'counter/a'`).Scan(&seq); err != nil {
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT seq FROM cairn.state_snapshots WHERE stream = 'counter/a'`).Scan(&seq); err != nil {
 		t.Fatal(err)
 	}
 	if seq != 4 {
@@ -400,7 +400,7 @@ func TestSnapshotsAreUsedAndIgnoredWhenTheirVersionChanges(t *testing.T) {
 
 	// Doctor the snapshot to prove Load reads it: 100 from the snapshot plus
 	// the one entry after it.
-	if _, err := agg.Store.Pool().Exec(ctx, `UPDATE cairn.snapshots SET state = '{"Total": 100}'`); err != nil {
+	if _, err := agg.Store.Pool().Exec(ctx, `UPDATE cairn.state_snapshots SET state = '{"Total": 100}'`); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := agg.Load(ctx, "a")
@@ -417,6 +417,41 @@ func TestSnapshotsAreUsedAndIgnoredWhenTheirVersionChanges(t *testing.T) {
 	}
 	if loaded.State.Total != 5 {
 		t.Fatalf("loaded %d; a snapshot of another version must be ignored", loaded.State.Total)
+	}
+}
+
+// Two versions of the code handling one stream, as during a rolling deploy,
+// each keep their own snapshot instead of evicting the other's and
+// re-snapshotting on every message.
+func TestSnapshotsOfDifferentVersionsCoexist(t *testing.T) {
+	v1 := newCounter(t)
+	v1.StateVersion, v1.SnapshotEvery = "v1", 3
+	v2 := *v1
+	v2.StateVersion = "v2"
+
+	handle := func(agg *ledger.Aggregate[counter, msg, int, event, effect]) {
+		t.Helper()
+		if _, err := agg.Handle(ctx, "a", add{1, 100}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 6 {
+		handle(v1) // snapshots at 3 and 6
+	}
+	handle(&v2) // v2 has none yet, so it snapshots at 7
+	handle(v1)  // v1's snapshot at 6 is 2 behind: no new one
+
+	rows, err := v1.Store.Pool().Query(ctx,
+		`SELECT version || '@' || seq FROM cairn.state_snapshots WHERE stream = 'counter/a' ORDER BY version`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != "[v1@6 v2@7]" {
+		t.Fatalf("snapshots %v, want [v1@6 v2@7]", got)
 	}
 }
 

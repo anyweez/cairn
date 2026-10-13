@@ -59,7 +59,8 @@ CREATE TABLE cairn.schema_version (version int PRIMARY KEY, applied_at timestamp
 INSERT INTO cairn.schema_version (version) VALUES (1);
 INSERT INTO cairn.streams (stream, kind, seq) VALUES ('counter/a', 'counter', 1);
 INSERT INTO cairn.entries (stream, kind, seq, message, result, events)
-VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{}}', '1', '[{"type":"added","v":1,"data":{}}]');`); err != nil {
+VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{}}', '1', '[{"type":"added","v":1,"data":{}}]');
+INSERT INTO cairn.snapshots (stream, seq, version, state) VALUES ('counter/a', 1, 'v1', '{"Total": 1}');`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,5 +74,15 @@ VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{}}', '1', '[{"ty
 	}
 	if len(entries) != 1 || entries[0].Meta.Actor != "" || entries[0].Meta.Extra != nil || !entries[0].Meta.OccurredAt.IsZero() {
 		t.Fatalf("an old entry should read back with empty metadata: %+v", entries)
+	}
+
+	// Snapshots move to the table keyed by version.
+	var snapshot string
+	if err := pool.QueryRow(ctx, `SELECT version || '@' || seq || ' ' || state::text FROM cairn.state_snapshots
+WHERE stream = 'counter/a'`).Scan(&snapshot); err != nil {
+		t.Fatalf("reading a snapshot taken before the migration: %v", err)
+	}
+	if snapshot != `v1@1 {"Total": 1}` {
+		t.Fatalf("snapshot %q, want it carried over unchanged", snapshot)
 	}
 }

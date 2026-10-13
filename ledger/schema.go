@@ -104,6 +104,25 @@ ALTER TABLE cairn.entries
 CREATE INDEX entries_actor ON cairn.entries (actor, position) WHERE actor IS NOT NULL;
 CREATE INDEX entries_correlation ON cairn.entries (correlation_id, position) WHERE correlation_id IS NOT NULL;
 `,
+	// 3: snapshots keyed by version as well as stream. With one row per
+	// stream, processes running different StateVersions during a rolling
+	// deploy overwrite each other's snapshot, and each then folds the whole
+	// stream and writes a fresh snapshot on every message. The new table sits
+	// beside the old one rather than replacing its key, so processes still on
+	// the old code keep writing cairn.snapshots instead of failing; a later
+	// migration drops it.
+	`
+CREATE TABLE cairn.state_snapshots (
+    stream   text NOT NULL REFERENCES cairn.streams (stream),
+    version  text NOT NULL,
+    seq      bigint NOT NULL,
+    state    jsonb NOT NULL,
+    taken_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream, version)
+);
+INSERT INTO cairn.state_snapshots (stream, version, seq, state, taken_at)
+SELECT stream, version, seq, state, taken_at FROM cairn.snapshots;
+`,
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every
