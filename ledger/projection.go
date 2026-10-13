@@ -22,6 +22,9 @@ type Projection struct {
 	Apply func(ctx context.Context, tx pgx.Tx, e Entry) error
 	// BatchSize is how many entries one transaction applies. Defaults to 100.
 	BatchSize int
+	// OnError, when set, keeps Run going after an error, reporting it here and
+	// trying again at the next interval. When nil, Run returns the error.
+	OnError func(error)
 }
 
 // CatchUp applies every entry visible now, returning how many it applied.
@@ -94,13 +97,17 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 
 var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runner")
 
-// Run catches the projection up every interval until ctx is done.
+// Run catches the projection up every interval until ctx is done. An error
+// ends it unless the projection sets OnError.
 func (s *Store) Run(ctx context.Context, p Projection, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if _, err := s.CatchUp(ctx, p); err != nil {
-			return err
+		if _, err := s.CatchUp(ctx, p); err != nil && ctx.Err() == nil {
+			if p.OnError == nil {
+				return err
+			}
+			p.OnError(err)
 		}
 		select {
 		case <-ctx.Done():

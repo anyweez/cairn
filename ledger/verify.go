@@ -96,7 +96,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 	return out, nil
 }
 
-// VerifyAll verifies every stream of the aggregate's kind.
+// VerifyAll verifies every stream of the aggregate's kind that exists when it
+// starts listing them. Streams are read one by one, so entries written while it
+// runs may or may not be checked; run it against a quiet database, or treat a
+// clean result as covering the history up to its start.
 func (a *Aggregate[S, M, R, Ev, Ef]) VerifyAll(ctx context.Context) ([]Divergence, error) {
 	streams, err := a.Store.Streams(ctx, a.Kind)
 	if err != nil {

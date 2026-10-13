@@ -54,6 +54,8 @@ BEGIN
 END $$;
 CREATE TRIGGER entries_append_only BEFORE UPDATE OR DELETE ON cairn.entries
     FOR EACH ROW EXECUTE FUNCTION cairn.refuse_change();
+CREATE TRIGGER entries_no_truncate BEFORE TRUNCATE ON cairn.entries
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn.refuse_change();
 
 -- A cache. Deleting every row is always safe; version names the state's shape,
 -- and a snapshot of any other version is ignored.
@@ -80,7 +82,7 @@ CREATE TABLE cairn.outbox (
     UNIQUE (stream, seq, idx),
     FOREIGN KEY (stream, seq) REFERENCES cairn.entries (stream, seq)
 );
-CREATE INDEX outbox_pending ON cairn.outbox (kind, available_at, id)
+CREATE INDEX outbox_pending ON cairn.outbox (kind, id)
     WHERE done_at IS NULL AND failed_at IS NULL;
 
 CREATE TABLE cairn.checkpoints (

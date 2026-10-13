@@ -2,8 +2,7 @@ package decisions
 
 import (
 	"context"
-	"fmt"
-	"sync/atomic"
+	"crypto/rand"
 	"time"
 
 	"github.com/anyweez/cairn"
@@ -22,7 +21,6 @@ type Service struct {
 // NewService builds a service over a store.
 func NewService(store *ledger.Store) *Service {
 	msgs, events, effects := Codecs()
-	var n atomic.Int64
 	return &Service{
 		Register: &ledger.Aggregate[State, Msg, Result, Event, Effect]{
 			Store: store, Kind: "decision", Decider: Decider,
@@ -30,9 +28,8 @@ func NewService(store *ledger.Store) *Service {
 			StateVersion: "decision/1",
 		},
 		Now: time.Now,
-		NewID: func(prefix string) string {
-			return fmt.Sprintf("%s%d", prefix, n.Add(1))
-		},
+		// Random, so a restarted process never mints an ID already in the ledger.
+		NewID: func(prefix string) string { return prefix + rand.Text()[:16] },
 	}
 }
 
@@ -85,23 +82,26 @@ func (s *Service) Acknowledge(ctx context.Context, id, by string, committed bool
 func (s *Service) Supersede(ctx context.Context, id, with, by string) error {
 	var refusal *cairn.Refusal
 	err := s.Register.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, s.Register.Stream(id), s.Register.Stream(with)); err != nil {
+		streams := []ledger.Stream{s.Register.Stream(id)}
+		if with != "" { // an empty replacement is the decider's to refuse
+			streams = append(streams, s.Register.Stream(with))
+		}
+		if err := tx.Lock(ctx, streams...); err != nil {
 			return err
 		}
 		target, err := s.Register.LoadLocked(ctx, tx, id)
 		if err != nil {
 			return err
 		}
-		replacement, err := s.Register.LoadLocked(ctx, tx, with)
-		if err != nil {
-			return err
+		msg := Supersede{By: by, With: with}
+		if with != "" {
+			replacement, err := s.Register.LoadLocked(ctx, tx, with)
+			if err != nil {
+				return err
+			}
+			msg.WithStatus, msg.WithSupersededBy = replacement.State.Status, replacement.State.SupersededBy
 		}
-		h, err := s.Register.Apply(ctx, tx, &target, Supersede{
-			By:               by,
-			With:             with,
-			WithStatus:       replacement.State.Status,
-			WithSupersededBy: replacement.State.SupersededBy,
-		})
+		h, err := s.Register.Apply(ctx, tx, &target, msg)
 		refusal = h.Refusal
 		return err
 	})

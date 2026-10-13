@@ -12,10 +12,16 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" -p "127.0.0.1:${port}:5432" \
     -e POSTGRES_PASSWORD=cairn -e POSTGRES_USER=cairn postgres:17-alpine >/dev/null
-  for _ in $(seq 1 60); do
-    docker exec "$name" pg_isready -U cairn >/dev/null 2>&1 && break
-    sleep 0.5
-  done
+fi
+# Over TCP: during init the image runs a socket-only server that the unix
+# socket check would mistake for the real one.
+for _ in $(seq 1 60); do
+  docker exec "$name" pg_isready -h 127.0.0.1 -U cairn >/dev/null 2>&1 && ready=1 && break
+  sleep 0.5
+done
+if [ -z "${ready:-}" ]; then
+  echo "postgres in $name did not become ready" >&2
+  exit 1
 fi
 
 echo "postgres://cairn:cairn@127.0.0.1:${port}/postgres?sslmode=disable"

@@ -30,40 +30,59 @@ type Dispatcher[Ef any] struct {
 	Store   *Store
 	Kind    string
 	Effects *codec.Codec[Ef]
-	Handle  func(ctx context.Context, d Delivery[Ef]) error
+	// Handle carries out one effect. Its context ends when the lease does, so
+	// a handler that outlives its lease is cancelled rather than racing the
+	// dispatcher that reclaims the effect.
+	Handle func(ctx context.Context, d Delivery[Ef]) error
 
 	// Batch is how many effects one claim takes. Defaults to 20.
 	Batch int
-	// Lease is how long a claimed effect is hidden from other dispatchers.
-	// Defaults to a minute.
+	// Lease is how long one delivery may take before the effect is offered to
+	// another dispatcher. Defaults to a minute.
 	Lease time.Duration
 	// Backoff is the delay before retrying a failed attempt. Defaults to
 	// doubling from a second, capped at ten minutes.
 	Backoff func(attempt int) time.Duration
-	// MaxAttempts gives up on an effect after this many failures, leaving it
+	// MaxAttempts gives up on an effect after this many attempts, leaving it
 	// marked failed for an operator. Zero retries forever.
 	MaxAttempts int
+	// OnError, when set, keeps Run going after an error, reporting it here and
+	// trying again at the next interval. When nil, Run returns the error.
+	OnError func(error)
 }
 
-func (d *Dispatcher[Ef]) defaults() {
-	if d.Batch <= 0 {
-		d.Batch = 20
+type dispatchConfig struct {
+	batch   int
+	lease   time.Duration
+	backoff func(attempt int) time.Duration
+}
+
+func (d *Dispatcher[Ef]) config() dispatchConfig {
+	c := dispatchConfig{batch: d.Batch, lease: d.Lease, backoff: d.Backoff}
+	if c.batch <= 0 {
+		c.batch = 20
 	}
-	if d.Lease <= 0 {
-		d.Lease = time.Minute
+	if c.lease <= 0 {
+		c.lease = time.Minute
 	}
-	if d.Backoff == nil {
-		d.Backoff = func(attempt int) time.Duration {
+	if c.backoff == nil {
+		c.backoff = func(attempt int) time.Duration {
 			delay := time.Second << min(attempt-1, 10)
 			return min(delay, 10*time.Minute)
 		}
 	}
+	return c
 }
 
 // DrainOnce claims one batch and carries it out, returning how many effects
-// it attempted.
+// it claimed.
+//
+// Every claim increments an effect's attempts, and every later write for that
+// effect is conditional on attempts being unchanged. A dispatcher whose lease
+// ran out, and whose effect another dispatcher has since claimed, therefore
+// cannot mark it done or failed.
 func (d *Dispatcher[Ef]) DrainOnce(ctx context.Context) (int, error) {
-	d.defaults()
+	cfg := d.config()
 	rows, err := d.Store.pool.Query(ctx, `
 UPDATE cairn.outbox SET attempts = attempts + 1, available_at = now() + make_interval(secs => $3)
 WHERE id IN (
@@ -73,7 +92,7 @@ WHERE id IN (
     FOR UPDATE SKIP LOCKED
     LIMIT $2)
 RETURNING id, stream, seq, idx, effect, attempts`,
-		d.Kind, d.Batch, d.Lease.Seconds())
+		d.Kind, cfg.batch, cfg.lease.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("cairn: claiming effects: %w", err)
 	}
@@ -99,22 +118,51 @@ RETURNING id, stream, seq, idx, effect, attempts`,
 		return 0, err
 	}
 
+	// Outcomes are recorded even when ctx is cancelled mid-batch, so an effect
+	// that was carried out is not carried out again after shutdown.
+	record := context.WithoutCancel(ctx)
+	const fenced = ` AND attempts = $2 AND done_at IS NULL AND failed_at IS NULL`
 	for _, c := range batch {
-		err := d.deliver(ctx, c.stream, c.seq, c.idx, c.id, c.effect, c.attempts)
-		if err == nil {
-			if _, err := d.Store.pool.Exec(ctx, `UPDATE cairn.outbox SET done_at = now(), last_error = NULL WHERE id = $1`, c.id); err != nil {
-				return 0, err
+		if ctx.Err() != nil {
+			return len(batch), ctx.Err()
+		}
+		// Claimed more times than allowed without an outcome being recorded:
+		// earlier attempts died with their dispatcher.
+		if d.MaxAttempts > 0 && c.attempts > d.MaxAttempts {
+			if _, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox SET failed_at = now(),
+last_error = coalesce(last_error, 'no outcome recorded after ' || $3::int || ' attempts') WHERE id = $1`+fenced,
+				c.id, c.attempts, d.MaxAttempts); err != nil {
+				return len(batch), err
 			}
 			continue
 		}
-		if d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts {
-			_, err = d.Store.pool.Exec(ctx, `UPDATE cairn.outbox SET failed_at = now(), last_error = $2 WHERE id = $1`, c.id, err.Error())
-		} else {
-			_, err = d.Store.pool.Exec(ctx, `UPDATE cairn.outbox SET available_at = now() + make_interval(secs => $2), last_error = $3 WHERE id = $1`,
-				c.id, d.Backoff(c.attempts).Seconds(), err.Error())
+		// The claim's lease started with the batch; restart it for this effect.
+		tag, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox
+SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id, c.attempts, cfg.lease.Seconds())
+		if err != nil {
+			return len(batch), err
+		}
+		if tag.RowsAffected() == 0 {
+			continue // reclaimed by another dispatcher
+		}
+
+		handleCtx, cancel := context.WithTimeout(ctx, cfg.lease)
+		err = d.deliver(handleCtx, c.stream, c.seq, c.idx, c.id, c.effect, c.attempts)
+		cancel()
+		switch {
+		case err == nil:
+			_, err = d.Store.pool.Exec(record,
+				`UPDATE cairn.outbox SET done_at = now(), last_error = NULL WHERE id = $1`+fenced, c.id, c.attempts)
+		case d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts:
+			_, err = d.Store.pool.Exec(record,
+				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, c.attempts, err.Error())
+		default:
+			_, err = d.Store.pool.Exec(record, `UPDATE cairn.outbox
+SET available_at = now() + make_interval(secs => $3), last_error = $4 WHERE id = $1`+fenced,
+				c.id, c.attempts, cfg.backoff(c.attempts).Seconds(), err.Error())
 		}
 		if err != nil {
-			return 0, err
+			return len(batch), err
 		}
 	}
 	return len(batch), nil
@@ -137,17 +185,21 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, stream string, seq int64, 
 	return d.Handle(ctx, Delivery[Ef]{ID: id, Stream: stream, Seq: seq, Index: idx, Effect: effect, Attempt: attempt})
 }
 
-// Run drains the outbox every interval until ctx is done.
+// Run drains the outbox every interval until ctx is done. An error ends it
+// unless OnError is set.
 func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		for {
 			n, err := d.DrainOnce(ctx)
-			if err != nil {
-				return err
+			if err != nil && ctx.Err() == nil {
+				if d.OnError == nil {
+					return err
+				}
+				d.OnError(err)
 			}
-			if n == 0 {
+			if err != nil || n == 0 {
 				break
 			}
 		}
