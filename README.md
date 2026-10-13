@@ -161,6 +161,37 @@ full-length check (rapid's default 100 runs). Under `-short` or a lowered
 `-rapid.checks` it is only reported, since a rarely applied rule can miss a
 short check by chance.
 
+## The spec manifest
+
+[`spec.manifest.json`](spec.manifest.json) lists every rule, every type
+stored in the ledger (its codec name, version, upcasters and JSON shape), and
+every fsm table. It's generated from the code and committed, so a review
+reads a change to the spec as a diff of that file: a rule added, demoted or
+reworded, an edge added to a lifecycle, a field added to an event.
+
+```sh
+go -C cmd/cairn-manifest run . -dir ../..
+```
+
+`cmd/cairn-manifest` reads the source statically, so it sees everything that
+is declared, whether or not a test uses it. It reads:
+
+- **Rules:** package-level `spec.Rule` variables, test files included, since
+  a machine's rules usually live with its spec test.
+- **Tables:** package-level variables built by `fsm.New`.
+- **Codecs:** `codec.Register` and `Upcast` calls outside test files, since
+  only production code writes to the ledger.
+
+Each of these must be stated with constants. A rule, table or registration
+the tool can't read exactly is an error, not a guess. Declare a fixture
+rule inside a function to keep it out of the manifest.
+
+CI fails when the manifest is stale. On a pull request it also compares the
+codecs with the base branch's manifest and fails if a stored type was
+removed, went back a version, changed shape without a version bump, or was
+bumped without an upcaster from each earlier version. Any of these would
+leave entries already in the ledger unreadable.
+
 ## Working on cairn
 
 ```sh
@@ -170,5 +201,13 @@ go test ./...
 
 Without the database URL, ledger tests are skipped. In CI, set
 `CAIRN_REQUIRE_DATABASE=1` as well, so they fail instead of skipping.
+
+The manifest tool is its own module, so the library doesn't depend on
+`golang.org/x/tools`. Its tests also check that the committed manifest is
+current:
+
+```sh
+go -C cmd/cairn-manifest test ./...
+```
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and the open questions.

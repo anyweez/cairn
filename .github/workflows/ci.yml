@@ -42,3 +42,23 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test -race ./...
+      - name: manifest tool
+        run: |
+          go -C cmd/cairn-manifest vet ./...
+          go -C cmd/cairn-manifest test ./...
+      - name: spec manifest is current
+        run: |
+          go -C cmd/cairn-manifest run . -dir ../..
+          if ! git diff --exit-code -- spec.manifest.json; then
+            echo "::error::spec.manifest.json is stale: run 'go -C cmd/cairn-manifest run . -dir ../..' and commit it"
+            exit 1
+          fi
+      - name: stored types stay readable
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "$GITHUB_BASE_REF"
+          if git show FETCH_HEAD:spec.manifest.json > "$RUNNER_TEMP/base.json" 2>/dev/null; then
+            go -C cmd/cairn-manifest run . -dir ../.. -o - -base "$RUNNER_TEMP/base.json" > /dev/null
+          else
+            echo "$GITHUB_BASE_REF has no spec.manifest.json yet"
+          fi

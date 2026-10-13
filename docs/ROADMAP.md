@@ -14,29 +14,32 @@
   Its spec includes one proposed rule (DR8, the acknowledgement gap) that the
   current behaviour violates.
 
+## Built since
+
+- `cmd/cairn-manifest`: the spec manifest. Rules, stored types with their
+  JSON shapes, and fsm tables, committed as `spec.manifest.json` and checked
+  in CI. Pull requests also fail when a stored type changes in a way that
+  breaks reading entries already in the ledger.
+
 ## Next
 
-1. **Spec manifest.** Extract every rule (ID, kind, status, statement), every
-   codec type and version, and every fsm table into a stable JSON file using
-   `go/packages`. The file is committed, and CI fails when it is stale. A
-   reviewer then reads the manifest diff, not the code.
-2. **Semantic spec diff.** Run base and head specs over the same corpus
+1. **Semantic spec diff.** Run base and head specs over the same corpus
    (seeded runs plus ledger exports) and report examples tightened or
    loosened, model changes, implementation violations, production messages
    that would now be refused, and rules that became vacuous.
-3. **Linearizability.** Use porcupine over concurrent `Handle` calls, with
+2. **Linearizability.** Use porcupine over concurrent `Handle` calls, with
    the sequential Decider as the model. The concurrent supersede test in the
    example is a hand-written instance of this check.
-4. **Lint.** Add analyzers for:
+3. **Lint.** Add analyzers for:
    - core purity: a package containing a Decider imports no clock, randomness
      or I/O;
    - model independence: a model doesn't import the implementation;
    - rule hygiene: unique IDs, and no rule left proposed for too long.
-5. **`blocks/bag`.** A counted multiset with caps and a slot or weight
+4. **`blocks/bag`.** A counted multiset with caps and a slot or weight
    budget, the shape of the LegendsReborn inventory, with its rules built in.
-6. **Ledger export.** Dump a stream or kind as JSONL, so it can serve as a
+5. **Ledger export.** Dump a stream or kind as JSONL, so it can serve as a
    spec corpus or reproduce a production bug locally.
-7. **LISTEN/NOTIFY.** Wake projections and dispatchers on commit instead of
+6. **LISTEN/NOTIFY.** Wake projections and dispatchers on commit instead of
    polling.
 
 ## Open questions
