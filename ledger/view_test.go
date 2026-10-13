@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,11 +25,11 @@ func totalsView(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, ef
 	}
 	return ledger.View[counter]{
 		Name: "counter_totals",
-		Write: func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter], _ ledger.Entry) error {
-			_, err := tx.Exec(ctx, `
+		Write: func(b *ledger.Batch, at ledger.Loaded[counter], _ ledger.Entry) error {
+			b.Queue(`
 INSERT INTO counter_totals VALUES ($1, $2, $3)
 ON CONFLICT (id) DO UPDATE SET total = excluded.total, seq = excluded.seq`, at.Stream.ID, at.State.Total, at.Seq)
-			return err
+			return nil
 		},
 	}
 }
@@ -119,7 +120,7 @@ func TestARefusalLeavesTheViewAlone(t *testing.T) {
 func TestAFailingViewRefusesToRecordTheMessage(t *testing.T) {
 	agg := newCounter(t)
 	broken := errors.New("view is broken")
-	agg.Views = []ledger.View[counter]{{Name: "broken", Write: func(context.Context, pgx.Tx, ledger.Loaded[counter], ledger.Entry) error {
+	agg.Views = []ledger.View[counter]{{Name: "broken", Write: func(*ledger.Batch, ledger.Loaded[counter], ledger.Entry) error {
 		return broken
 	}}}
 
@@ -129,6 +130,39 @@ func TestAFailingViewRefusesToRecordTheMessage(t *testing.T) {
 	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("the message was recorded without its view: %v %v", entries, err)
+	}
+}
+
+// A statement that fails in the database aborts the message too, and the
+// error names the view that queued it, though every view's statements were
+// sent together. A statement can fail as the batch is prepared, before any
+// runs, or as it runs.
+func TestAViewWhoseStatementFailsRefusesToRecordTheMessage(t *testing.T) {
+	for _, failing := range []string{
+		`INSERT INTO no_such_table VALUES ($1)`,
+		`INSERT INTO counter_totals VALUES ($1 || '-copy', NULL, 0)`,
+	} {
+		agg := newCounter(t)
+		agg.Views = []ledger.View[counter]{
+			totalsView(t, agg),
+			{Name: "bad", Write: func(b *ledger.Batch, at ledger.Loaded[counter], _ ledger.Entry) error {
+				b.Queue(`SELECT 1`)
+				b.Queue(failing, at.Stream.ID)
+				return nil
+			}},
+		}
+
+		_, err := agg.Handle(ctx, "a", add{3, 10})
+		if err == nil || !strings.Contains(err.Error(), "view bad at counter/a#1: statement 1:") {
+			t.Fatalf("%s: want an error naming the view and its statement, got %v", failing, err)
+		}
+		entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("%s: the message was recorded without its view: %v %v", failing, entries, err)
+		}
+		if got := readTotals(t, agg.Store.Pool()); len(got) != 0 {
+			t.Fatalf("%s: the other view's write survived: %v", failing, got)
+		}
 	}
 }
 
@@ -170,10 +204,10 @@ func TestAWriteDuringRebuildIsNotOverwritten(t *testing.T) {
 	// The rebuild has read the stream, and pauses before writing its row.
 	read := make(chan struct{})
 	slow := view
-	slow.Write = func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter], cause ledger.Entry) error {
+	slow.Write = func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
 		close(read)
 		time.Sleep(200 * time.Millisecond)
-		return view.Write(ctx, tx, at, cause)
+		return view.Write(b, at, cause)
 	}
 
 	var wg sync.WaitGroup

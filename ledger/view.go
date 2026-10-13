@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -23,21 +24,39 @@ import (
 // Read who changed the stream and when from it (cause.Meta.Actor,
 // cause.RecordedAt) for display columns like updated_by. A fact a decision
 // depends on belongs in the state instead.
+//
+// Write queues its statements in b instead of running them. Every view's
+// statements are sent together, in one round trip, while the stream is
+// locked; a view that ran its own would add a round trip per statement to
+// that wait. Everything a view needs is in at and cause, so it has nothing to
+// read first. An error from Write, or from any statement it queued, keeps the
+// message from being recorded.
 type View[S any] struct {
 	Name  string
-	Write func(ctx context.Context, tx pgx.Tx, at Loaded[S], cause Entry) error
+	Write func(b *Batch, at Loaded[S], cause Entry) error
 }
 
 // writeViews runs every view after a message that produced events. A refusal,
 // a duplicate or an accepted message with no events changes no state, so it
 // writes nothing; Rebuild skips the same streams.
 func (a *Aggregate[S, M, R, Ev, Ef]) writeViews(ctx context.Context, tx *Tx, at *Loaded[S], cause Entry) error {
+	var b Batch
 	for _, v := range a.Views {
-		if err := v.Write(ctx, tx.Tx, *at, cause); err != nil {
+		b.owner = v.Name
+		if err := v.Write(&b, *at, cause); err != nil {
 			return fmt.Errorf("cairn: view %s at %s#%d: %w", v.Name, at.Stream, at.Seq, err)
 		}
 	}
-	return nil
+	return sendViews(ctx, tx, &b, at.Stream.String(), at.Seq)
+}
+
+func sendViews(ctx context.Context, tx *Tx, b *Batch, stream string, seq int64) error {
+	err := b.send(ctx, tx.Tx)
+	var failed *batchError
+	if errors.As(err, &failed) {
+		return fmt.Errorf("cairn: view %s at %s#%d: %w", failed.owner, stream, seq, failed)
+	}
+	return err
 }
 
 // Rebuild writes v for every stream of the aggregate's kind that has recorded
@@ -82,7 +101,11 @@ WHERE stream = $1 AND events <> '[]'::jsonb ORDER BY seq DESC LIMIT 1`, name)
 			// Later entries are refusals or carried no events, so the state is
 			// the same; the seq is the one a live write saw.
 			at.Seq = cause[0].Seq
-			return v.Write(ctx, tx.Tx, at, cause[0])
+			b := Batch{owner: v.Name}
+			if err := v.Write(&b, at, cause[0]); err != nil {
+				return err
+			}
+			return sendViews(ctx, tx, &b, name, at.Seq)
 		})
 		if err != nil {
 			return i, fmt.Errorf("cairn: rebuilding view %s at %s: %w", v.Name, name, err)
