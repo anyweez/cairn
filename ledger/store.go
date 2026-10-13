@@ -93,8 +93,10 @@ func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
 	})
 }
 
-// Lock takes the write lock on every stream the transaction will touch,
-// creating streams that do not exist yet. Locks are taken in a fixed order,
+// Lock takes the write lock on every stream the transaction will touch.
+// Locking a stream that does not exist yet does not create it: its row is
+// written with its first entry, so a stream locked only to be read leaves
+// nothing behind. Locks are taken in a fixed order,
 // which is why they must all be taken at once: two transactions that lock
 // overlapping streams can then never deadlock. Lock may be called once, and
 // must come before the transaction's first write.
@@ -143,20 +145,26 @@ func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
 		}
 	}
 
-	tx.locked = make(map[string]int64, len(sorted))
-	for _, st := range sorted {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO cairn.streams (stream, kind) VALUES ($1, $2) ON CONFLICT (stream) DO NOTHING`,
-			st.String(), st.Kind); err != nil {
-			return fmt.Errorf("cairn: creating stream %s: %w", st, err)
-		}
-		var seq int64
-		if err := tx.QueryRow(ctx,
-			`SELECT seq FROM cairn.streams WHERE stream = $1 FOR UPDATE`, st.String()).Scan(&seq); err != nil {
-			return fmt.Errorf("cairn: locking stream %s: %w", st, err)
-		}
-		tx.locked[st.String()] = seq
+	// A stream that does not exist yet reads as seq 0; append creates its row.
+	rows, err = tx.Query(ctx, `SELECT stream, seq FROM cairn.streams WHERE stream = ANY($1)`, names)
+	if err != nil {
+		return fmt.Errorf("cairn: reading streams: %w", err)
 	}
+	locked := make(map[string]int64, len(names))
+	for _, name := range names {
+		locked[name] = 0
+	}
+	var (
+		name string
+		seq  int64
+	)
+	if _, err := pgx.ForEachRow(rows, []any{&name, &seq}, func() error {
+		locked[name] = seq
+		return nil
+	}); err != nil {
+		return fmt.Errorf("cairn: reading streams: %w", err)
+	}
+	tx.locked = locked
 	return nil
 }
 
@@ -199,6 +207,14 @@ func (tx *Tx) append(ctx context.Context, stream Stream, e Entry) (Entry, error)
 		key = &e.IdempotencyKey
 	}
 
+	// The first entry creates the stream; Lock only reserved it.
+	if _, err := tx.Exec(ctx, `
+INSERT INTO cairn.streams (stream, kind, seq) VALUES ($1, $2, $3)
+ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
+		e.Stream, e.Kind, e.Seq); err != nil {
+		return Entry{}, fmt.Errorf("cairn: advancing %s: %w", stream, err)
+	}
+
 	var txid string
 	err = tx.QueryRow(ctx, `
 INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, effects, idempotency_key)
@@ -213,10 +229,6 @@ RETURNING position, txid::text, recorded_at`,
 		return Entry{}, err
 	}
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE cairn.streams SET seq = $2, updated_at = now() WHERE stream = $1`, e.Stream, e.Seq); err != nil {
-		return Entry{}, fmt.Errorf("cairn: advancing %s: %w", stream, err)
-	}
 	for i, effect := range e.Effects {
 		data, err := json.Marshal(effect)
 		if err != nil {

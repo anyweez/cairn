@@ -46,12 +46,9 @@
   payloads or encrypting per subject and discarding the key. Which one should
   the library offer, and should events be allowed to carry personal data at
   all?
-- **Locking a stream creates it.** `Tx.Lock` creates a row for a stream that
-  doesn't exist yet. The example's `Supersede` therefore leaves an empty
-  stream behind when asked to supersede with a decision that doesn't exist.
-  Should there be a read lock that doesn't create?
 - **Refusals advance the stream sequence.** Recording them is the point (they
-  are the evidence for "this change would refuse N real requests"). But a
+  are the evidence for "this change would refuse N real requests"). A refused
+  message to a stream that doesn't exist also creates that stream. But a
   client spamming refused messages grows the stream. Rate-limit in the shell,
   or store refusals in a separate table?
 - **Result is opaque JSON.** `Verify` compares results structurally. If R

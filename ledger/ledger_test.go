@@ -258,6 +258,43 @@ func TestLockMustComeBeforeAnyWrite(t *testing.T) {
 	}
 }
 
+func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
+	agg := newCounter(t)
+	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+		if err := tx.Lock(ctx, agg.Stream("read"), agg.Stream("written")); err != nil {
+			return err
+		}
+		read, err := agg.LoadLocked(ctx, tx, "read")
+		if err != nil {
+			return err
+		}
+		if read.Seq != 0 || read.State.Total != 0 {
+			t.Errorf("a stream that does not exist loads empty: %+v", read)
+		}
+		written, err := agg.LoadLocked(ctx, tx, "written")
+		if err != nil {
+			return err
+		}
+		_, err = agg.Apply(ctx, tx, &written, add{2, 9})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := agg.Store.Streams(ctx, "counter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(streams) != 1 || streams[0] != agg.Stream("written") {
+		t.Fatalf("only the stream written to exists, got %v", streams)
+	}
+
+	h, err := agg.Handle(ctx, "read", add{2, 9})
+	if err != nil || h.Entry.Seq != 1 {
+		t.Fatalf("the first write creates the stream: %+v, %v", h.Entry, err)
+	}
+}
+
 func TestIdempotencyKeyAnswersARetryWithoutDecidingAgain(t *testing.T) {
 	agg := newCounter(t)
 	first, err := agg.Handle(ctx, "a", add{4, 10}, ledger.IdempotencyKey("req-1"))

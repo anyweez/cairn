@@ -120,7 +120,8 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   and its snapshot commit together, or none of them do.
 - **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
   transaction needs in one sorted call, so overlapping transactions cannot
-  deadlock.
+  deadlock. Locking a stream doesn't create it: a stream exists once its first
+  entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
   refusals free of events and effects.
 - **No gaps for readers of the global log.** `ReadAll` and projections hold
