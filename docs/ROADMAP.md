@@ -17,7 +17,7 @@
 ## Built since
 
 - `cmd/cairn-manifest`: the spec manifest. Rules, stored types with their
-  JSON shapes, and fsm tables, committed as `spec.manifest.json` and checked
+  JSON shapes, and fsm tables, committed as `spec.manifest.yaml` and checked
   in CI. Pull requests also fail when a stored type changes in a way that
   breaks reading entries already in the ledger.
 
