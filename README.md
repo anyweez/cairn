@@ -116,8 +116,15 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
 
 ## What the ledger guarantees
 
-- **One transaction per message.** A decided message, its events, its effects
-  and its snapshot commit together, or none of them do.
+- **One transaction per message.** A decided message, its events, its effects,
+  its snapshot and its views commit together, or none of them do.
+- **Read your own writes.** An aggregate's `Views` are written from the
+  stream's new state inside that transaction, so a caller that writes and then
+  reads a view table sees its write. A view replaces a stream's rows from its
+  whole state, which makes it safe to run again: `Aggregate.Rebuild` fills a
+  new or changed view from current state, while messages keep arriving.
+  Read models that combine streams use a projection instead, which is
+  eventually consistent.
 - **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
   transaction needs in one sorted call, so overlapping transactions cannot
   deadlock. Locking a stream doesn't create it: a stream exists once its first

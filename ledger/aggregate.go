@@ -30,6 +30,10 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// SnapshotEvery is how many entries may accumulate past the last snapshot
 	// before another is taken. Defaults to 100.
 	SnapshotEvery int64
+
+	// Views are written in the same transaction as every message that
+	// produces events.
+	Views []View[S]
 }
 
 // Stream names one of this aggregate's streams.
@@ -207,6 +211,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 
 	if err := a.maybeSnapshot(ctx, tx, at); err != nil {
 		return Handled[S, R]{}, err
+	}
+	if len(decision.Events) > 0 {
+		if err := a.writeViews(ctx, tx, at); err != nil {
+			return Handled[S, R]{}, err
+		}
 	}
 
 	return Handled[S, R]{Entry: entry, State: at.State, Result: decision.Result, Refusal: decision.Refusal}, nil
