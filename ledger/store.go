@@ -258,7 +258,10 @@ func nullJSON(raw json.RawMessage) any {
 	return []byte(raw)
 }
 
-const entryColumns = `position, txid::text, stream, kind, seq, message, result, refusal, events, effects,
+// txid is read as text under another name: left named txid, it would shadow
+// the column in ORDER BY txid, which would then sort the log as text ("1000"
+// before "999").
+const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, message, result, refusal, events, effects,
 coalesce(idempotency_key, ''), recorded_at`
 
 func scanEntries(rows pgx.Rows) ([]Entry, error) {

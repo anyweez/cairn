@@ -170,18 +170,27 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		})
 	}
 	wg.Wait()
+	var written int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM cairn.entries`).Scan(&written); err != nil {
+		t.Fatal(err)
+	}
 
+	// The cutoff is the oldest transaction running anywhere on the server, so
+	// another database's transaction can hold entries back for a while: keep
+	// reading until every entry has arrived.
 	last := map[string]int64{}
-	for cursor, total := (ledger.Cursor{}), 0; ; {
+	deadline := time.Now().Add(10 * time.Second)
+	for cursor, total := (ledger.Cursor{}), 0; total < written; {
 		entries, next, err := agg.Store.ReadAll(ctx, cursor, 50)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(entries) == 0 {
-			if total == 0 {
-				t.Fatal("read nothing")
+			if time.Now().After(deadline) {
+				t.Fatalf("read %d of %d entries", total, written)
 			}
-			break
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		for _, e := range entries {
 			if e.Seq != last[e.Stream]+1 {
@@ -191,6 +200,51 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		}
 		total += len(entries)
 		cursor = next
+	}
+}
+
+// Transaction IDs order the log as numbers, including across a change in their
+// number of digits.
+func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
+	agg := newCounter(t)
+	pool := agg.Store.Pool()
+	if _, err := agg.Handle(ctx, "first", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+	var current uint64
+	if err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()::text::bigint`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	next := uint64(10)
+	for next <= current {
+		next *= 10
+	}
+	if next-current > 2_000_000 {
+		t.Skipf("transaction ID %d is too far from %d to cross cheaply", current, next)
+	}
+	// Each iteration commits, so each one uses up a transaction ID.
+	if _, err := pool.Exec(ctx, fmt.Sprintf(
+		`DO $$ BEGIN FOR i IN 1..%d LOOP PERFORM pg_current_xact_id(); COMMIT; END LOOP; END $$`, next-current)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agg.Handle(ctx, "second", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []ledger.Entry
+	cursor := ledger.Cursor{}
+	for deadline := time.Now().Add(10 * time.Second); len(entries) < 2 && time.Now().Before(deadline); {
+		more, next, err := agg.Store.ReadAll(ctx, cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(more) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		entries, cursor = append(entries, more...), next
+	}
+	if len(entries) != 2 || entries[0].Stream != "counter/first" || entries[1].Stream != "counter/second" {
+		t.Fatalf("got %d entries, first %v", len(entries), entries)
 	}
 }
 
@@ -233,9 +287,18 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	entries, _, err = agg.Store.ReadAll(ctx, cursor, 10)
-	if err != nil {
-		t.Fatal(err)
+	// The cutoff is the oldest transaction running anywhere on the server, so
+	// another database's transaction can hold entries back a little longer.
+	entries = nil
+	for deadline := time.Now().Add(10 * time.Second); len(entries) < 2 && time.Now().Before(deadline); {
+		more, next, err := agg.Store.ReadAll(ctx, cursor, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(more) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		entries, cursor = append(entries, more...), next
 	}
 	if len(entries) != 2 || entries[0].Stream != "counter/slow" || entries[1].Stream != "counter/fast" {
 		t.Fatalf("got %+v", entries)
