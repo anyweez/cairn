@@ -94,3 +94,31 @@ WHERE stream = 'counter/a'`).Scan(&snapshot); err != nil {
 		t.Fatalf("snapshot %q, want it carried over unchanged", snapshot)
 	}
 }
+
+// During a rolling deploy, processes on an earlier release run their own
+// statements against the newest schema. Every lock statement any release has
+// sent must still work once every migration has run.
+func TestEveryReleasesLockStatementsRunOnTheNewestSchema(t *testing.T) {
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	if err := New(pool, RequireActor(false)).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []struct{ sql, release string }{
+		{`SELECT locked_stream, locked_seq, locked_at FROM cairn.lock_streams($1)`, "Handle in two round trips"},
+		{`SELECT locked_stream, locked_seq FROM cairn.lock_streams($1)`, "the state cache"},
+	} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := tx.Query(ctx, stmt.sql, []string{"counter/a"})
+		if err == nil {
+			_, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (any, error) { return r.Values() })
+		}
+		_ = tx.Rollback(ctx)
+		if err != nil {
+			t.Errorf("%s's lock statement fails on the newest schema: %v", stmt.release, err)
+		}
+	}
+}

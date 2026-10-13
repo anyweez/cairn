@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,7 +203,9 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 	agg := newCounter(t)
 	view := totalsView(t, agg)
+	var writes atomic.Int64
 	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
+		writes.Add(1)
 		switch at.State.Total {
 		case 1:
 			// Holds the stream's lane while the next messages queue behind it.
@@ -236,6 +239,103 @@ func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 		t.Fatalf("%d messages failed, want only the one whose view fails", failed)
 	}
 	checkStream(t, agg, "a", 5, 5)
+	// Recorded one at a time from the start, the six messages would write the
+	// view six times. Grouped, the five queued ones write it twice more first:
+	// from the cache, then from the stored state, before the fallback.
+	if n := writes.Load(); n <= 6 {
+		t.Fatalf("the view was written %d times: the queued messages were never recorded together", n)
+	}
+}
+
+// A transaction whose last message is a refusal writes its views as of the
+// last entry that changed the state, as Rebuild would.
+func TestAViewWrittenForSeveralMessagesHasTheSeqOfItsCause(t *testing.T) {
+	agg := newCounter(t)
+	view := totalsView(t, agg)
+	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
+		if at.State.Total == 1 {
+			b.Queue(`SELECT pg_sleep(0.3)`) // holds the lane while two more queue
+		}
+		return view.Write(b, at, cause)
+	}}}
+
+	var wg sync.WaitGroup
+	for i, m := range []msg{add{1, 3}, add{1, 3}, add{100, 3}} {
+		wg.Go(func() { _, _ = agg.Handle(ctx, "a", m) })
+		if i == 0 {
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			time.Sleep(20 * time.Millisecond) // the refusal queues last
+		}
+	}
+	wg.Wait()
+
+	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil || len(entries) != 3 || entries[2].Refusal == nil {
+		t.Fatalf("entries %+v, %v; want two accepted, then a refusal", entries, err)
+	}
+	if got := readTotals(t, agg.Store.Pool()); len(got) != 1 || got[0].Total != 2 || got[0].Seq != 2 {
+		t.Fatalf("view %v, want a total of 2 at seq 2, the entry that made it", got)
+	}
+}
+
+// The composable API records every entry of one transaction at one time.
+func TestOneTransactionsEntriesShareTheirRecordingTime(t *testing.T) {
+	agg := newCounter(t)
+	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
+		if err := tx.Lock(ctx, agg.Stream("a"), agg.Stream("b")); err != nil {
+			return err
+		}
+		for _, id := range []string{"a", "b"} {
+			at, err := agg.LoadLocked(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			time.Sleep(5 * time.Millisecond)
+			if _, err := agg.Apply(ctx, tx, &at, add{1, 10}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+	b, _ := agg.Store.ReadStream(ctx, agg.Stream("b"), 0)
+	if len(a) != 1 || len(b) != 1 || !a[0].RecordedAt.Equal(b[0].RecordedAt) || a[0].TxID != b[0].TxID {
+		t.Fatalf("one transaction's entries: %+v and %+v", a, b)
+	}
+}
+
+// A kind with a slash in it could name another kind's stream ("a/b" + "c" is
+// "a" + "b/c"). It is refused even when that stream is already cached.
+func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
+	agg := newCounter(t)
+	if _, err := agg.Handle(ctx, "b/c", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+	alias := *agg
+	alias.Kind = "counter/b"
+	if _, err := alias.Handle(ctx, "c", add{1, 10}); err == nil || !strings.Contains(err.Error(), "invalid stream") {
+		t.Fatalf("want an invalid stream error, got %v", err)
+	}
+	checkStream(t, agg, "b/c", 1, 1)
+}
+
+// A Clone that panics after the transaction committed tells its caller the
+// message was recorded, so that a retry without an idempotency key doesn't
+// record it twice.
+func TestAPanicAfterCommittingSaysTheMessageWasRecorded(t *testing.T) {
+	agg := newBasket(t, ledgertest.NewStore(t))
+	agg.Clone = func(basket) basket { panic("clone") }
+	_, err := agg.Handle(ctx, "a", put{"apple"})
+	if err == nil || !strings.Contains(err.Error(), "was recorded") {
+		t.Fatalf("want an error saying the message was recorded, got %v", err)
+	}
+	if entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0); err != nil || len(entries) != 1 {
+		t.Fatalf("entries %v, %v; want the one recorded", entries, err)
+	}
 }
 
 func TestAPanickingDeciderReachesItsCaller(t *testing.T) {

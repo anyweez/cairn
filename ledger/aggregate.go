@@ -182,7 +182,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		// One batch, which Postgres runs as one implicit transaction: it
 		// commits as the batch ends unless a statement fails, in which case
 		// it rolls back with nothing left to end.
-		l, at = queueLockAt(&b, stream, cached.Seq), *cached
+		if l, err = queueLockAt(&b, stream, cached.Seq); err != nil {
+			return nil, Loaded[S]{}, Loaded[S]{}, err
+		}
+		at = *cached
 	} else {
 		b.own(sqlStep("beginning a transaction"), `BEGIN`)
 		if l, err = queueLock(&b, []Stream{stream}); err != nil {
@@ -206,8 +209,13 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 
 	results = make([]result[S, R], len(reqs))
 	finishes := make([]func() Handled[S, R], len(reqs))
-	var cause *Entry
-	now := recordingTime()
+	// cause is the last entry with events, and viewAt the state it left: the
+	// entries after it changed nothing a view shows, and a view is written as
+	// of the entry that caused it, as Rebuild writes it.
+	var (
+		cause  *Entry
+		viewAt Loaded[S]
+	)
 	for i, r := range reqs {
 		switch {
 		// A retry gets its first answer even when it lost the request's
@@ -226,15 +234,20 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		// queued, so one that fails leaves nothing of itself behind.
 		var one Batch
 		seq := l.seqs[stream.String()]
-		finish, next, entry, err := a.queueEntry(&one, l, at, r.msg, r.o, r.meta, now)
+		finish, next, entry, err := a.queueEntry(&one, l, at, r.msg, r.o, r.meta, l.at)
 		if err != nil {
 			l.seqs[stream.String()] = seq
 			results[i].err = err
+			if r.o.key != "" && cached != nil {
+				// A retry is answered from its first entry, which only the
+				// stored stream can show.
+				results[i].err = errUnchecked
+			}
 			continue
 		}
 		b.merge(&one)
 		if len(entry.Events) > 0 {
-			cause = entry
+			cause, viewAt = entry, next
 		}
 		at, finishes[i] = next, finish
 	}
@@ -250,7 +263,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		return nil, Loaded[S]{}, Loaded[S]{}, err
 	}
 	if cause != nil {
-		if err := a.queueViews(&b, at, *cause); err != nil {
+		if err := a.queueViews(&b, viewAt, *cause); err != nil {
 			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 	}
@@ -258,7 +271,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		b.own(commitStep, `COMMIT`)
 	}
 	if err := b.send(ctx, conn); err != nil {
-		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, at)
+		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, viewAt)
 	}
 	for i, finish := range finishes {
 		if finish != nil {
@@ -472,7 +485,12 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 
 	var b Batch
 	seq, notLocked := tx.locks.seq(at.Stream)
-	finish, next, entry, err := a.queueEntry(&b, tx.locks, *at, msg, o, meta, recordingTime())
+	// Every entry in one transaction shares its recorded_at, taken at Lock.
+	var recordedAt time.Time
+	if tx.locks != nil {
+		recordedAt = tx.locks.at
+	}
+	finish, next, entry, err := a.queueEntry(&b, tx.locks, *at, msg, o, meta, recordedAt)
 	if err == nil {
 		err = a.queueSnapshot(&b, &next)
 	}

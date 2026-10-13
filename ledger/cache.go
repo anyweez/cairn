@@ -36,7 +36,7 @@ import (
 // Messages that arrive for a stream while one of its transactions is in
 // flight wait for it, and are then decided in order and recorded together, in
 // one transaction. Each caller still returns only once its own message is
-// committed, but one stream is no longer limited to one commit per message.
+// committed, but one stream takes many messages per commit.
 // Views and snapshots are written once per transaction, from the state after
 // its last message.
 type stateCache struct {
@@ -295,13 +295,23 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 	cache, key := a.Store.cache, a.cacheKey(stream)
 	ctx, stop := groupContext(reqs)
 	defer stop()
+	var results []result[S, R] // set once the transaction has committed
 	defer func() {
-		// A panic in the decider would otherwise end the process from a
-		// goroutine no caller can recover in.
+		// A panic in the decider, or in Clone, would otherwise end the process
+		// from a goroutine no caller can recover in. Callers not yet answered
+		// learn whether their messages were recorded, so that one without an
+		// idempotency key isn't recorded twice by a retry.
 		if p := recover(); p != nil {
 			cache.drop(key)
-			for _, r := range reqs {
-				deliver(r, result[S, R]{err: fmt.Errorf("cairn: panic recording a message to %s: %v", stream, p)})
+			for i, r := range reqs {
+				err := fmt.Errorf("cairn: panic recording a message to %s: %v", stream, p)
+				switch {
+				case results != nil && results[i].err != nil:
+					err = results[i].err
+				case results != nil:
+					err = fmt.Errorf("cairn: the message to %s was recorded, but its result could not be returned: panic: %v", stream, p)
+				}
+				deliver(r, result[S, R]{err: err})
 			}
 		}
 	}()
@@ -317,7 +327,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 			}
 		}
 	}
-	results, before, after, err := a.runGroup(ctx, stream, reqs, cached)
+	attempt, before, after, err := a.runGroup(ctx, stream, reqs, cached)
 	switch {
 	case cached != nil && err == nil:
 		cache.observe(key, true)
@@ -327,7 +337,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 		if errors.Is(err, errStale) {
 			cache.observe(key, false)
 		}
-		results, before, after, err = a.runGroup(ctx, stream, reqs, nil)
+		attempt, before, after, err = a.runGroup(ctx, stream, reqs, nil)
 	case prev != nil && err == nil:
 		// Read first, which shows whether the cache would have been right.
 		cache.observe(key, before.Seq == prev.Seq)
@@ -347,6 +357,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 		return
 	}
 
+	results = attempt
 	cache.put(key, after)
 	copyState := a.copier()
 	for i, r := range reqs {

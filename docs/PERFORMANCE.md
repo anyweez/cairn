@@ -186,6 +186,12 @@ Postgres:
 - **Effects:** outbox leases fenced on attempts.
 - **Projections:** compare-and-set checkpoints.
 
+An entry's `recorded_at` comes from the clock of the process that recorded
+it, taken once per transaction, so that views can be told it before anything
+reaches the database. Processes' clocks differ, so `recorded_at` can disagree
+with the order of the log. The log is ordered by transaction ID and position,
+never by time.
+
 During a rolling deploy:
 
 - **Snapshots:** they are kept per `StateVersion`, so old and new code don't

@@ -124,9 +124,11 @@ type Tx struct {
 }
 
 // locks is what a transaction's Lock found: the seq of each stream it locked,
-// advanced as entries are queued.
+// advanced as entries are queued, and the recorded_at every entry the
+// transaction records shares.
 type locks struct {
 	seqs map[string]int64
+	at   time.Time
 }
 
 // recordingTime is the recorded_at of entries recorded now. It comes from
@@ -185,13 +187,13 @@ func queueLock(b *Batch, streams []Stream) (*locks, error) {
 	sorted = slices.CompactFunc(sorted, func(a, b Stream) bool { return a == b })
 	names := make([]string, len(sorted))
 	for i, st := range sorted {
-		if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
-			return nil, fmt.Errorf("cairn: invalid stream %q", st)
+		if err := validStream(st); err != nil {
+			return nil, err
 		}
 		names[i] = st.String()
 	}
 
-	l := &locks{seqs: make(map[string]int64, len(names))}
+	l := &locks{seqs: make(map[string]int64, len(names)), at: recordingTime()}
 	b.own(func(r pgx.BatchResults) error {
 		rows, err := r.Query()
 		if err == nil {
@@ -215,12 +217,24 @@ var errStale = errors.New("cairn: the stream has moved on")
 
 // queueLockAt queues taking one stream's lock on the condition that it is
 // still at seq, failing the batch with errStale otherwise.
-func queueLockAt(b *Batch, stream Stream, seq int64) *locks {
+func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
+	if err := validStream(stream); err != nil {
+		return nil, err
+	}
 	b.own(func(r pgx.BatchResults) error {
 		_, err := r.Exec()
 		return lockError(err)
 	}, `SELECT cairn.lock_stream_at($1, $2)`, stream.String(), seq)
-	return &locks{seqs: map[string]int64{stream.String(): seq}}
+	return &locks{seqs: map[string]int64{stream.String(): seq}, at: recordingTime()}, nil
+}
+
+// validStream refuses a stream whose name could be another's: the name joins
+// kind and ID with a slash, so a kind may not contain one.
+func validStream(st Stream) error {
+	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
+		return fmt.Errorf("cairn: invalid stream %q", st)
+	}
+	return nil
 }
 
 func lockError(err error) error {

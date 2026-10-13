@@ -110,10 +110,10 @@ Next to the baseline:
 
 - **The slower the link, the bigger the gain:** 2.5× or less on a local
   connection, 5–8× at 3–6 ms.
-- **A hot stream now gains from more callers,** 1.6–1.8× instead of 1.3×. The
-  lock is held for about 1.5 of the 2 round trips, and none of that time
-  depends on how much a message writes.
-- **The pool still caps total throughput,** at about connections ÷ latency:
+- **A hot stream gains from more callers:** 1.6–1.8×, against 1.3× in the
+  baseline. The lock is held for about 1.5 of the 2 round trips, and none of
+  that time depends on how much a message writes.
+- **The pool caps total throughput,** at about connections ÷ latency:
   4 ÷ 9.2 ms ≈ 435/s, against 423/s measured. Pool size remains the setting
   that matters most for many streams.
 - **Tails are tighter.** No case's p99 was more than about twice its median
@@ -165,10 +165,10 @@ stays current.
   median, about the run-to-run noise. Once it has seen that a stream's cached
   state is right less than three times in four, it reads before deciding,
   which is the uncached path.
-- **The first version did much worse.** It went back to trusting the cache
-  after a single read found the stream where the cache had it. With two
-  writers racing, that happens by chance about half the time. It made 2.47
-  round trips a message and recorded 97/s at 3 ms, because each failed
-  attempt also waited behind the other process for the lock.
-  `TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache` fails
-  against that version.
+- **One matching read is not enough to trust the cache again.** With two
+  writers racing, a read finds the stream where the cache had it about half
+  the time by chance. A cache that trusted such a read would make about 2.5
+  round trips a message, and each failed attempt would also wait behind the
+  other process for the lock.
+  `TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache` holds the
+  cost to about 2.
