@@ -42,6 +42,11 @@ func TestExtractReadsEverything(t *testing.T) {
 		"-: string",                              // json:"-," names the field "-"
 		"Untagged: int",                          //
 		"extra?: map[string]string",              // omitzero
+		"count: string(int)",                     // ,string writes the number inside a string
+		"labels: []string",                       // ,string applies only to scalars
+		"inline: {a: int}",                       // not addressable: the pointer marshaler is unused
+		"behind: *example.com/good.PtrMarshal",   // behind a pointer it marshals itself
+		"many: []example.com/good.PtrMarshal",    // slice elements are addressable
 	}
 	if !slices.Equal(c.Fields, wantFields) {
 		t.Errorf("fields:\n got %q\nwant %q", c.Fields, wantFields)
@@ -68,13 +73,18 @@ func TestExtractRefusesToGuess(t *testing.T) {
 		"bad.go:24: table Spread must list its edges, not pass a slice",
 		"bad.go:34: codec.Register[example.com/bad.Ping]: the name and version must be constants",
 		"bad.go:35: upcaster for missing, which is not registered in example.com/bad.Msg",
+		"bad.go:38: rule Positional must name its fields",
+		"bad.go:42: table Indirect must be built by a direct fsm.New call",
+		"bad.go:46: table NonConstEdge: To is not a constant",
+		"bad.go:51: pong is also registered at bad.go:50",
+		"bad.go:52: Upcast: the name and version must be constants",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %q in:\n%v", want, err)
 		}
 	}
-	if n := strings.Count(err.Error(), "\n") + 1; n != 6 {
-		t.Errorf("got %d errors, want 6:\n%v", n, err)
+	if n := strings.Count(err.Error(), "\n") + 1; n != 11 {
+		t.Errorf("got %d errors, want 11:\n%v", n, err)
 	}
 }
 
@@ -97,6 +107,44 @@ func TestCairnManifestIsCurrent(t *testing.T) {
 	}
 }
 
+// The -base path, as the PR check runs it: write the manifest to stdout and
+// fail on an incompatible change since the base.
+func TestRunChecksTheBase(t *testing.T) {
+	m, err := Extract("testdata/good", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, data []byte) string {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	same, err := encode(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run("testdata/good", "-", write("same.json", same), []string{"./..."}); err != nil {
+		t.Errorf("an unchanged base must pass: %v", err)
+	}
+
+	m.Codecs[0].Fields = append(m.Codecs[0].Fields, "gone: int")
+	older, err := encode(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run("testdata/good", "-", write("older.json", older), []string{"./..."})
+	if err == nil || !strings.Contains(err.Error(), "good.published changed shape without a version bump") {
+		t.Errorf("a reshaped codec must fail against the base, got %v", err)
+	}
+
+	if err := run("testdata/good", "-", write("bad.json", []byte("{")), []string{"./..."}); err == nil {
+		t.Error("an unreadable base must fail, not pass")
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}
@@ -115,6 +163,10 @@ func TestIncompatible(t *testing.T) {
 		{"went back", []Codec{codec(2, v2, 1)}, []Codec{codec(1, v1)}, "went back from version 2 to 1"},
 		{"reshaped", []Codec{codec(1, v1)}, []Codec{codec(1, v2)}, "changed shape without a version bump"},
 		{"no upcaster", []Codec{codec(1, v1)}, []Codec{codec(3, v2, 2)}, "no upcaster from version 1"},
+		{"bumped and reshaped", []Codec{codec(1, v1)}, []Codec{codec(2, v2, 1)}, ""},
+		{"fields reordered", []Codec{codec(1, []string{"a: string", "b: int"})}, []Codec{codec(1, []string{"b: int", "a: string"})}, ""},
+		{"upcaster dropped", []Codec{codec(2, v2, 1)}, []Codec{codec(2, v2)}, "no upcaster from version 1"},
+		{"older upcaster dropped on a bump", []Codec{codec(2, v2, 1)}, []Codec{codec(3, v2, 2)}, "no upcaster from version 1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := strings.Join(Incompatible(&Manifest{Codecs: tc.old}, &Manifest{Codecs: tc.now}), "\n")

@@ -28,7 +28,7 @@ import (
 func main() {
 	dir := flag.String("dir", ".", "the module to read")
 	out := flag.String("o", "spec.manifest.json", "the manifest to write, relative to -dir; - for stdout")
-	base := flag.String("base", "", "an earlier manifest to check codec changes against")
+	base := flag.String("base", "", "an earlier manifest, relative to the current directory, to check codec changes against")
 	flag.Parse()
 	patterns := flag.Args()
 	if len(patterns) == 0 {
@@ -99,17 +99,35 @@ func Incompatible(old, m *Manifest) []string {
 		switch {
 		case !ok:
 			problems = append(problems, fmt.Sprintf("%s (%s) was removed; entries already stored with it can't be decoded", was.Name, was.Sum))
+			continue
 		case c.Version < was.Version:
 			problems = append(problems, fmt.Sprintf("%s went back from version %d to %d", c.Name, was.Version, c.Version))
-		case c.Version == was.Version && !slices.Equal(c.Fields, was.Fields):
+			continue
+		case c.Version == was.Version && !sameFields(c.Fields, was.Fields):
 			problems = append(problems, fmt.Sprintf("%s changed shape without a version bump (still version %d)", c.Name, c.Version))
-		default:
-			for v := was.Version; v < c.Version; v++ {
-				if !slices.Contains(c.Upcasts, v) {
-					problems = append(problems, fmt.Sprintf("%s is now version %d but has no upcaster from version %d", c.Name, c.Version, v))
-				}
+		}
+		// Entries may be stored at any version the base could read, so each
+		// needs its path to the current version: the base's upcasters, and one
+		// from every version since.
+		needed := slices.Clone(was.Upcasts)
+		for v := was.Version; v < c.Version; v++ {
+			needed = append(needed, v)
+		}
+		slices.Sort(needed)
+		for _, v := range slices.Compact(needed) {
+			if !slices.Contains(c.Upcasts, v) {
+				problems = append(problems, fmt.Sprintf("%s is version %d but has no upcaster from version %d", c.Name, c.Version, v))
 			}
 		}
 	}
 	return problems
+}
+
+// sameFields compares shapes by field, not by order: decoding matches JSON
+// keys by name, so moving a field changes nothing that is stored.
+func sameFields(a, b []string) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }

@@ -34,3 +34,20 @@ func Codecs(version int) {
 	codec.Register[Ping](msgs, fmt.Sprint("ping"), version)
 	msgs.Upcast("missing", 1, nil)
 }
+
+var Positional = spec.Rule{"B3", spec.Never, spec.Established, "fields by position"}
+
+func table() fsm.Table[string, string] { return fsm.New[string, string]() }
+
+var Indirect = table()
+
+var target = "b"
+
+var NonConstEdge = fsm.New(fsm.Edge[string, string]{From: "a", On: "go", To: target})
+
+func More(name string) {
+	msgs := codec.New[Msg]()
+	codec.Register[Ping](msgs, "pong", 1)
+	codec.Register[Ping](msgs, "pong", 1)
+	msgs.Upcast(name, 1, nil)
+}

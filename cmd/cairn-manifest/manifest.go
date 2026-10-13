@@ -121,6 +121,7 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	m := &Manifest{Rules: x.rules, Tables: x.tables, Codecs: []Codec{}}
 	for _, c := range x.codecs {
 		slices.Sort(c.Upcasts)
+		c.Upcasts = slices.Compact(c.Upcasts) // a version upcast twice is replaced, not chained
 		m.Codecs = append(m.Codecs, *c)
 	}
 	if m.Rules == nil {

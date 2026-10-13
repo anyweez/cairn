@@ -52,7 +52,19 @@ type Published_ struct {
 	Untagged int
 	hidden   int
 	Extra    map[string]string `json:"extra,omitzero"`
+	Count    int               `json:"count,string"`
+	Labels   []string          `json:"labels,string"`
+	Inline   PtrMarshal        `json:"inline"`
+	Behind   *PtrMarshal       `json:"behind"`
+	Many     []PtrMarshal      `json:"many"`
 }
+
+// PtrMarshal marshals itself only where encoding/json can take its address.
+type PtrMarshal struct {
+	A int `json:"a"`
+}
+
+func (*PtrMarshal) MarshalJSON() ([]byte, error) { return []byte(`"custom"`), nil }
 
 func (Published_) isEvent() {}
 
