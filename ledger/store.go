@@ -95,7 +95,15 @@ type querier interface {
 // while locked, and all of a transaction's locks are taken in one Lock call.
 type Tx struct {
 	pgx.Tx
-	locked map[string]int64
+	locks *locks
+}
+
+// locks is what a transaction's Lock found: the seq of each stream it locked,
+// advanced as entries are queued, and the transaction's start time, which is
+// every entry's recorded_at.
+type locks struct {
+	seqs map[string]int64
+	at   time.Time
 }
 
 // ErrNotLocked is returned when a transaction writes a stream it did not lock.
@@ -122,99 +130,103 @@ func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
 // behind another for a stream is assigned its ID after the other's, so its
 // entries follow the other's in the log as they do in the stream.
 func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
-	if tx.locked != nil {
+	if tx.locks != nil {
 		return errors.New("cairn: Lock may be called once per transaction; pass every stream to one call")
 	}
+	var b Batch
+	l, err := queueLock(&b, streams)
+	if err != nil {
+		return err
+	}
+	if err := b.send(ctx, tx.Tx); err != nil {
+		return err
+	}
+	tx.locks = l
+	return nil
+}
+
+// errLockAfterWrite is cairn.lock_streams refusing a transaction that has
+// already written.
+var errLockAfterWrite = errors.New("cairn: Lock must come before the transaction's first write")
+
+// queueLock queues taking every stream's lock and reading its seq, in one
+// statement. The returned locks are filled in when the batch runs.
+func queueLock(b *Batch, streams []Stream) (*locks, error) {
 	sorted := slices.Clone(streams)
 	slices.SortFunc(sorted, func(a, b Stream) int { return strings.Compare(a.String(), b.String()) })
 	sorted = slices.CompactFunc(sorted, func(a, b Stream) bool { return a == b })
 	names := make([]string, len(sorted))
 	for i, st := range sorted {
 		if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
-			return fmt.Errorf("cairn: invalid stream %q", st)
+			return nil, fmt.Errorf("cairn: invalid stream %q", st)
 		}
 		names[i] = st.String()
 	}
 
-	var assigned bool
-	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id_if_assigned() IS NOT NULL`).Scan(&assigned); err != nil {
-		return fmt.Errorf("cairn: locking streams: %w", err)
-	}
-	if assigned {
-		return errors.New("cairn: Lock must come before the transaction's first write")
-	}
-	// Ordered by lock key, not by name, so that two streams whose keys collide
-	// are still taken in one global order.
-	rows, err := tx.Query(ctx,
-		`SELECT DISTINCT hashtextextended(s, 0) AS k FROM unnest($1::text[]) AS s ORDER BY k`, names)
-	if err != nil {
-		return fmt.Errorf("cairn: locking streams: %w", err)
-	}
-	keys, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return fmt.Errorf("cairn: locking streams: %w", err)
-	}
-	for _, k := range keys {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, k); err != nil {
+	l := &locks{seqs: make(map[string]int64, len(names))}
+	b.own(func(r pgx.BatchResults) error {
+		rows, err := r.Query()
+		if err == nil {
+			var (
+				name string
+				seq  int64
+			)
+			_, err = pgx.ForEachRow(rows, []any{&name, &seq, &l.at}, func() error {
+				l.seqs[name] = seq
+				return nil
+			})
+		}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "CN001" {
+			return errLockAfterWrite
+		}
+		if err != nil {
 			return fmt.Errorf("cairn: locking streams: %w", err)
 		}
-	}
-
-	// A stream that does not exist yet reads as seq 0; append creates its row.
-	rows, err = tx.Query(ctx, `SELECT stream, seq FROM cairn.streams WHERE stream = ANY($1)`, names)
-	if err != nil {
-		return fmt.Errorf("cairn: reading streams: %w", err)
-	}
-	locked := make(map[string]int64, len(names))
-	for _, name := range names {
-		locked[name] = 0
-	}
-	var (
-		name string
-		seq  int64
-	)
-	if _, err := pgx.ForEachRow(rows, []any{&name, &seq}, func() error {
-		locked[name] = seq
 		return nil
-	}); err != nil {
-		return fmt.Errorf("cairn: reading streams: %w", err)
-	}
-	tx.locked = locked
-	return nil
+	}, `SELECT locked_stream, locked_seq, locked_at FROM cairn.lock_streams($1)`, names)
+	return l, nil
 }
 
-func (tx *Tx) seq(stream Stream) (int64, error) {
-	seq, ok := tx.locked[stream.String()]
+func (l *locks) seq(stream Stream) (int64, error) {
+	var (
+		seq int64
+		ok  bool
+	)
+	if l != nil {
+		seq, ok = l.seqs[stream.String()]
+	}
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrNotLocked, stream)
 	}
 	return seq, nil
 }
 
-// append writes one entry at the next sequence number of a locked stream.
-func (tx *Tx) append(ctx context.Context, stream Stream, e Entry) (Entry, error) {
-	seq, err := tx.seq(stream)
+// queueAppend queues writing e at the next seq of a locked stream, advancing
+// the stream in l. e is filled in as far as it can be now, including
+// RecordedAt; its Position and TxID are filled in when the batch runs.
+func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry) error {
+	seq, err := l.seq(stream)
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
-	e.Stream, e.Kind, e.Seq = stream.String(), stream.Kind, seq+1
+	e.Stream, e.Kind, e.Seq, e.RecordedAt = stream.String(), stream.Kind, seq+1, l.at
 
 	message, err := json.Marshal(e.Message)
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
 	events, err := json.Marshal(nonNil(e.Events))
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
 	effects, err := json.Marshal(nonNil(e.Effects))
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
 	var refusal []byte
 	if e.Refusal != nil {
 		if refusal, err = json.Marshal(e.Refusal); err != nil {
-			return Entry{}, err
+			return err
 		}
 	}
 	var key *string
@@ -224,52 +236,64 @@ func (tx *Tx) append(ctx context.Context, stream Stream, e Entry) (Entry, error)
 	extra := []byte(`{}`)
 	if len(e.Meta.Extra) > 0 {
 		if extra, err = json.Marshal(e.Meta.Extra); err != nil {
-			return Entry{}, fmt.Errorf("cairn: encoding metadata for %s: %w", stream, err)
+			return fmt.Errorf("cairn: encoding metadata for %s: %w", stream, err)
 		}
 	}
 	var occurred *time.Time
 	if !e.Meta.OccurredAt.IsZero() {
 		occurred = &e.Meta.OccurredAt
 	}
-
-	// The first entry creates the stream; Lock only reserved it.
-	if _, err := tx.Exec(ctx, `
-INSERT INTO cairn.streams (stream, kind, seq) VALUES ($1, $2, $3)
-ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
-		e.Stream, e.Kind, e.Seq); err != nil {
-		return Entry{}, fmt.Errorf("cairn: advancing %s: %w", stream, err)
+	outbox := make([]string, len(e.Effects))
+	for i, effect := range e.Effects {
+		data, err := json.Marshal(effect)
+		if err != nil {
+			return err
+		}
+		outbox[i] = string(data)
 	}
 
-	var txid string
-	err = tx.QueryRow(ctx, `
+	// The first entry creates the stream; Lock only reserved it.
+	b.own(func(r pgx.BatchResults) error {
+		if _, err := r.Exec(); err != nil {
+			return fmt.Errorf("cairn: advancing %s: %w", stream, err)
+		}
+		return nil
+	}, `
+INSERT INTO cairn.streams (stream, kind, seq) VALUES ($1, $2, $3)
+ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
+		e.Stream, e.Kind, e.Seq)
+
+	b.own(func(r pgx.BatchResults) error {
+		var txid string
+		if err := r.QueryRow().Scan(&e.Position, &txid, &e.RecordedAt); err != nil {
+			return fmt.Errorf("cairn: appending to %s: %w", stream, err)
+		}
+		var err error
+		e.TxID, err = strconv.ParseUint(txid, 10, 64)
+		return err
+	}, `
 INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, effects, idempotency_key,
     actor, via, correlation_id, causation_id, occurred_at, extra)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
     nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15)
 RETURNING position, txid::text, recorded_at`,
 		e.Stream, e.Kind, e.Seq, message, nullJSON(e.Result), refusal, events, effects, key,
-		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra,
-	).Scan(&e.Position, &txid, &e.RecordedAt)
-	if err != nil {
-		return Entry{}, fmt.Errorf("cairn: appending to %s: %w", stream, err)
-	}
-	if e.TxID, err = strconv.ParseUint(txid, 10, 64); err != nil {
-		return Entry{}, err
-	}
+		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra)
 
-	for i, effect := range e.Effects {
-		data, err := json.Marshal(effect)
-		if err != nil {
-			return Entry{}, err
-		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO cairn.outbox (stream, seq, idx, kind, effect) VALUES ($1, $2, $3, $4, $5)`,
-			e.Stream, e.Seq, i, e.Kind, data); err != nil {
-			return Entry{}, fmt.Errorf("cairn: queueing effect %d of %s#%d: %w", i, stream, e.Seq, err)
-		}
+	// Every effect in one statement, numbered from 0 in order.
+	if len(outbox) > 0 {
+		b.own(func(r pgx.BatchResults) error {
+			if _, err := r.Exec(); err != nil {
+				return fmt.Errorf("cairn: queueing the effects of %s#%d: %w", stream, e.Seq, err)
+			}
+			return nil
+		}, `
+INSERT INTO cairn.outbox (stream, seq, idx, kind, effect)
+SELECT $1, $2, i - 1, $3, effect::jsonb FROM unnest($4::text[]) WITH ORDINALITY AS t(effect, i)`,
+			e.Stream, e.Seq, e.Kind, outbox)
 	}
-	tx.locked[e.Stream] = e.Seq
-	return e, nil
+	l.seqs[e.Stream] = e.Seq
+	return nil
 }
 
 func nonNil(envs []codec.Envelope) []codec.Envelope {
