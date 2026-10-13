@@ -18,8 +18,9 @@ import (
 	"github.com/anyweez/cairn/ledger"
 )
 
-// NewStore creates a fresh database, migrates it, and drops it when the test ends.
-func NewStore(t testing.TB) *ledger.Store {
+// NewStore creates a fresh database, migrates it, and drops it when the test
+// ends. Messages need no actor, unless opts include ledger.RequireActor(true).
+func NewStore(t testing.TB, opts ...ledger.StoreOption) *ledger.Store {
 	t.Helper()
 	url := os.Getenv("CAIRN_TEST_DATABASE_URL")
 	if url == "" {
@@ -57,7 +58,7 @@ func NewStore(t testing.TB) *ledger.Store {
 		_ = admin.Close(context.Background())
 	})
 
-	store := ledger.New(pool)
+	store := ledger.New(pool, append([]ledger.StoreOption{ledger.RequireActor(false)}, opts...)...)
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("migrating: %v", err)
 	}

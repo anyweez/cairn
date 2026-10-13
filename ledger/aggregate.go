@@ -34,6 +34,11 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// Views are written in the same transaction as every message that
 	// produces events.
 	Views []View[S]
+
+	// Actor, when set, returns the actor a message itself names (its "by"
+	// field), which then fills Meta.Actor. A message whose metadata names a
+	// different actor is not recorded, so the two can never disagree.
+	Actor func(M) string
 }
 
 // Stream names one of this aggregate's streams.
@@ -63,7 +68,10 @@ type Handled[S, R any] struct {
 // Option adjusts how a message is recorded.
 type Option func(*options)
 
-type options struct{ key string }
+type options struct {
+	key  string
+	meta Meta
+}
 
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
@@ -174,11 +182,16 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	for _, opt := range opts {
 		opt(&o)
 	}
-
+	// A retry gets its first answer even when it lost the request's metadata:
+	// the message was attributed when it was recorded.
 	if o.key != "" {
 		if h, found, err := a.duplicate(ctx, tx, at, o.key); err != nil || found {
 			return h, err
 		}
+	}
+	meta, err := a.meta(ctx, msg, o)
+	if err != nil {
+		return Handled[S, R]{}, err
 	}
 
 	decision := a.Decider.Decide(at.State, msg)
@@ -186,8 +199,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		return Handled[S, R]{}, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
 	}
 
-	entry := Entry{Refusal: decision.Refusal, IdempotencyKey: o.key}
-	var err error
+	entry := Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
 	if entry.Message, err = a.Messages.Encode(msg); err != nil {
 		return Handled[S, R]{}, err
 	}
@@ -213,7 +225,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		return Handled[S, R]{}, err
 	}
 	if len(decision.Events) > 0 {
-		if err := a.writeViews(ctx, tx, at); err != nil {
+		if err := a.writeViews(ctx, tx, at, entry); err != nil {
 			return Handled[S, R]{}, err
 		}
 	}

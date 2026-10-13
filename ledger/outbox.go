@@ -17,6 +17,8 @@ type Delivery[Ef any] struct {
 	Index   int
 	Effect  Ef
 	Attempt int
+	// Meta is the metadata of the entry that produced the effect.
+	Meta Meta
 }
 
 // Key identifies the effect across retries. Pass it to whatever carries the
@@ -33,6 +35,11 @@ type Dispatcher[Ef any] struct {
 	// Handle carries out one effect. Its context ends when the lease does, so
 	// a handler that outlives its lease is cancelled rather than racing the
 	// dispatcher that reclaims the effect.
+	//
+	// The context carries metadata for any message the handler records: the
+	// producing entry's actor (or "outbox" when it had none) and correlation
+	// ID, Via "outbox", and the delivery's Key as the CausationID. Replace the
+	// actor with ContextWithMeta when the handler acts as itself.
 	Handle func(ctx context.Context, d Delivery[Ef]) error
 
 	// Batch is how many effects one claim takes. Defaults to 20.
@@ -84,14 +91,19 @@ func (d *Dispatcher[Ef]) config() dispatchConfig {
 func (d *Dispatcher[Ef]) DrainOnce(ctx context.Context) (int, error) {
 	cfg := d.config()
 	rows, err := d.Store.pool.Query(ctx, `
-UPDATE cairn.outbox SET attempts = attempts + 1, available_at = now() + make_interval(secs => $3)
-WHERE id IN (
-    SELECT id FROM cairn.outbox
-    WHERE kind = $1 AND done_at IS NULL AND failed_at IS NULL AND available_at <= now()
-    ORDER BY id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $2)
-RETURNING id, stream, seq, idx, effect, attempts`,
+WITH claimed AS (
+    UPDATE cairn.outbox SET attempts = attempts + 1, available_at = now() + make_interval(secs => $3)
+    WHERE id IN (
+        SELECT id FROM cairn.outbox
+        WHERE kind = $1 AND done_at IS NULL AND failed_at IS NULL AND available_at <= now()
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        LIMIT $2)
+    RETURNING id, stream, seq, idx, effect, attempts)
+SELECT c.id, c.stream, c.seq, c.idx, c.effect, c.attempts,
+    coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, '')
+FROM claimed c JOIN cairn.entries e ON e.stream = c.stream AND e.seq = c.seq
+ORDER BY c.id`,
 		d.Kind, cfg.batch, cfg.lease.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("cairn: claiming effects: %w", err)
@@ -103,11 +115,13 @@ RETURNING id, stream, seq, idx, effect, attempts`,
 		idx      int
 		effect   []byte
 		attempts int
+		meta     Meta
 	}
 	var batch []claimed
 	for rows.Next() {
 		var c claimed
-		if err := rows.Scan(&c.id, &c.stream, &c.seq, &c.idx, &c.effect, &c.attempts); err != nil {
+		if err := rows.Scan(&c.id, &c.stream, &c.seq, &c.idx, &c.effect, &c.attempts,
+			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -147,7 +161,8 @@ SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id
 		}
 
 		handleCtx, cancel := context.WithTimeout(ctx, cfg.lease)
-		err = d.deliver(handleCtx, c.stream, c.seq, c.idx, c.id, c.effect, c.attempts)
+		err = d.deliver(handleCtx, Delivery[Ef]{ID: c.id, Stream: c.stream, Seq: c.seq, Index: c.idx,
+			Attempt: c.attempts, Meta: c.meta}, c.effect)
 		cancel()
 		switch {
 		case err == nil:
@@ -168,7 +183,7 @@ SET available_at = now() + make_interval(secs => $3), last_error = $4 WHERE id =
 	return len(batch), nil
 }
 
-func (d *Dispatcher[Ef]) deliver(ctx context.Context, stream string, seq int64, idx int, id int64, raw []byte, attempt int) (err error) {
+func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byte) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic: %v", p)
@@ -178,11 +193,10 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, stream string, seq int64, 
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return err
 	}
-	effect, err := d.Effects.Decode(env)
-	if err != nil {
+	if dl.Effect, err = d.Effects.Decode(env); err != nil {
 		return err
 	}
-	return d.Handle(ctx, Delivery[Ef]{ID: id, Stream: stream, Seq: seq, Index: idx, Effect: effect, Attempt: attempt})
+	return d.Handle(ContextWithMeta(ctx, dl.caused()), dl)
 }
 
 // Run drains the outbox every interval until ctx is done. An error ends it
@@ -209,4 +223,22 @@ func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error 
 		case <-t.C:
 		}
 	}
+}
+
+// caused is the metadata for a message recorded while carrying out d: the
+// same actor and flow as the entry that produced the effect, caused by this
+// delivery. A flow with no correlation ID starts at that entry. An entry with
+// no actor, recorded before entries had one or by a store that does not
+// require one, is attributed to the outbox, so its follow-ups are not refused
+// by a store that does.
+func (d Delivery[Ef]) caused() Meta {
+	correlation := d.Meta.CorrelationID
+	if correlation == "" {
+		correlation = fmt.Sprintf("%s#%d", d.Stream, d.Seq)
+	}
+	actor := d.Meta.Actor
+	if actor == "" {
+		actor = "outbox"
+	}
+	return Meta{Actor: actor, Via: "outbox", CorrelationID: correlation, CausationID: d.Key()}
 }
