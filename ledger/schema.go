@@ -154,6 +154,55 @@ BEGIN
         FROM unnest(names) AS n LEFT JOIN cairn.streams s ON s.stream = n;
 END $$;
 `,
+	// 5: lock one stream on the condition that it is still at the seq the
+	// caller last saw, so a process can decide from state it holds in memory
+	// and record the decision in the same round trip as the lock. Entries'
+	// recorded_at now comes from the recording process, which knows it before
+	// that round trip, so lock_streams stops returning the transaction's time.
+	`
+CREATE FUNCTION cairn.lock_stream_at(name text, expected bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    current bigint;
+BEGIN
+    IF pg_current_xact_id_if_assigned() IS NOT NULL THEN
+        RAISE EXCEPTION 'Lock must come before the transaction''s first write'
+            USING ERRCODE = 'CN001';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(name, 0));
+    SELECT seq INTO current FROM cairn.streams WHERE stream = name;
+    IF coalesce(current, 0) <> expected THEN
+        RAISE EXCEPTION 'stream % is at seq %, not %', name, coalesce(current, 0), expected
+            USING ERRCODE = 'CN002';
+    END IF;
+END $$;
+
+DROP FUNCTION cairn.lock_streams(text[]);
+CREATE FUNCTION cairn.lock_streams(names text[])
+RETURNS TABLE (locked_stream text, locked_seq bigint)
+LANGUAGE plpgsql AS $$
+DECLARE
+    k bigint;
+BEGIN
+    -- The global log is ordered by transaction ID, assigned at the first
+    -- write; a transaction that waited for a stream must get its ID after
+    -- the one it waited for.
+    IF pg_current_xact_id_if_assigned() IS NOT NULL THEN
+        RAISE EXCEPTION 'Lock must come before the transaction''s first write'
+            USING ERRCODE = 'CN001';
+    END IF;
+    -- Ordered by key, not by name, so that two streams whose keys collide are
+    -- still taken in one global order.
+    FOR k IN SELECT DISTINCT hashtextextended(n, 0) FROM unnest(names) AS n ORDER BY 1 LOOP
+        PERFORM pg_advisory_xact_lock(k);
+    END LOOP;
+    -- A fresh snapshot, taken now that every lock is held. A stream that does
+    -- not exist yet reads as seq 0.
+    RETURN QUERY
+        SELECT n, coalesce(s.seq, 0)
+        FROM unnest(names) AS n LEFT JOIN cairn.streams s ON s.stream = n;
+END $$;
+`,
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every

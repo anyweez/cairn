@@ -55,10 +55,16 @@ func queueView[S any](b *Batch, v View[S], at Loaded[S], cause Entry) error {
 	b.owner = v.Name
 	defer func() { b.owner = "" }()
 	if err := v.Write(b, at, cause); err != nil {
-		return fmt.Errorf("cairn: view %s at %s#%d: %w", v.Name, at.Stream, at.Seq, err)
+		return &viewFailure{fmt.Errorf("cairn: view %s at %s#%d: %w", v.Name, at.Stream, at.Seq, err)}
 	}
 	return nil
 }
+
+// viewFailure is a view's Write returning an error. Nothing was sent, so the
+// messages it was writing for can be tried again one at a time.
+type viewFailure struct{ error }
+
+func (e *viewFailure) Unwrap() error { return e.error }
 
 // viewError names the view that queued a failing statement. Errors from the
 // ledger's own statements already say what failed.

@@ -8,8 +8,9 @@ package ledger_test
 //	go test ./ledger -run '^$' -bench Handle -benchtime 5s
 //
 // CAIRN_BENCH_RTT_MS picks the added round-trip times (default "0,2,5").
-// Besides ns/op, each reports msgs/s, p50 and p99 latency, round trips and
-// statements per message, and the round trip it measured before starting.
+// Each load also runs with a StateCache, suffixed /cache. Besides ns/op, each
+// reports msgs/s, p50 and p99 latency, round trips and statements per
+// message, and the round trip it measured before starting.
 
 import (
 	"bytes"
@@ -38,9 +39,10 @@ type benchLoad struct {
 	callers int // goroutines calling Handle
 	pool    int // connections
 	hot     bool
+	cache   bool // with a StateCache
 }
 
-var benchLoads = []benchLoad{
+var benchLoads = withCache([]benchLoad{
 	// One caller on one stream: one message's full latency.
 	{name: "hot/callers=1", callers: 1, pool: 1, hot: true},
 	// Callers queued on one stream's lock: the most it can take.
@@ -49,6 +51,16 @@ var benchLoads = []benchLoad{
 	{name: "spread/callers=32/pool=32", callers: 32, pool: 32},
 	// The same callers on pgxpool's default size on a 4-CPU host.
 	{name: "spread/callers=32/pool=4", callers: 32, pool: 4},
+})
+
+// withCache adds a cached run of every load after it.
+func withCache(loads []benchLoad) []benchLoad {
+	out := slices.Clone(loads)
+	for _, l := range loads {
+		l.name, l.cache = l.name+"/cache", true
+		out = append(out, l)
+	}
+	return out
 }
 
 // BenchmarkHandle records messages shaped like an ordinary aggregate's:
@@ -102,6 +114,9 @@ func benchHandle(b *testing.B, proxyAddr string, load benchLoad) {
 	agg := counterOn(ledger.New(pool, ledger.RequireActor(false)))
 	agg.StateVersion = "bench/1"
 	agg.Views = []ledger.View[counter]{totalsView(b, agg)}
+	if load.cache {
+		agg.Cache = ledger.NewStateCache(1000)
+	}
 
 	stream := func(caller int) string {
 		if load.hot {
