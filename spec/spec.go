@@ -1,5 +1,5 @@
 // Package spec is the vocabulary for stating what a Decider must and must not
-// do: rules, and the laws and invariants that check them.
+// do: rules, and the laws, changes and invariants that check them.
 //
 // The rules are the human-owned part. Each one has a stable ID, a one-sentence
 // statement, a kind and a status. Review attention goes to changes in this

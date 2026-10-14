@@ -95,7 +95,7 @@ different kind:
 | `cairn` | `Decider`, `Decision`, `Refusal`. Business logic as two pure functions: `Decide` turns a state and a message into events and effects (or a refusal), and `Evolve` folds one event into the state. |
 | `codec` | Versioned JSON for messages, results, events and effects, with upcasters for old versions. |
 | `ledger` | The Postgres shell. It takes per-stream locks, appends every decided message (refusals included) to an append-only log, queues effects in an outbox in the same transaction, runs projections over the global log, and re-decides stored history with `Verify`. |
-| `spec` / `spectest` | Rules (`Never` / `Can` / `Refines`, `Established` / `Proposed`) and a rapid-based checker. It holds every machine to the framework's own rules (deterministic, total, refusals carry nothing, no mutation of the given state, replayable) as well as to the machine's rules, and reports how often each rule actually applied. |
+| `spec` / `spectest` | Rules (`Never` / `Can` / `Refines`, `Established` / `Proposed`), checked as laws over a transition, changes over the state alone, invariants over every state, and refinements of a reference model, by a rapid-based checker. It holds every machine to the framework's own rules (deterministic, total, refusals carry nothing, no mutation of the given state, replayable) as well as to the machine's rules, and reports how often each rule actually applied. |
 | `blocks/fsm` | A lifecycle as a table of allowed transitions. `Decide` consults it, the spec enforces it, and review renders it. |
 | `ledger/ledgertest` | A fresh, migrated database for each test. |
 | `examples/decisions` | lore's decision register rebuilt on cairn, end to end. |
@@ -172,6 +172,7 @@ var NeverOverdrawn = spec.Rule{ID: "B1", Kind: spec.Never, Status: spec.Establis
 func TestBankSpec(t *testing.T) {
 	spectest.Machine[Account, Msg, int, Event, Effect]{
 		Decider: Bank,
+		Codecs:  Codecs(), // D6: every value survives its codec
 		Messages: func(t *rapid.T, a Account) Msg {
 			n := rapid.IntRange(-5, a.Balance+20).Draw(t, "amount")
 			if rapid.Bool().Draw(t, "deposit") {
@@ -186,16 +187,35 @@ func TestBankSpec(t *testing.T) {
 }
 ```
 
-**The ledger.** The same decider, persisted:
+**The ledger.** The same decider, persisted. Every type the ledger stores is
+registered under a name and a version that never change, and the four codecs
+travel together as a `codec.Set`, which the spec test round-trips through too
+(D6):
+
+```go
+func Codecs() *codec.Set[Msg, int, Event, Effect] {
+	msgs := codec.New[Msg]()
+	codec.Register[Deposit](msgs, "account.deposit", 1)
+	codec.Register[Withdraw](msgs, "account.withdraw", 1)
+	events := codec.New[Event]()
+	codec.Register[Deposited](events, "account.deposited", 1)
+	codec.Register[Withdrew](events, "account.withdrew", 1)
+	effects := codec.New[Effect]()
+	codec.Register[WarnLowBalance](effects, "account.warn_low_balance", 1)
+	results := codec.New[int]()
+	codec.Register[int](results, "account.balance", 1)
+	return &codec.Set[Msg, int, Event, Effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
+}
+```
 
 ```go
 store := ledger.New(pool)
 if err := store.Migrate(ctx); err != nil { ... }
 
 accounts := &ledger.Aggregate[Account, Msg, int, Event, Effect]{
-	Store: store, Kind: "account", Decider: Bank,
-	Codecs: codecs, // a *codec.Set
+	Store: store, Kind: "account", Decider: Bank, Codecs: Codecs(),
 }
+if err := accounts.Validate(); err != nil { ... } // every method checks this too
 
 // Usually set once per request, by middleware. Every entry needs an actor.
 ctx = ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_alice", Via: "api", CorrelationID: requestID})
