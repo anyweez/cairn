@@ -117,14 +117,20 @@ func TestLockRefusesATransactionThatHasWritten(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	err := store.Transact(ctx, func(tx *Tx) error {
+	// Transact locks before anything else, so the guard is reached only by
+	// sending the lock statement by hand after a write.
+	err := pgx.BeginFunc(ctx, store.pool, func(tx pgx.Tx) error {
 		// Assigns the transaction its ID, as any write would.
 		if _, err := tx.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
 			return err
 		}
-		return tx.Lock(ctx, Stream{Kind: "counter", ID: "a"})
+		var b Batch
+		if _, err := queueLock(&b, []Stream{{Kind: "counter", ID: "a"}}); err != nil {
+			return err
+		}
+		return b.send(ctx, tx)
 	})
 	if !errors.Is(err, errLockAfterWrite) {
-		t.Fatalf("Lock after a write: %v, want errLockAfterWrite", err)
+		t.Fatalf("lock after a write: %v, want errLockAfterWrite", err)
 	}
 }

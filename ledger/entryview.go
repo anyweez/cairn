@@ -106,7 +106,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) replayEntries(ctx context.Context, stream S
 	at := Loaded[S]{Stream: stream, State: a.Decider.Initial()}
 	for {
 		var n int
-		err := a.Store.Transact(ctx, func(tx *Tx) error {
+		err := a.Store.Transact(ctx, nil, func(tx *Tx) error {
 			rows, err := tx.Query(ctx, `SELECT `+entryColumns+` FROM cairn.entries
 WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, rebuildWindow)
 			if err != nil {

@@ -105,14 +105,11 @@ func (s *Service) Acknowledge(ctx context.Context, id, by string, committed bool
 // exactly the facts the decision was made on.
 func (s *Service) Supersede(ctx context.Context, id, with, by string) error {
 	var refusal *cairn.Refusal
-	err := s.Register.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		streams := []ledger.Stream{s.Register.Stream(id)}
-		if with != "" { // an empty replacement is the decider's to refuse
-			streams = append(streams, s.Register.Stream(with))
-		}
-		if err := tx.Lock(ctx, streams...); err != nil {
-			return err
-		}
+	streams := []ledger.Stream{s.Register.Stream(id)}
+	if with != "" { // an empty replacement is the decider's to refuse
+		streams = append(streams, s.Register.Stream(with))
+	}
+	err := s.Register.Store.Transact(ctx, streams, func(tx *ledger.Tx) error {
 		target, err := s.Register.LoadLocked(ctx, tx, id)
 		if err != nil {
 			return err

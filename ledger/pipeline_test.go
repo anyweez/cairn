@@ -65,10 +65,7 @@ func TestEachPathKeepsToItsRoundTrips(t *testing.T) {
 		}},
 		// BEGIN, Lock, LoadLocked, Apply, COMMIT.
 		{"Transact", 5, func(int) error {
-			return agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-				if err := tx.Lock(ctx, agg.Stream("a")); err != nil {
-					return err
-				}
+			return agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a")}, func(tx *ledger.Tx) error {
 				at, err := agg.LoadLocked(ctx, tx, "a")
 				if err != nil {
 					return err

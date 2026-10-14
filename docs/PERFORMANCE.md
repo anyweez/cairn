@@ -16,7 +16,7 @@ measurements and how to reproduce them.
 | `Handle` with an idempotency key that matches, cached | 3 |
 | `Handle` on a stream another process wrote since this one did | 3, or 2 once the cache has seen it's shared |
 | `Load` | 1 |
-| `Transact` with `Lock`, `LoadLocked` and `Apply` on one stream | 5 |
+| `Transact` with `LoadLocked` and `Apply` on one stream | 5 |
 | `CatchUp`, per batch of up to `BatchSize` entries | 5 |
 
 `TestEachPathKeepsToItsRoundTrips` holds the uncached paths to these numbers,

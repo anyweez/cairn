@@ -157,10 +157,7 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		wg.Go(func() {
 			for i := range 15 {
 				pair := []string{ids[(w+i)%len(ids)], ids[(w+2*i+1)%len(ids)]}
-				err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-					if err := tx.Lock(ctx, agg.Stream(pair[0]), agg.Stream(pair[1])); err != nil {
-						return err
-					}
+				err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream(pair[0]), agg.Stream(pair[1])}, func(tx *ledger.Tx) error {
 					for _, id := range pair {
 						at, err := agg.LoadLocked(ctx, tx, id)
 						if err != nil {
@@ -271,10 +268,7 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	agg := newCounter(t)
 	appended, release, done := make(chan struct{}), make(chan struct{}), make(chan error)
 	go func() {
-		done <- agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-			if err := tx.Lock(ctx, agg.Stream("slow")); err != nil {
-				return err
-			}
+		done <- agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("slow")}, func(tx *ledger.Tx) error {
 			at, err := agg.LoadLocked(ctx, tx, "slow")
 			if err != nil {
 				return err
@@ -322,30 +316,10 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	}
 }
 
-func TestLockMustComeBeforeAnyWrite(t *testing.T) {
-	t.Parallel()
-	agg := newCounter(t)
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE scratch (x int)`); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO scratch VALUES (1)`); err != nil {
-			return err
-		}
-		return tx.Lock(ctx, agg.Stream("late"))
-	})
-	if err == nil {
-		t.Fatal("Lock after a write must fail: the transaction already has its place in the log")
-	}
-}
-
 func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("read"), agg.Stream("written")); err != nil {
-			return err
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("read"), agg.Stream("written")}, func(tx *ledger.Tx) error {
 		read, err := agg.LoadLocked(ctx, tx, "read")
 		if err != nil {
 			return err
@@ -859,13 +833,7 @@ func TestTheLibraryKeepsItsOwnGuarantees(t *testing.T) {
 		t.Errorf("a refusal with events must be rejected, got %v", err)
 	}
 
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("a")); err != nil {
-			return err
-		}
-		if err := tx.Lock(ctx, agg.Stream("b")); err == nil {
-			t.Error("a second Lock must be refused")
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a")}, func(tx *ledger.Tx) error {
 		if _, err := agg.LoadLocked(ctx, tx, "b"); !errors.Is(err, ledger.ErrNotLocked) {
 			t.Errorf("loading an unlocked stream for writing: %v", err)
 		}

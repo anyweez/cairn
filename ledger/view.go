@@ -98,10 +98,7 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 	}
 	for i, name := range names {
 		stream := parseStream(name, a.Kind)
-		err := a.Store.Transact(ctx, func(tx *Tx) error {
-			if err := tx.Lock(ctx, stream); err != nil {
-				return err
-			}
+		err := a.Store.Transact(ctx, []Stream{stream}, func(tx *Tx) error {
 			at, err := a.LoadLocked(ctx, tx, stream.ID)
 			if err != nil {
 				return err

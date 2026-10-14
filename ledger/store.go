@@ -122,8 +122,8 @@ type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// Tx is a transaction that may write to the ledger. Streams are written only
-// while locked, and all of a transaction's locks are taken in one Lock call.
+// Tx is a transaction that may write to the ledger: the streams Transact
+// locked, and nothing else.
 type Tx struct {
 	pgx.Tx
 	locks *locks
@@ -145,44 +145,38 @@ func recordingTime() time.Time { return time.Now().Truncate(time.Microsecond) }
 // ErrNotLocked is returned when a transaction writes a stream it did not lock.
 var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
 
-// Transact runs fn in a transaction, committing if it returns nil.
+// Transact runs fn in a transaction that holds the write lock on streams,
+// committing if fn returns nil. Pass every stream the transaction will write;
+// Apply on any other fails with ErrNotLocked. Locking a stream that does not
+// exist yet does not create it: its row is written with its first entry, so a
+// stream locked only to be read leaves nothing behind.
+//
+// The locks are taken before anything else, in a fixed order, so two
+// transactions that lock overlapping streams can never deadlock. The global
+// log is ordered by transaction ID, and Postgres assigns that ID at a
+// transaction's first write. Every stream lock is therefore an advisory lock
+// taken while the transaction has no ID yet: a transaction that queues behind
+// another for a stream is assigned its ID after the other's, so its entries
+// follow the other's in the log as they do in the stream.
 //
 // fn may run its own statements on tx, such as claiming a number from an
-// application table, but nothing that writes may come before tx.Lock: Lock
-// refuses a transaction that has already written (see Lock).
-func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
+// application table. Each costs a round trip; see docs/CONVENTIONS.md.
+func (s *Store) Transact(ctx context.Context, streams []Stream, fn func(tx *Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(ptx pgx.Tx) error {
-		return fn(&Tx{Tx: ptx})
+		tx := &Tx{Tx: ptx}
+		if len(streams) > 0 {
+			var b Batch
+			l, err := queueLock(&b, streams)
+			if err != nil {
+				return err
+			}
+			if err := b.send(ctx, ptx); err != nil {
+				return err
+			}
+			tx.locks = l
+		}
+		return fn(tx)
 	})
-}
-
-// Lock takes the write lock on every stream the transaction will touch.
-// Locking a stream that does not exist yet does not create it: its row is
-// written with its first entry, so a stream locked only to be read leaves
-// nothing behind. Locks are taken in a fixed order,
-// which is why they must all be taken at once: two transactions that lock
-// overlapping streams can then never deadlock. Lock may be called once, and
-// must come before the transaction's first write.
-//
-// The global log is ordered by transaction ID, and Postgres assigns that ID at
-// a transaction's first write. Every stream lock is therefore an advisory
-// lock taken while the transaction has no ID yet: a transaction that queues
-// behind another for a stream is assigned its ID after the other's, so its
-// entries follow the other's in the log as they do in the stream.
-func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
-	if tx.locks != nil {
-		return errors.New("cairn: Lock may be called once per transaction; pass every stream to one call")
-	}
-	var b Batch
-	l, err := queueLock(&b, streams)
-	if err != nil {
-		return err
-	}
-	if err := b.send(ctx, tx.Tx); err != nil {
-		return err
-	}
-	tx.locks = l
-	return nil
 }
 
 // errLockAfterWrite is cairn.lock_streams refusing a transaction that has

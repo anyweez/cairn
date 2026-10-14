@@ -60,7 +60,7 @@ on wherever possible.
 | `View.Write` | Takes a `Batch`. Views' statements go out with the message's own writes and its commit. |
 | `EntryView.Write` | Takes a `Batch`. Each entry's statements go out with the message's own writes and its commit, after the views. |
 | `Projection.Apply` | Takes a `Batch`. A batch of entries' statements goes out in one round trip, together with the checkpoint's advance. It also takes a `ctx`, for read models that live outside the database. |
-| `Store.Transact` / `Tx` | `Tx` embeds `pgx.Tx`, for transactions that span several streams. Callers compose cairn's own calls in it, and each costs one round trip: `Lock` for every stream at once, `LoadLocked` per stream, and `Apply` per message (plus one to look up an idempotency key). `Transact` adds `BEGIN` and `COMMIT`. |
+| `Store.Transact` / `Tx` | `Tx` is a `pgx` transaction, for transactions that span several streams. Callers compose cairn's own calls in it, and each costs one round trip: `Transact` locks every stream at once, then `LoadLocked` per stream, and `Apply` per message (plus one to look up an idempotency key). `Transact` adds `BEGIN` and `COMMIT`. |
 
 cairn's own statements follow the same rule. `Handle` costs one round trip
 when the store's state cache holds the stream, and two otherwise: one begins

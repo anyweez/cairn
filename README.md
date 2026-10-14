@@ -230,9 +230,9 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   caused by that delivery, in the same flow. `Decide` never sees metadata:
   what a decision depends on belongs in the message, where `Verify` can
   replay it.
-- **No interleaving within a stream.** `Tx.Lock` takes every stream lock a
-  transaction needs in one sorted call, so overlapping transactions cannot
-  deadlock. Locking a stream doesn't create it: a stream exists once its first
+- **No interleaving within a stream.** `Transact` takes every stream lock a
+  transaction needs in one sorted call, before anything else, so overlapping
+  transactions cannot deadlock. Locking a stream doesn't create it: a stream exists once its first
   entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
   refusals free of events and effects.

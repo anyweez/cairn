@@ -292,10 +292,7 @@ func TestAViewWrittenForSeveralMessagesHasTheSeqOfItsCause(t *testing.T) {
 func TestOneTransactionsEntriesShareTheirRecordingTime(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("a"), agg.Stream("b")); err != nil {
-			return err
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a"), agg.Stream("b")}, func(tx *ledger.Tx) error {
 		for _, id := range []string{"a", "b"} {
 			at, err := agg.LoadLocked(ctx, tx, id)
 			if err != nil {

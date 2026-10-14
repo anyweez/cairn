@@ -75,10 +75,7 @@ func TestAViewCommitsAndRollsBackWithItsMessage(t *testing.T) {
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 	errAbandon := errors.New("abandon")
 
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("a")); err != nil {
-			return err
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a")}, func(tx *ledger.Tx) error {
 		at, err := agg.LoadLocked(ctx, tx, "a")
 		if err != nil {
 			return err
