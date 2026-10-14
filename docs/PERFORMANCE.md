@@ -87,15 +87,9 @@ What it relies on:
 
 - **Each stream's traffic mostly reaching one process.** That's where the
   cache pays. Without it, the cache falls back to about what no cache costs.
-- **A faithful copy of the state.** `Handled.State` is never the cached value,
-  so a caller can't change what the next decision sees. It is copied by
-  `Aggregate.Clone` if set; otherwise by assignment, when the state has no
-  maps, slices, pointers or interfaces in it (`time.Time` is fine); otherwise
-  through JSON, when `StateVersion` is set, since snapshots already rely on
-  the state surviving JSON. An aggregate with none of these is not cached.
-  Set `Clone`, or `StateVersion`, to cache it.
 - **Pure deciders.** `Decide`, `Evolve` and views are handed the cached state,
-  so they must not change it. spectest holds deciders to this.
+  so they must not change it. spectest holds deciders to this. Nothing hands
+  it to a caller: `Handled` carries no state, and `Load` reads the stream.
 - **Views that only care about the latest state.** A view sees only the state
   after its transaction's last message. A view that fails for one message's
   state therefore fails that message only when it is the last in its

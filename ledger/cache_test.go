@@ -20,8 +20,8 @@ import (
 
 // handleAll sends msgs to one stream at once, and returns each one's outcome
 // in the order given.
-func handleAll(agg *ledger.Aggregate[counter, msg, int, event, effect], id string, msgs []msg, opts ...ledger.Option) ([]ledger.Handled[counter, int], []error) {
-	hs := make([]ledger.Handled[counter, int], len(msgs))
+func handleAll(agg *ledger.Aggregate[counter, msg, int, event, effect], id string, msgs []msg, opts ...ledger.Option) ([]ledger.Handled[int], []error) {
+	hs := make([]ledger.Handled[int], len(msgs))
 	errs := make([]error, len(msgs))
 	var wg sync.WaitGroup
 	for i, m := range msgs {
@@ -96,10 +96,10 @@ func TestACacheNeverRecordsAgainstStaleState(t *testing.T) {
 	}
 	// Cached, a total of 3 would accept this; stored, it is 5, which refuses.
 	h, err := agg.Handle(ctx, "a", add{1, 5})
-	if !errors.Is(err, &cairn.Refusal{Code: "over_cap"}) || h.Entry.Seq != 3 || h.State.Total != 5 {
+	if !errors.Is(err, &cairn.Refusal{Code: "over_cap"}) || h.Entry.Seq != 3 {
 		t.Fatalf("decided against stale state: %+v, %v", h, err)
 	}
-	if h, err := agg.Handle(ctx, "a", add{0, 5}); err != nil || h.Entry.Seq != 4 || h.State.Total != 5 {
+	if h, err := agg.Handle(ctx, "a", add{0, 5}); err != nil || h.Entry.Seq != 4 || h.Result != 5 {
 		t.Fatalf("after catching up: %+v, %v", h, err)
 	}
 	checkStream(t, agg, "a", 4, 5)
@@ -117,7 +117,7 @@ func TestMessagesArrivingTogetherShareATransaction(t *testing.T) {
 		if errs[i] != nil {
 			t.Fatal(errs[i])
 		}
-		totals = append(totals, hs[i].State.Total)
+		totals = append(totals, hs[i].Result)
 	}
 	slices.Sort(totals)
 	for i, total := range totals {
@@ -331,22 +331,6 @@ func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
 	checkStream(t, agg, "b/c", 1, 1)
 }
 
-// A Clone that panics after the transaction committed tells its caller the
-// message was recorded, so that a retry without an idempotency key doesn't
-// record it twice.
-func TestAPanicAfterCommittingSaysTheMessageWasRecorded(t *testing.T) {
-	t.Parallel()
-	agg := newBasket(t, ledgertest.NewStore(t))
-	agg.Clone = func(basket) basket { panic("clone") }
-	_, err := agg.Handle(ctx, "a", put{"apple"})
-	if err == nil || !strings.Contains(err.Error(), "was recorded") {
-		t.Fatalf("want an error saying the message was recorded, got %v", err)
-	}
-	if entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0); err != nil || len(entries) != 1 {
-		t.Fatalf("entries %v, %v; want the one recorded", entries, err)
-	}
-}
-
 func TestAPanickingDeciderReachesItsCaller(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
@@ -380,7 +364,7 @@ func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
 	agg := counterOn(ledgertest.NewStore(t, ledger.StateCacheSize(1)))
 	for i := range 6 {
 		for _, id := range []string{"a", "b", "c"} {
-			if h, err := agg.Handle(ctx, id, add{1, 100}); err != nil || h.State.Total != i+1 {
+			if h, err := agg.Handle(ctx, id, add{1, 100}); err != nil || h.Result != i+1 {
 				t.Fatalf("%s: %+v, %v", id, h, err)
 			}
 		}
@@ -423,47 +407,6 @@ func newBasket(t *testing.T, store *ledger.Store) *ledger.Aggregate[basket, put,
 	return &ledger.Aggregate[basket, put, int, placed, struct{}]{
 		Store: store, Kind: "basket", Decider: basketDecider,
 		Codecs: &codec.Set[put, int, placed, struct{}]{Messages: msgs, Results: results, Events: events, Effects: effects},
-	}
-}
-
-// The state Handle returns is a copy, so a caller that changes it changes
-// nothing the next decision sees.
-func TestACallerCannotChangeTheCachedState(t *testing.T) {
-	t.Parallel()
-	for _, how := range []string{"Clone", "StateVersion"} {
-		agg := newBasket(t, ledgertest.NewStore(t))
-		if how == "Clone" {
-			agg.Clone = func(s basket) basket { return basket{Items: maps.Clone(s.Items)} }
-		} else {
-			agg.StateVersion = "basket/1"
-		}
-		h, err := agg.Handle(ctx, "a", put{"apple"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		h.State.Items["apple"] = 100
-		if h, err = agg.Handle(ctx, "a", put{"apple"}); err != nil || h.Result != 2 {
-			t.Fatalf("%s: decided %d, %v; the caller's change reached the cache", how, h.Result, err)
-		}
-	}
-}
-
-// With no faithful way to copy its state, an aggregate's streams are not
-// cached: each message costs the two round trips it would with no cache.
-func TestAStateThatCannotBeCopiedIsNotCached(t *testing.T) {
-	t.Parallel()
-	pool, trips := tracedPool(t, 1)
-	agg := newBasket(t, ledger.New(pool, ledger.RequireActor(false)))
-	for i := range 4 {
-		trips.reset()
-		h, err := agg.Handle(ctx, "a", put{"apple"})
-		if err != nil || h.Result != i+1 {
-			t.Fatalf("decided %d, %v", h.Result, err)
-		}
-		if n := trips.trips.Load(); i > 1 && n != 2 {
-			t.Fatalf("took %d round trips, want the uncached 2", n)
-		}
-		h.State.Items["apple"] = 100
 	}
 }
 

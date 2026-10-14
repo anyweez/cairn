@@ -54,7 +54,7 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Entry.Seq != 3 || h.State.N != 3 {
-		t.Fatalf("recorded at seq %d with a total of %d; want 3 and 3, from the stored stream", h.Entry.Seq, h.State.N)
+	if h.Entry.Seq != 3 || h.Result != 3 {
+		t.Fatalf("recorded at seq %d with a total of %d; want 3 and 3, from the stored stream", h.Entry.Seq, h.Result)
 	}
 }

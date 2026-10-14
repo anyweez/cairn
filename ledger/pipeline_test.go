@@ -184,7 +184,7 @@ func TestASnapshotAheadOfItsStreamIsIgnored(t *testing.T) {
 		t.Fatalf("loaded %+v, %v; want a total of 3", loaded, err)
 	}
 	h, err := agg.Handle(ctx, "a", add{1, 100})
-	if err != nil || h.State.Total != 4 {
+	if err != nil || h.Result != 4 {
 		t.Fatalf("handled %+v, %v; want a total of 4", h, err)
 	}
 }
