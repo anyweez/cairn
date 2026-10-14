@@ -123,10 +123,31 @@ type querier interface {
 }
 
 // Tx is a transaction that may write to the ledger: the streams Transact
-// locked, and nothing else.
+// locked, and nothing else. It runs a caller's own statements too, each in a
+// round trip of its own; Transact owns its begin, commit and rollback.
 type Tx struct {
-	pgx.Tx
+	tx    pgx.Tx
 	locks *locks
+}
+
+// Exec runs a statement.
+func (tx *Tx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return tx.tx.Exec(ctx, sql, args...)
+}
+
+// Query runs a query.
+func (tx *Tx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return tx.tx.Query(ctx, sql, args...)
+}
+
+// QueryRow runs a query that returns one row.
+func (tx *Tx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return tx.tx.QueryRow(ctx, sql, args...)
+}
+
+// SendBatch runs several statements in one round trip.
+func (tx *Tx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return tx.tx.SendBatch(ctx, b)
 }
 
 // locks is what a transaction's Lock found: the seq of each stream it locked,
@@ -163,7 +184,7 @@ var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
 // application table. Each costs a round trip; see docs/CONVENTIONS.md.
 func (s *Store) Transact(ctx context.Context, streams []Stream, fn func(tx *Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(ptx pgx.Tx) error {
-		tx := &Tx{Tx: ptx}
+		tx := &Tx{tx: ptx}
 		if len(streams) > 0 {
 			var b Batch
 			l, err := queueLock(&b, streams)

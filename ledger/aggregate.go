@@ -429,7 +429,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) LoadLocked(ctx context.Context, tx *Tx, id 
 	}
 	var b Batch
 	load := a.queueLoad(&b, stream)
-	if err := b.send(ctx, tx.Tx); err != nil {
+	if err := b.send(ctx, tx.tx); err != nil {
 		return Loaded[S]{}, err
 	}
 	return a.finishLoad(ctx, tx, load, seq)
@@ -526,7 +526,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 // Apply decides msg against a locked, loaded stream and records the result in
 // tx, updating at to the state after it. A refusal is not an error here: it is
 // recorded like any other decision and reported in Handled.Refusal, so a
-// caller composing several streams decides for itself whether to commit.
+// caller composing several streams decides for itself whether to commit. The
+// usual check of err therefore passes over a refusal; read Handled.Refusal, or
+// the transaction commits past it. Handle, by contrast, returns the refusal as
+// its error.
 //
 // It costs one round trip, and one more to look up an idempotency key.
 func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Loaded[S], msg M, opts ...Option) (Handled[R], error) {
@@ -539,7 +542,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	if o.key != "" {
 		var b Batch
 		dup := queueDuplicate(&b, at.Stream, o.key)
-		if err := b.send(ctx, tx.Tx); err != nil {
+		if err := b.send(ctx, tx.tx); err != nil {
 			return Handled[R]{}, err
 		}
 		if dup.found {
@@ -576,7 +579,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		}
 		return Handled[R]{}, err
 	}
-	if err := b.send(ctx, tx.Tx); err != nil {
+	if err := b.send(ctx, tx.tx); err != nil {
 		return Handled[R]{}, viewError(err, next)
 	}
 	*at = next

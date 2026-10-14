@@ -135,7 +135,7 @@ WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, 
 					}
 				}
 			}
-			if err := viewError(b.send(ctx, tx.Tx), next); err != nil {
+			if err := viewError(b.send(ctx, tx.tx), next); err != nil {
 				return err
 			}
 			at = next

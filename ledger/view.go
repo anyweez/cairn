@@ -126,7 +126,7 @@ WHERE stream = $1 AND events <> '[]'::jsonb ORDER BY seq DESC LIMIT 1`, name)
 			if err := queueView(&b, v, at, cause[0]); err != nil {
 				return err
 			}
-			return viewError(b.send(ctx, tx.Tx), at)
+			return viewError(b.send(ctx, tx.tx), at)
 		})
 		if err != nil {
 			return i, fmt.Errorf("cairn: rebuilding view %s at %s: %w", v.Name, name, err)
