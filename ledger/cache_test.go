@@ -316,7 +316,7 @@ func TestOneTransactionsEntriesShareTheirRecordingTime(t *testing.T) {
 }
 
 // A kind with a slash in it could name another kind's stream ("a/b" + "c" is
-// "a" + "b/c"). It is refused even when that stream is already cached.
+// "a" + "b/c"). Validate refuses it before anything is cached or read.
 func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
@@ -325,8 +325,8 @@ func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
 	}
 	alias := *agg
 	alias.Kind = "counter/b"
-	if _, err := alias.Handle(ctx, "c", add{1, 10}); err == nil || !strings.Contains(err.Error(), "invalid stream") {
-		t.Fatalf("want an invalid stream error, got %v", err)
+	if _, err := alias.Handle(ctx, "c", add{1, 10}); err == nil || !strings.Contains(err.Error(), "contain no slash") {
+		t.Fatalf("want the kind refused, got %v", err)
 	}
 	checkStream(t, agg, "b/c", 1, 1)
 }

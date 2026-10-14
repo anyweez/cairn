@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,7 +16,8 @@ import (
 )
 
 // Aggregate binds a Decider to the ledger: one kind of stream, its codecs,
-// and how its state is snapshotted.
+// and how its state is snapshotted. Every method checks the aggregate with
+// Validate before it does anything.
 type Aggregate[S, M, R, Ev, Ef any] struct {
 	Store   *Store
 	Kind    string
@@ -53,6 +55,56 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 
 // Stream names one of this aggregate's streams.
 func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Kind: a.Kind, ID: id} }
+
+// Validate reports the first thing wrong with how the aggregate is set up: no
+// store, a kind that is empty or contains a slash, a Decider missing a
+// function, a codec missing from Codecs, or a view or entry view whose name is
+// empty or repeats another's. Every other method runs it first, so a mistake
+// is an error rather than a nil-pointer panic on the first message; call it
+// at startup to fail before then.
+func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
+	switch {
+	case a.Store == nil:
+		return fail("Store is nil")
+	case a.Kind == "" || strings.Contains(a.Kind, "/"):
+		return fail("Kind must be non-empty and contain no slash")
+	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
+		return fail("Decider needs Initial, Decide and Evolve")
+	case a.Codecs == nil:
+		return fail("Codecs is nil")
+	case a.Codecs.Messages == nil:
+		return fail("Codecs.Messages is nil")
+	case a.Codecs.Results == nil:
+		return fail("Codecs.Results is nil")
+	case a.Codecs.Events == nil:
+		return fail("Codecs.Events is nil")
+	case a.Codecs.Effects == nil:
+		return fail("Codecs.Effects is nil")
+	}
+	// Batch attributes a failing statement to the view that queued it by name,
+	// so a view needs one of its own.
+	names := map[string]bool{}
+	for _, v := range a.Views {
+		if v.Name == "" {
+			return fail("a view has no Name")
+		}
+		if names[v.Name] {
+			return fail("two views are named " + v.Name)
+		}
+		names[v.Name] = true
+	}
+	for _, v := range a.EntryViews {
+		if v.Name == "" {
+			return fail("an entry view has no Name")
+		}
+		if names[v.Name] {
+			return fail("two views are named " + v.Name)
+		}
+		names[v.Name] = true
+	}
+	return nil
+}
 
 // Loaded is a stream's state as of a sequence number.
 type Loaded[S any] struct {
@@ -108,6 +160,9 @@ func collect(opts []Option) options {
 // and commits, or for a duplicate, rolls back. Messages that arrive together
 // for one stream are recorded together. See docs/PERFORMANCE.md.
 func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg M, opts ...Option) (Handled[R], error) {
+	if err := a.Validate(); err != nil {
+		return Handled[R]{}, err
+	}
 	o := collect(opts)
 	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
@@ -330,6 +385,9 @@ func commitStep(r pgx.BatchResults) error {
 
 // Load reads a stream's current state without locking it, in one round trip.
 func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loaded[S], error) {
+	if err := a.Validate(); err != nil {
+		return Loaded[S]{}, err
+	}
 	stream := a.Stream(id)
 	var (
 		b   Batch
@@ -361,6 +419,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 
 // LoadLocked reads the state of a stream the transaction has locked.
 func (a *Aggregate[S, M, R, Ev, Ef]) LoadLocked(ctx context.Context, tx *Tx, id string) (Loaded[S], error) {
+	if err := a.Validate(); err != nil {
+		return Loaded[S]{}, err
+	}
 	stream := a.Stream(id)
 	seq, err := tx.locks.seq(stream)
 	if err != nil {
@@ -469,6 +530,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 //
 // It costs one round trip, and one more to look up an idempotency key.
 func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Loaded[S], msg M, opts ...Option) (Handled[R], error) {
+	if err := a.Validate(); err != nil {
+		return Handled[R]{}, err
+	}
 	o := collect(opts)
 	// A retry gets its first answer even when it lost the request's metadata:
 	// the message was attributed when it was recorded.
@@ -540,9 +604,6 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 		return nil, at, nil, nil, err
 	}
 	if !decision.Refused() {
-		if a.Codecs.Results == nil {
-			return nil, at, nil, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
-		}
 		result, err := a.Codecs.Results.Encode(decision.Result)
 		if err != nil {
 			return nil, at, nil, nil, err
@@ -602,10 +663,6 @@ func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry) (Handled[R], error) {
 
 // decodeResult decodes a stored result through Results.
 func (a *Aggregate[S, M, R, Ev, Ef]) decodeResult(env codec.Envelope) (R, error) {
-	if a.Codecs.Results == nil {
-		var zero R
-		return zero, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
-	}
 	return a.Codecs.Results.Decode(env)
 }
 

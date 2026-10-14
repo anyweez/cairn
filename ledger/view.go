@@ -85,6 +85,9 @@ func viewError[S any](err error, at Loaded[S]) error {
 // rows change shape. Each stream is locked and written in its own
 // transaction, so Rebuild can run while the aggregate is taking messages.
 func (a *Aggregate[S, M, R, Ev, Ef]) Rebuild(ctx context.Context, v View[S]) (int, error) {
+	if err := a.Validate(); err != nil {
+		return 0, err
+	}
 	// A stream with no events has nothing in any view.
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries

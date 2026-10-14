@@ -82,6 +82,9 @@ var rebuildWindow = 1000
 // safe to run again. A failed rebuild leaves the windows before the failure
 // written; running it again redoes them.
 func (a *Aggregate[S, M, R, Ev, Ef]) RebuildEntries(ctx context.Context, v EntryView[S, Ev]) (int, error) {
+	if err := a.Validate(); err != nil {
+		return 0, err
+	}
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries
 WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)

@@ -40,8 +40,8 @@ func (d Divergence) String() string {
 // only when the stored result carries it, and a map in R only on the keys the
 // stored result has.
 func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]Divergence, error) {
-	if a.Codecs.Results == nil {
-		return nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+	if err := a.Validate(); err != nil {
+		return nil, err
 	}
 	stream := a.Stream(id)
 	entries, err := readStream(ctx, a.Store.pool, stream, 0)
@@ -117,6 +117,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 // runs may or may not be checked; run it against a quiet database, or treat a
 // clean result as covering the history up to its start.
 func (a *Aggregate[S, M, R, Ev, Ef]) VerifyAll(ctx context.Context) ([]Divergence, error) {
+	if err := a.Validate(); err != nil {
+		return nil, err
+	}
 	streams, err := a.Store.Streams(ctx, a.Kind)
 	if err != nil {
 		return nil, err
