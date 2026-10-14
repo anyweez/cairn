@@ -131,6 +131,8 @@ paths:
   .github/workflows/: [build]
   scripts/: [build]
   .cz.toml: [build]
+  .claude/: [build]
+  docs/RELEASING.md: [build]
   .gitignore: [build]
   go.mod: [build]
   go.sum: [build]
@@ -150,5 +152,7 @@ docs:
       read_when: the change touches locking, the state cache, the pool, or what a call costs
     - path: docs/BENCHMARKS.md
       read_when: the change claims a throughput effect, or needs a measurement before and after
+    - path: docs/RELEASING.md
+      read_when: the task cuts a release, or changes versioning, the changelog or the release workflow
     - path: docs/ROADMAP.md
       read_when: the task names a roadmap item or an open question (redaction, refusals, effect ordering)

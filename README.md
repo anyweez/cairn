@@ -324,4 +324,8 @@ current:
 go -C cmd/cairn-manifest test ./...
 ```
 
+Releases are `vX.Y.Z` tags, with the version and notes worked out from the
+commit messages; [docs/RELEASING.md](docs/RELEASING.md) has the procedure.
+Pin a version with `go get github.com/anyweez/cairn@vX.Y.Z`.
+
 See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next and the open questions.
