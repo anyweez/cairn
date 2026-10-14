@@ -60,6 +60,12 @@ Most subsystems are a decision core inside a CRUD shell. An issue's
 lifecycle belongs in cairn, and its comment text does not. Draw the line
 inside the subsystem, not around it.
 
+**Personal data.** Messages, events, effects, results and metadata must
+carry opaque identifiers, never personal data — cairn stores whatever it is
+given and can never delete it. The decision *about* the data belongs in
+cairn; the data itself stays in your own mutable tables, where ordinary
+deletion works. See [docs/REDACTION.md](docs/REDACTION.md).
+
 ## When not to use cairn
 
 - **CRUD with no rules:** profile fields, content bodies, settings.
@@ -232,10 +238,6 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
   refusals free of events and effects.
-- **Entries hold decisions, not content.** Messages, events, effects, results
-  and metadata carry opaque identifiers, never personal data. The log is
-  never rewritten to forget: erasure happens in your own tables and the
-  history stays verifiable. See [docs/REDACTION.md](docs/REDACTION.md).
 - **No gaps for readers of the global log.** `ReadAll` and projections hold
   back entries from transactions that are still in flight until every older
   transaction has finished, so a reader never skips past an entry that
