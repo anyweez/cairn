@@ -127,6 +127,18 @@ on average. Allow headroom for bursts.
   lane instead, and the stream uses one connection there. Bound how long
   callers wait, with context deadlines or `lock_timeout`, and keep hot
   streams' traffic on few instances.
+- **A transaction-mode pooler works.** cairn keeps no session state: its
+  locks last only for the transaction, and it sets nothing on the session
+  and listens for nothing. So it runs behind PgBouncer, or Supabase's pooler,
+  in transaction mode. pgx's default exec mode prepares named statements,
+  which such a pooler can send to a server connection that never prepared
+  them unless it tracks prepared statements itself (PgBouncer's
+  `max_prepared_statements`). Otherwise set
+  `default_query_exec_mode=cache_describe` in the connection string, or
+  `simple_protocol`. Under `cache_describe` the first send of each statement
+  on a connection costs one extra round trip, to describe it; later sends
+  don't. CI runs the ledger's tests through PgBouncer in transaction mode
+  (`scripts/test-pgbouncer.sh`).
 - **Read from replicas only where staleness is fine.** Advisory locks exist
   only on the primary, so every `Handle` goes there. `Load` against a replica
   works but can return stale state.

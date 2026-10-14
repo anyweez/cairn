@@ -341,6 +341,14 @@ current:
 go -C cmd/cairn-manifest test ./...
 ```
 
+To run the ledger tests the way a pooled deployment connects, through PgBouncer
+in transaction mode:
+
+```sh
+export CAIRN_TEST_DATABASE_URL=$(scripts/test-pgbouncer.sh)
+go test ./ledger/... ./examples/...
+```
+
 Releases are `vX.Y.Z` tags, with the version and notes worked out from the
 commit messages; [docs/RELEASING.md](docs/RELEASING.md) has the procedure.
 Pin a version with `go get github.com/anyweez/cairn@vX.Y.Z`.
