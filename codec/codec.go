@@ -106,26 +106,41 @@ func (c *Codec[T]) EncodeAll(vs []T) ([]Envelope, error) {
 	return out, nil
 }
 
-// Decode upcasts an envelope to its type's current version and unmarshals it.
-func (c *Codec[T]) Decode(env Envelope) (T, error) {
-	var zero T
+// Latest runs an envelope's data through its type's upcasters and returns the
+// current version's JSON, without decoding it.
+func (c *Codec[T]) Latest(env Envelope) (json.RawMessage, error) {
+	_, data, err := c.upcast(env)
+	return data, err
+}
+
+func (c *Codec[T]) upcast(env Envelope) (*entry, json.RawMessage, error) {
 	e, ok := c.byName[env.Type]
 	if !ok {
-		return zero, fmt.Errorf("codec: unknown type %q", env.Type)
+		return nil, nil, fmt.Errorf("codec: unknown type %q", env.Type)
 	}
 	if env.Version > e.version {
-		return zero, fmt.Errorf("codec: %s version %d is newer than this build's %d", env.Type, env.Version, e.version)
+		return nil, nil, fmt.Errorf("codec: %s version %d is newer than this build's %d", env.Type, env.Version, e.version)
 	}
 	data := env.Data
 	for v := env.Version; v < e.version; v++ {
 		up, ok := e.upcasters[v]
 		if !ok {
-			return zero, fmt.Errorf("codec: no upcaster for %s from version %d", env.Type, v)
+			return nil, nil, fmt.Errorf("codec: no upcaster for %s from version %d", env.Type, v)
 		}
 		var err error
 		if data, err = up(data); err != nil {
-			return zero, fmt.Errorf("codec: upcasting %s from version %d: %w", env.Type, v, err)
+			return nil, nil, fmt.Errorf("codec: upcasting %s from version %d: %w", env.Type, v, err)
 		}
+	}
+	return e, data, nil
+}
+
+// Decode upcasts an envelope to its type's current version and unmarshals it.
+func (c *Codec[T]) Decode(env Envelope) (T, error) {
+	var zero T
+	e, data, err := c.upcast(env)
+	if err != nil {
+		return zero, err
 	}
 	ptr := reflect.New(e.typ)
 	dec := json.NewDecoder(bytes.NewReader(data))

@@ -54,8 +54,5 @@
   message to a stream that doesn't exist also creates that stream. But a
   client spamming refused messages grows the stream. Rate-limit in the shell,
   or store refusals in a separate table?
-- **Result is opaque JSON.** `Verify` compares results structurally. If R
-  gains a field, every stored result diverges. Should R be optional, or
-  versioned like events?
 - **Effect ordering.** The outbox guarantees at-least-once delivery but not
   ordering. Is per-stream ordering worth the cost of a per-stream cursor?

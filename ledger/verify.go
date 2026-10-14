@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 )
@@ -31,7 +32,17 @@ func (d Divergence) String() string {
 // each message is judged against the state it was actually decided in. A
 // divergence is not necessarily a bug — an intended behaviour change diverges
 // by design — but every one should be explained by a change someone meant.
+//
+// A stored result is upcast to the current version and compared on the fields
+// it carries. A field added since it was recorded is checked when its upcaster
+// fills it in, and skipped when the upcaster leaves it out, since the entry
+// can't say what it would have been. So a field tagged omitempty is checked
+// only when the stored result carries it, and a map in R only on the keys the
+// stored result has.
 func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]Divergence, error) {
+	if a.Results == nil {
+		return nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+	}
 	stream := a.Stream(id)
 	entries, err := readStream(ctx, a.Store.pool, stream, 0)
 	if err != nil {
@@ -72,12 +83,17 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 		// Once the verdict differs, so must everything that follows from it;
 		// the refusal is the one divergence worth reading.
 		if e.Refusal == nil && d.Refusal == nil {
-			now, err := json.Marshal(d.Result)
+			now, err := a.Results.Encode(d.Result)
 			if err != nil {
 				return out, err
 			}
-			if !sameJSON(e.Result, now) {
-				diverge("result", string(e.Result), string(now))
+			switch stored, err := a.storedResult(e); {
+			case err != nil:
+				diverge("decode", "result", err)
+			case e.Result.Type != "" && e.Result.Type != now.Type:
+				diverge("result", e.Result.Type, now.Type)
+			case !coversJSON(stored, now.Data):
+				diverge("result", string(stored), string(now.Data))
 			}
 			if !sameSlice(storedEvents, d.Events) {
 				diverge("events", storedEvents, d.Events)
@@ -120,10 +136,57 @@ func sameSlice[T any](a, b []T) bool {
 	return (len(a) == 0 && len(b) == 0) || reflect.DeepEqual(a, b)
 }
 
-func sameJSON(a, b []byte) bool {
-	var x, y any
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
-		return bytes.Equal(a, b)
+// storedResult is an accepted entry's result, upcast to the current version.
+// One recorded before results were versioned is compared as it was stored.
+func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, error) {
+	if e.Result == nil {
+		return nil, errors.New("accepted entry has no result")
 	}
-	return reflect.DeepEqual(x, y)
+	if e.Result.Type == "" {
+		return e.Result.Data, nil
+	}
+	return a.Results.Latest(*e.Result)
+}
+
+// coversJSON reports whether now agrees with every field stored carries.
+func coversJSON(stored, now []byte) bool {
+	var x, y any
+	if json.Unmarshal(stored, &x) != nil || json.Unmarshal(now, &y) != nil {
+		return bytes.Equal(stored, now)
+	}
+	return covers(x, y)
+}
+
+// covers compares decoded JSON. A key missing from a stored object is a field
+// the entry predates, which its upcasters could not fill in, so it is not
+// compared; every key stored carries must be in now with a value it covers.
+// Arrays must have the same length and cover element by element, and anything
+// else must be equal.
+func covers(stored, now any) bool {
+	switch s := stored.(type) {
+	case map[string]any:
+		n, ok := now.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k, v := range s {
+			if nv, ok := n[k]; !ok || !covers(v, nv) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		n, ok := now.([]any)
+		if !ok || len(n) != len(s) {
+			return false
+		}
+		for i := range s {
+			if !covers(s[i], n[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(stored, now)
+	}
 }

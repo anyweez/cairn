@@ -84,13 +84,16 @@ func (s Stream) String() string { return s.Kind + "/" + s.ID }
 
 // Entry is one decided message as stored.
 type Entry struct {
-	Position       int64
-	TxID           uint64
-	Stream         string
-	Kind           string
-	Seq            int64
-	Message        codec.Envelope
-	Result         json.RawMessage
+	Position int64
+	TxID     uint64
+	Stream   string
+	Kind     string
+	Seq      int64
+	Message  codec.Envelope
+	// Result is nil when the message was refused. A result recorded before
+	// results were versioned reads back as an envelope with an empty Type and
+	// Version 0, holding the bare JSON as its Data.
+	Result         *codec.Envelope
 	Refusal        *cairn.Refusal
 	Events         []codec.Envelope
 	Effects        []codec.Envelope
@@ -286,6 +289,12 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if err != nil {
 		return err
 	}
+	var result []byte
+	if e.Result != nil {
+		if result, err = json.Marshal(e.Result); err != nil {
+			return err
+		}
+	}
 	var refusal []byte
 	if e.Refusal != nil {
 		if refusal, err = json.Marshal(e.Refusal); err != nil {
@@ -340,7 +349,7 @@ INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
     nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15, $16)
 RETURNING position, txid::text`,
-		e.Stream, e.Kind, e.Seq, message, nullJSON(e.Result), refusal, events, effects, key,
+		e.Stream, e.Kind, e.Seq, message, result, refusal, events, effects, key,
 		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra, e.RecordedAt)
 
 	// Every effect in one statement, numbered from 0 in order.
@@ -366,19 +375,22 @@ func nonNil(envs []codec.Envelope) []codec.Envelope {
 	return envs
 }
 
-func nullJSON(raw json.RawMessage) any {
-	if len(raw) == 0 {
-		return nil
-	}
-	return []byte(raw)
-}
-
 // txid is read as text under another name: left named txid, it would shadow
 // the column in ORDER BY txid, which would then sort the log as text ("1000"
 // before "999").
 const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, message, result, refusal, events, effects,
 coalesce(idempotency_key, ''), recorded_at,
 coalesce(actor, ''), coalesce(via, ''), coalesce(correlation_id, ''), coalesce(causation_id, ''), occurred_at, extra`
+
+// scanResult reads a stored result: an envelope, or the bare JSON of a result
+// recorded before results were versioned.
+func scanResult(raw []byte) *codec.Envelope {
+	var env codec.Envelope
+	if json.Unmarshal(raw, &env) == nil && env.Type != "" && env.Version >= 1 && env.Data != nil {
+		return &env
+	}
+	return &codec.Envelope{Data: raw}
+}
 
 func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	defer rows.Close()
@@ -424,7 +436,9 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 				return nil, fmt.Errorf("cairn: %s#%d refusal: %w", e.Stream, e.Seq, err)
 			}
 		}
-		e.Result = result
+		if result != nil {
+			e.Result = scanResult(result)
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
