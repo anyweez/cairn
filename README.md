@@ -67,8 +67,11 @@ inside the subsystem, not around it.
 - **Caches and derived data:** a projection's job, not a stream's.
 - **Mirrors of an external system**, where that system is the source of
   truth.
-- **Sessions, tokens and other data that must be deletable on demand.**
-  Entries are append-only, and there is no redaction path yet.
+- **The value of a session, token or other secret, or any personal data.**
+  Entries are append-only and are never redacted, so content stays in your
+  own mutable tables. A decision *about* it — issue, expire, revoke —
+  belongs in cairn, named by an opaque id. See
+  [docs/REDACTION.md](docs/REDACTION.md).
 - **High-frequency simulation:** game ticks, movement, physics, AI.
 
 For simulation, the rule is that **the simulation proposes and the ledger
@@ -229,6 +232,10 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
   refusals free of events and effects.
+- **Entries hold decisions, not content.** Messages, events, effects, results
+  and metadata carry opaque identifiers, never personal data. The log is
+  never rewritten to forget: erasure happens in your own tables and the
+  history stays verifiable. See [docs/REDACTION.md](docs/REDACTION.md).
 - **No gaps for readers of the global log.** `ReadAll` and projections hold
   back entries from transactions that are still in flight until every older
   transaction has finished, so a reader never skips past an entry that
