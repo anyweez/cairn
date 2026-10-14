@@ -162,3 +162,15 @@ func (c *Codec[T]) DecodeAll(envs []Envelope) ([]T, error) {
 	}
 	return out, nil
 }
+
+// Set is the four codecs a Decider's values are stored through: its messages,
+// results, events and effects. The ledger stores every entry through one, and
+// the checker round-trips every value through one (D6).
+type Set[M, R, Ev, Ef any] struct {
+	Messages *Codec[M]
+	// Results encodes what an accepted message returns. A single struct R
+	// registers as Register[R, R].
+	Results *Codec[R]
+	Events  *Codec[Ev]
+	Effects *Codec[Ef]
+}

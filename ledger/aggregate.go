@@ -21,14 +21,10 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	Kind    string
 	Decider cairn.Decider[S, M, R, Ev, Ef]
 
-	Messages *codec.Codec[M]
-	Events   *codec.Codec[Ev]
-	Effects  *codec.Codec[Ef]
-	// Results encodes what an accepted message returns. A single struct R
-	// registers as codec.Register[R, R]. A retry decodes its stored result
-	// through Results' upcasters, and Verify compares only the fields the
-	// upcast stored result carries (see Verify).
-	Results *codec.Codec[R]
+	// Codecs are how messages, results, events and effects are stored. A
+	// retry decodes its stored result through Results' upcasters, and Verify
+	// compares only the fields the upcast stored result carries (see Verify).
+	Codecs *codec.Set[M, R, Ev, Ef]
 
 	// StateVersion names the shape of S as stored in snapshots. Change it
 	// whenever S changes shape; snapshots of any other version are ignored and
@@ -465,7 +461,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 		if e.Seq > seq {
 			break
 		}
-		events, err := a.Events.DecodeAll(e.Events)
+		events, err := a.Codecs.Events.DecodeAll(e.Events)
 		if err != nil {
 			return Loaded[S]{}, fmt.Errorf("cairn: %s#%d: %w", p.stream, e.Seq, err)
 		}
@@ -542,20 +538,20 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	}
 
 	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
-	if entry.Message, err = a.Messages.Encode(msg); err != nil {
+	if entry.Message, err = a.Codecs.Messages.Encode(msg); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if entry.Events, err = a.Events.EncodeAll(decision.Events); err != nil {
+	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if entry.Effects, err = a.Effects.EncodeAll(decision.Effects); err != nil {
+	if entry.Effects, err = a.Codecs.Effects.EncodeAll(decision.Effects); err != nil {
 		return nil, at, nil, nil, err
 	}
 	if !decision.Refused() {
-		if a.Results == nil {
+		if a.Codecs.Results == nil {
 			return nil, at, nil, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
 		}
-		result, err := a.Results.Encode(decision.Result)
+		result, err := a.Codecs.Results.Encode(decision.Result)
 		if err != nil {
 			return nil, at, nil, nil, err
 		}
@@ -614,11 +610,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry, state S) (Handled[S, R
 
 // decodeResult decodes a stored result through Results.
 func (a *Aggregate[S, M, R, Ev, Ef]) decodeResult(env codec.Envelope) (R, error) {
-	if a.Results == nil {
+	if a.Codecs.Results == nil {
 		var zero R
 		return zero, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
 	}
-	return a.Results.Decode(env)
+	return a.Codecs.Results.Decode(env)
 }
 
 // queueSnapshot queues a snapshot of at when one is due.

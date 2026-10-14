@@ -424,8 +424,8 @@ func newBasket(t *testing.T, store *ledger.Store) *ledger.Aggregate[basket, put,
 	results := codec.New[int]()
 	codec.Register[int](results, "count", 1)
 	return &ledger.Aggregate[basket, put, int, placed, struct{}]{
-		Store: store, Kind: "basket", Decider: basketDecider, Messages: msgs, Events: events, Effects: effects,
-		Results: results,
+		Store: store, Kind: "basket", Decider: basketDecider,
+		Codecs: &codec.Set[put, int, placed, struct{}]{Messages: msgs, Results: results, Events: events, Effects: effects},
 	}
 }
 

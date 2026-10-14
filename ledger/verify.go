@@ -40,7 +40,7 @@ func (d Divergence) String() string {
 // only when the stored result carries it, and a map in R only on the keys the
 // stored result has.
 func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]Divergence, error) {
-	if a.Results == nil {
+	if a.Codecs.Results == nil {
 		return nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
 	}
 	stream := a.Stream(id)
@@ -57,12 +57,12 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 				Stored: fmt.Sprintf("%+v", stored), Now: fmt.Sprintf("%+v", now)})
 		}
 
-		storedEvents, err := a.Events.DecodeAll(e.Events)
+		storedEvents, err := a.Codecs.Events.DecodeAll(e.Events)
 		if err != nil {
 			return out, fmt.Errorf("cairn: %s#%d: %w", e.Stream, e.Seq, err)
 		}
 
-		msg, err := a.Messages.Decode(e.Message)
+		msg, err := a.Codecs.Messages.Decode(e.Message)
 		if err != nil {
 			diverge("decode", e.Message.Type, err)
 			state = a.Decider.Fold(state, storedEvents)
@@ -83,7 +83,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 		// Once the verdict differs, so must everything that follows from it;
 		// the refusal is the one divergence worth reading.
 		if e.Refusal == nil && d.Refusal == nil {
-			now, err := a.Results.Encode(d.Result)
+			now, err := a.Codecs.Results.Encode(d.Result)
 			if err != nil {
 				return out, err
 			}
@@ -98,7 +98,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 			if !sameSlice(storedEvents, d.Events) {
 				diverge("events", storedEvents, d.Events)
 			}
-			storedEffects, err := a.Effects.DecodeAll(e.Effects)
+			storedEffects, err := a.Codecs.Effects.DecodeAll(e.Effects)
 			if err != nil {
 				return out, fmt.Errorf("cairn: %s#%d: %w", e.Stream, e.Seq, err)
 			}
@@ -141,7 +141,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, err
 	if e.Result == nil {
 		return nil, errors.New("accepted entry has no result")
 	}
-	return a.Results.Latest(*e.Result)
+	return a.Codecs.Results.Latest(*e.Result)
 }
 
 // coversJSON reports whether now agrees with every field stored carries.

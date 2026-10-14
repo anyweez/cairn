@@ -183,7 +183,7 @@ if err := store.Migrate(ctx); err != nil { ... }
 
 accounts := &ledger.Aggregate[Account, Msg, int, Event, Effect]{
 	Store: store, Kind: "account", Decider: Bank,
-	Messages: msgs, Results: results, Events: events, Effects: effects, // codecs
+	Codecs: codecs, // a *codec.Set
 }
 
 // Usually set once per request, by middleware. Every entry needs an actor.

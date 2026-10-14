@@ -32,7 +32,8 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 	results := codec.New[int]()
 	codec.Register[int](results, "n", 1)
 	agg := &Aggregate[tally, bump, int, bumped, struct{}]{
-		Store: store, Kind: "tally", Messages: msgs, Events: events, Effects: effects, Results: results,
+		Store: store, Kind: "tally",
+		Codecs: &codec.Set[bump, int, bumped, struct{}]{Messages: msgs, Results: results, Events: events, Effects: effects},
 		Decider: cairn.Decider[tally, bump, int, bumped, struct{}]{
 			Initial: func() tally { return tally{} },
 			Decide: func(s tally, _ bump) cairn.Decision[int, bumped, struct{}] {

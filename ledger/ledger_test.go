@@ -72,7 +72,7 @@ func counterOn(store *ledger.Store) *ledger.Aggregate[counter, msg, int, event, 
 	codec.Register[int](results, "total", 1)
 	return &ledger.Aggregate[counter, msg, int, event, effect]{
 		Store: store, Kind: "counter", Decider: counterDecider,
-		Messages: msgs, Events: events, Effects: effects, Results: results,
+		Codecs: &codec.Set[msg, int, event, effect]{Messages: msgs, Results: results, Events: events, Effects: effects},
 	}
 }
 
@@ -647,7 +647,7 @@ func TestOutboxRetriesUntilDelivered(t *testing.T) {
 	var delivered []string
 	failOnce := true
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, Batch: 1,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, Batch: 1,
 		Backoff: func(int) time.Duration { return 0 },
 		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
 			if failOnce {
@@ -683,14 +683,14 @@ func TestAnExpiredClaimCannotRecordAnOutcome(t *testing.T) {
 	var calls []string
 	var slow *ledger.Dispatcher[effect]
 	fast := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
 		Handle: func(_ context.Context, d ledger.Delivery[effect]) error {
 			calls = append(calls, fmt.Sprintf("fast@%d", d.Attempt))
 			return nil
 		},
 	}
 	slow = &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, Lease: 50 * time.Millisecond,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, Lease: 50 * time.Millisecond,
 		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
 			calls = append(calls, fmt.Sprintf("slow@%d", d.Attempt))
 			<-ctx.Done() // outlives its lease
@@ -730,7 +730,7 @@ func TestAnEffectClaimedTooOftenWithoutAnOutcomeIsFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, MaxAttempts: 2,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, MaxAttempts: 2,
 		Handle: func(context.Context, ledger.Delivery[effect]) error {
 			t.Error("an effect past MaxAttempts must not be delivered again")
 			return nil
@@ -799,8 +799,8 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 		codec.Register[totalV2](results, "total", 2)
 		results.Upcast("total", 1, upcast)
 		next := &ledger.Aggregate[counter, msg, totalV2, event, effect]{
-			Store: agg.Store, Kind: "counter", Messages: agg.Messages, Events: agg.Events, Effects: agg.Effects,
-			Results: results,
+			Store: agg.Store, Kind: "counter",
+			Codecs: &codec.Set[msg, totalV2, event, effect]{Messages: agg.Codecs.Messages, Results: results, Events: agg.Codecs.Events, Effects: agg.Codecs.Effects},
 			Decider: cairn.Decider[counter, msg, totalV2, event, effect]{
 				Initial: counterDecider.Initial,
 				Evolve:  counterDecider.Evolve,

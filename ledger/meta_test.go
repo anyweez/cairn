@@ -181,7 +181,7 @@ func TestAMessageRecordedByAnEffectHandlerIsCausedByTheDelivery(t *testing.T) {
 
 	var delivered ledger.Delivery[effect]
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
 		Handle: func(ctx context.Context, dl ledger.Delivery[effect]) error {
 			delivered = dl
 			_, err := agg.Handle(ctx, "audit", add{1, 1000})
@@ -215,7 +215,7 @@ func TestAnEffectStartsAFlowWhenItsEntryHadNone(t *testing.T) {
 	}
 	var got ledger.Meta
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
 		Handle: func(ctx context.Context, _ ledger.Delivery[effect]) error {
 			got = ledger.MetaFrom(ctx)
 			return nil

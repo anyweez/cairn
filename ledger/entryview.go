@@ -121,7 +121,7 @@ WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, 
 			var b Batch
 			next := at
 			for _, e := range entries {
-				events, err := a.Events.DecodeAll(e.Events)
+				events, err := a.Codecs.Events.DecodeAll(e.Events)
 				if err != nil {
 					return fmt.Errorf("cairn: %s#%d: %w", stream, e.Seq, err)
 				}

@@ -42,15 +42,6 @@ var (
 		Statement: "A state does not survive a JSON snapshot round trip unchanged."}
 )
 
-// Codecs, when given, are round-tripped on every message, accepted result,
-// event and effect. A nil codec is not checked.
-type Codecs[M, R, Ev, Ef any] struct {
-	Messages *codec.Codec[M]
-	Results  *codec.Codec[R]
-	Events   *codec.Codec[Ev]
-	Effects  *codec.Codec[Ef]
-}
-
 // Machine is a Decider with everything needed to check it.
 type Machine[S, M, R, Ev, Ef any] struct {
 	Decider cairn.Decider[S, M, R, Ev, Ef]
@@ -70,7 +61,9 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	// Steps caps the messages in one run. Defaults to 40.
 	Steps int
 
-	Codecs *Codecs[M, R, Ev, Ef]
+	// Codecs, when given, are round-tripped on every message, accepted result,
+	// event and effect. A nil codec in the set is not checked.
+	Codecs *codec.Set[M, R, Ev, Ef]
 
 	// Snapshots says the state is persisted as JSON, so it must round-trip.
 	Snapshots bool

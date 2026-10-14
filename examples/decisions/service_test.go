@@ -99,7 +99,7 @@ func TestRegisterOnTheLedger(t *testing.T) {
 	// The reference-index effects were queued in the same transactions.
 	var indexed []string
 	dispatcher := &ledger.Dispatcher[Effect]{
-		Store: svc.Register.Store, Kind: "decision", Effects: svc.Register.Effects,
+		Store: svc.Register.Store, Kind: "decision", Effects: svc.Register.Codecs.Effects,
 		Handle: func(_ context.Context, d ledger.Delivery[Effect]) error {
 			indexed = append(indexed, d.Effect.(IndexReferences).Decision)
 			return nil

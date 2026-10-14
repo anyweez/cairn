@@ -121,11 +121,10 @@ func messages(t *rapid.T, s State) Msg {
 type transition = spec.Transition[State, Msg, Result, Event, Effect]
 
 func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
-	msgs, results, events, effects := Codecs()
 	return spectest.Machine[State, Msg, Result, Event, Effect]{
 		Decider:   Decider,
 		Messages:  messages,
-		Codecs:    &spectest.Codecs[Msg, Result, Event, Effect]{Messages: msgs, Results: results, Events: events, Effects: effects},
+		Codecs:    Codecs(),
 		Snapshots: true,
 		Invariants: []spec.Invariant[State]{
 			{Rule: SettledCarriesOutcome, Check: func(s State) spec.Verdict {

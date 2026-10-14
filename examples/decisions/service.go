@@ -20,11 +20,10 @@ type Service struct {
 
 // NewService builds a service over a store.
 func NewService(store *ledger.Store) *Service {
-	msgs, results, events, effects := Codecs()
 	return &Service{
 		Register: &ledger.Aggregate[State, Msg, Result, Event, Effect]{
 			Store: store, Kind: "decision", Decider: Decider,
-			Messages: msgs, Results: results, Events: events, Effects: effects,
+			Codecs:       Codecs(),
 			StateVersion: "decision/1",
 			Actor:        sender,
 		},
