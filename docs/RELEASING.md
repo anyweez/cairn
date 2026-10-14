@@ -28,6 +28,9 @@ and v1.
 
 The changelog takes its entries from commit subjects and its breaking-change
 notes from `BREAKING CHANGE:` footers. Write both for someone upgrading.
+`CHANGELOG.md.j2` renders it; it is commitizen's default template, except
+that the first release has no breaking-change section, since nothing came
+before it to break.
 
 ## Steps
 
