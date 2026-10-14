@@ -11,7 +11,7 @@ import (
 
 // Divergence is one stored decision the current Decider would make differently.
 type Divergence struct {
-	Stream string
+	Stream Stream
 	Seq    int64
 	// Aspect is what differs: "refusal", "result", "events" or "effects", or
 	// "decode" when the stored message no longer decodes.

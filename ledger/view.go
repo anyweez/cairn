@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -98,12 +97,12 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 		return 0, err
 	}
 	for i, name := range names {
-		id := strings.TrimPrefix(name, a.Kind+"/")
+		stream := parseStream(name, a.Kind)
 		err := a.Store.Transact(ctx, func(tx *Tx) error {
-			if err := tx.Lock(ctx, a.Stream(id)); err != nil {
+			if err := tx.Lock(ctx, stream); err != nil {
 				return err
 			}
-			at, err := a.LoadLocked(ctx, tx, id)
+			at, err := a.LoadLocked(ctx, tx, stream.ID)
 			if err != nil {
 				return err
 			}

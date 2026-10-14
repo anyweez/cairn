@@ -12,7 +12,7 @@ import (
 // Delivery is one effect to carry out.
 type Delivery[Ef any] struct {
 	ID      int64
-	Stream  string
+	Stream  Stream
 	Seq     int64
 	Index   int
 	Effect  Ef
@@ -99,8 +99,8 @@ WITH claimed AS (
         ORDER BY id
         FOR UPDATE SKIP LOCKED
         LIMIT $2)
-    RETURNING id, stream, seq, idx, effect, attempts)
-SELECT c.id, c.stream, c.seq, c.idx, c.effect, c.attempts,
+    RETURNING id, stream, kind, seq, idx, effect, attempts)
+SELECT c.id, c.stream, c.kind, c.seq, c.idx, c.effect, c.attempts,
     coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, '')
 FROM claimed c JOIN cairn.entries e ON e.stream = c.stream AND e.seq = c.seq
 ORDER BY c.id`,
@@ -110,7 +110,7 @@ ORDER BY c.id`,
 	}
 	type claimed struct {
 		id       int64
-		stream   string
+		stream   Stream
 		seq      int64
 		idx      int
 		effect   []byte
@@ -120,11 +120,13 @@ ORDER BY c.id`,
 	var batch []claimed
 	for rows.Next() {
 		var c claimed
-		if err := rows.Scan(&c.id, &c.stream, &c.seq, &c.idx, &c.effect, &c.attempts,
+		var name, kind string
+		if err := rows.Scan(&c.id, &name, &kind, &c.seq, &c.idx, &c.effect, &c.attempts,
 			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID); err != nil {
 			rows.Close()
 			return 0, err
 		}
+		c.stream = parseStream(name, kind)
 		batch = append(batch, c)
 	}
 	rows.Close()

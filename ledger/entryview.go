@@ -3,7 +3,6 @@ package ledger
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -94,7 +93,7 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 		return 0, err
 	}
 	for i, name := range names {
-		stream := a.Stream(strings.TrimPrefix(name, a.Kind+"/"))
+		stream := parseStream(name, a.Kind)
 		if err := a.replayEntries(ctx, stream, v); err != nil {
 			return i, fmt.Errorf("cairn: rebuilding entry view %s at %s: %w", v.Name, name, err)
 		}

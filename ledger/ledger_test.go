@@ -191,7 +191,7 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 	// The cutoff is the oldest transaction running anywhere on the server, so
 	// another database's transaction can hold entries back for a while: keep
 	// reading until every entry has arrived.
-	last := map[string]int64{}
+	last := map[ledger.Stream]int64{}
 	deadline := time.Now().Add(10 * time.Second)
 	for cursor, total := (ledger.Cursor{}), 0; total < written; {
 		entries, next, err := agg.Store.ReadAll(ctx, cursor, 50)
@@ -258,7 +258,7 @@ func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 		}
 		entries, cursor = append(entries, more...), next
 	}
-	if len(entries) != 2 || entries[0].Stream != "counter/first" || entries[1].Stream != "counter/second" {
+	if len(entries) != 2 || entries[0].Stream != agg.Stream("first") || entries[1].Stream != agg.Stream("second") {
 		t.Fatalf("got %d entries, first %v", len(entries), entries)
 	}
 }
@@ -317,7 +317,7 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 		}
 		entries, cursor = append(entries, more...), next
 	}
-	if len(entries) != 2 || entries[0].Stream != "counter/slow" || entries[1].Stream != "counter/fast" {
+	if len(entries) != 2 || entries[0].Stream != agg.Stream("slow") || entries[1].Stream != agg.Stream("fast") {
 		t.Fatalf("got %+v", entries)
 	}
 }
@@ -496,7 +496,7 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 			}
 			b.Queue(`
 INSERT INTO totals VALUES ($1, $2, 1)
-ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries = totals.entries + 1`, e.Stream, total)
+ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries = totals.entries + 1`, e.Stream.String(), total)
 			return nil
 		},
 	}
@@ -538,7 +538,7 @@ func seenProjection(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event
 		t.Fatal(err)
 	}
 	return ledger.Projection{Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
-		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream, e.Seq)
+		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream.String(), e.Seq)
 		return nil
 	}}
 }
@@ -571,8 +571,8 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 		if err := apply(ctx, b, e); err != nil {
 			return err
 		}
-		if e.Stream == "counter/a" && e.Seq == 2 {
-			b.Queue(`INSERT INTO seen VALUES ($1, NULL)`, e.Stream)
+		if e.Stream.ID == "a" && e.Seq == 2 {
+			b.Queue(`INSERT INTO seen VALUES ($1, NULL)`, e.Stream.String())
 		}
 		return nil
 	}
@@ -770,7 +770,7 @@ func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(divergences) != 1 || divergences[0].Aspect != "refusal" || divergences[0].Stream != "counter/b" {
+	if len(divergences) != 1 || divergences[0].Aspect != "refusal" || divergences[0].Stream != agg.Stream("b") {
 		t.Fatalf("divergences: %v", divergences)
 	}
 	t.Log(divergences[0])
