@@ -202,7 +202,9 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   new or changed view from current state, while messages keep arriving.
   Read models that combine streams use a projection instead, which is
   eventually consistent. A view is also handed the entry that caused the
-  write, for display columns like `updated_by`.
+  write, for display columns like `updated_by`. Views queue their statements
+  in a `Batch` rather than running them, so all of them cost one round trip
+  while the stream is locked (see [docs/CONVENTIONS.md](docs/CONVENTIONS.md)).
 - **Every entry is attributed.** Each entry records who sent the message
   (`Actor`), through what (`Via`), the flow it belongs to (`CorrelationID`),
   what directly caused it (`CausationID`) and when the producer says it

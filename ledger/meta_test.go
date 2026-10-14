@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/anyweez/cairn/ledger"
 	"github.com/anyweez/cairn/ledger/ledgertest"
 )
@@ -228,12 +226,12 @@ func TestAViewWritesTheActorFromTheEntryThatCausedIt(t *testing.T) {
 		`CREATE TABLE edited (id text PRIMARY KEY, total int NOT NULL, updated_by text NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	view := ledger.View[counter]{Name: "edited", Write: func(ctx context.Context, tx pgx.Tx, at ledger.Loaded[counter], cause ledger.Entry) error {
-		_, err := tx.Exec(ctx, `
+	view := ledger.View[counter]{Name: "edited", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
+		b.Queue(`
 INSERT INTO edited VALUES ($1, $2, $3)
 ON CONFLICT (id) DO UPDATE SET total = excluded.total, updated_by = excluded.updated_by`,
 			at.Stream.ID, at.State.Total, cause.Meta.Actor)
-		return err
+		return nil
 	}}
 	agg.Views = []ledger.View[counter]{view}
 	read := func() string {
