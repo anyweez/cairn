@@ -1,0 +1,154 @@
+# How this repository asks to be worked on.
+#
+# The factory (github.com/anyweez/ioc) renders this file into every run's
+# prompt. A change here takes effect on the run after it lands. Check it before
+# committing a change:
+#
+#   git -c core.quotepath=off ls-files |
+#     curl -sS https://factory.int.anyweez.dev/api/guide/factory-yaml/check \
+#       -F manifest=@factory.yaml -F 'files=<-'
+version: 1
+
+# Quoted, all of them: a plain scalar containing ": " is a mapping to yaml.
+rules:
+  - "Never edit or reorder an entry in `migrations` (ledger/schema.go). Databases record how many have run, so a change only reaches a fresh database; append the next one."
+  - "Never hand-edit spec.manifest.yaml. Regenerate it with `go -C cmd/cairn-manifest run . -dir ../..` and commit the result."
+  - "Never change a stored type's JSON shape without bumping its codec version and adding an upcaster from each earlier version. Entries already in a ledger must stay readable."
+  - "Never let `Decide` or `Evolve` see time, randomness, I/O or request metadata. Anything a decision depends on goes in the message, where `Verify` can replay it."
+  - "Never hand a caller a `pgx.Tx`, connection or pool to write with. A public API that writes inside a cairn transaction takes a `*ledger.Batch` (docs/CONVENTIONS.md)."
+  - "Never add a round trip to `Handle`. `TestEachPathKeepsToItsRoundTrips` and cache_test.go hold the budgets; throughput over a slow database link is the priority."
+  - "Commit messages are conventional commits (commitizen). CI checks every commit in a PR, and release notes are built from them."
+
+scope:
+  prefer:
+    - path: blocks/
+      because: a block is a pure decider with its own spec test, checkable without a database
+    - path: examples/decisions/
+      because: an end-to-end user of the library, where a new feature is exercised before it is generalised
+  caution:
+    - path: ledger/schema.go
+      because: >-
+        the cairn schema every application's database carries. A migration that
+        has run anywhere cannot be changed, and the append-only trigger and
+        CHECK constraints there are guarantees the README makes
+    - path: ledger/store.go
+      because: >-
+        the locking, batching and commit path of `Handle`. A change here moves
+        round-trip counts and lock hold times, which the README and
+        docs/PERFORMANCE.md quote
+    - path: codec/
+      because: >-
+        decides whether entries already stored in a ledger can still be read; a
+        regression here is silent until an old entry is loaded
+    - path: spectest/
+      because: >-
+        the checker every machine is held to. A weakened check passes every
+        test while proving less, so a change needs a mutant test (`Fails`)
+        showing it still catches what it should
+    - path: cairn.go
+      because: the core types every user's decider is written against; a change is a breaking API change
+
+gate:
+  command: scripts/check.sh
+  note: >-
+    gofmt, go vet, `go test -race ./...` with the ledger's Postgres-backed tests
+    required rather than skipped, the manifest tool's vet and tests, and a check
+    that spec.manifest.yaml is current — the same steps as
+    .github/workflows/ci.yml's test job. Needs Docker for a throwaway
+    postgres:17-alpine unless CAIRN_TEST_DATABASE_URL points at a server. CI's
+    PR-only checks (commit messages, stored types against the base branch) are
+    not in it. Under a minute with a warm module cache
+
+tools:
+  - "`go doc <pkg>.<Symbol>`: a package's or symbol's API, for this module and its dependencies, without reading the source."
+  - "`go test -short ./spec/... ./spectest/... ./blocks/... .`: the inner loop, no database needed."
+  - "`go -C cmd/cairn-manifest run . -dir ../..`: regenerates spec.manifest.yaml; its diff shows what a change did to rules, stored types and fsm tables."
+  - "`scripts/bench-postgres.sh` with `go test -bench` in ledger/: measures throughput against a latency-injected Postgres (docs/BENCHMARKS.md)."
+
+conventions:
+  - "Docs describe current behaviour. Rewrite an outdated explanation in place; history belongs in commit messages."
+  - "A rule is a package-level `spec.Rule` with constant fields so the manifest tool can read it; a fixture rule is declared inside a function."
+  - "Spec tests use `spectest.Machine` with rapid generators, and a new established rule must be reached by the generator or listed in `AllowVacuous`."
+  - "Ledger tests take a fresh database from `ledgertest`, and run in parallel."
+  - "Errors are prefixed `cairn:` and wrap with `%w`."
+
+# In the order a message travels: decided, checked, encoded, recorded.
+components:
+  decider:
+    gloss: Decider, Decision and Refusal — business logic as pure Decide and Evolve
+    band: core
+  fsm:
+    gloss: lifecycles as tables of allowed transitions, with their law and Mermaid rendering
+    band: core
+    edges: [decider, spec]
+  spec:
+    gloss: rules (Never, Can, Refines) and their status, the vocabulary a machine's spec is written in
+    band: check
+  spectest:
+    gloss: the rapid-based checker — framework rules D1–D7, invariants, rule health, mutant tests
+    band: check
+    edges: [spec, decider, codec]
+  manifest:
+    gloss: cmd/cairn-manifest and spec.manifest.yaml — rules, stored types and tables, and the stored-type compatibility check
+    band: check
+    edges: [spec, fsm, codec]
+  codec:
+    gloss: versioned JSON for messages, events and effects, with upcasters
+    band: ledger
+  ledger:
+    gloss: the Postgres shell — per-stream locks, the append-only log, outbox, snapshots, state cache, idempotency, Verify
+    band: ledger
+    edges: [decider, codec]
+  views:
+    gloss: read models — per-stream views written in the message's transaction, and projections over the global log
+    band: ledger
+    edges: [ledger]
+  example:
+    gloss: lore's decision register rebuilt on cairn, end to end
+    band: users
+    edges: [ledger, fsm, spectest]
+  build:
+    gloss: CI, the test and benchmark Postgres scripts, and repository config
+    band: substrate
+
+paths:
+  cairn.go: [decider]
+  blocks/fsm/: [fsm]
+  spec/: [spec]
+  spectest/: [spectest]
+  cmd/cairn-manifest/: [manifest]
+  spec.manifest.yaml: [manifest]
+  codec/: [codec]
+  ledger/: [ledger]
+  ledger/view.go: [views]
+  ledger/view_test.go: [views]
+  ledger/projection.go: [views]
+  ledger/batch.go: [ledger, views]
+  docs/PERFORMANCE.md: [ledger]
+  docs/BENCHMARKS.md: [ledger]
+  docs/CONVENTIONS.md: [ledger, views]
+  examples/decisions/: [example]
+  .github/workflows/: [build]
+  scripts/: [build]
+  .cz.toml: [build]
+  .gitignore: [build]
+  go.mod: [build]
+  go.sum: [build]
+  factory.yaml: [build]
+
+docs:
+  entry: README.md
+  authority:
+    - path: docs/CONVENTIONS.md
+      covers: why public APIs take a Batch instead of a transaction, and each API's round-trip cost
+      read_when: the change adds or alters a public ledger API, or anything on the path of `Handle`
+    - path: spec.manifest.yaml
+      covers: every rule, stored type with its codec version and JSON shape, and fsm table
+      read_when: the change adds or alters a rule, a codec registration or an fsm table
+  guides:
+    - path: docs/PERFORMANCE.md
+      read_when: the change touches locking, the state cache, the pool, or what a call costs
+    - path: docs/BENCHMARKS.md
+      read_when: the change claims a throughput effect, or needs a measurement before and after
+    - path: docs/ROADMAP.md
+      read_when: the task names a roadmap item or an open question (redaction, refusals, effect ordering)
