@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"testing"
 
@@ -50,77 +51,57 @@ func emptyDatabase(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// Entries written before a migration must read back after it. This builds a
-// database at version 1 by hand, with an entry in it, then migrates.
-func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
-	if _, err := pool.Exec(ctx, `
-CREATE SCHEMA cairn;
-CREATE TABLE cairn.schema_version (version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, migrations[0]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `
-INSERT INTO cairn.schema_version (version) VALUES (1);
-INSERT INTO cairn.streams (stream, kind, seq) VALUES ('counter/a', 'counter', 1);
-INSERT INTO cairn.entries (stream, kind, seq, message, result, events)
-VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{}}', '1', '[{"type":"added","v":1,"data":{}}]');
-INSERT INTO cairn.snapshots (stream, seq, version, state) VALUES ('counter/a', 1, 'v1', '{"Total": 1}');`); err != nil {
-		t.Fatal(err)
-	}
-
-	store := New(pool, RequireActor(false))
-	if err := store.Migrate(ctx); err != nil {
-		t.Fatalf("migrating a populated version 1 ledger: %v", err)
-	}
-	entries, err := store.ReadStream(ctx, Stream{Kind: "counter", ID: "a"}, 0)
-	if err != nil {
-		t.Fatalf("reading an entry written before the migration: %v", err)
-	}
-	if len(entries) != 1 || entries[0].Meta.Actor != "" || entries[0].Meta.Extra != nil || !entries[0].Meta.OccurredAt.IsZero() {
-		t.Fatalf("an old entry should read back with empty metadata: %+v", entries)
-	}
-
-	// Snapshots move to the table keyed by version.
-	var snapshot string
-	if err := pool.QueryRow(ctx, `SELECT version || '@' || seq || ' ' || state::text FROM cairn.state_snapshots
-WHERE stream = 'counter/a'`).Scan(&snapshot); err != nil {
-		t.Fatalf("reading a snapshot taken before the migration: %v", err)
-	}
-	if snapshot != `v1@1 {"Total": 1}` {
-		t.Fatalf("snapshot %q, want it carried over unchanged", snapshot)
-	}
-}
-
-// During a rolling deploy, processes on an earlier release run their own
-// statements against the newest schema. Every lock statement any release has
-// sent must still work once every migration has run.
-func TestEveryReleasesLockStatementsRunOnTheNewestSchema(t *testing.T) {
+// During a deploy, and after a rollback, processes on an earlier release run
+// their own statements against the newest schema. Every statement a release
+// sends against a cairn function must still work once every migration has run;
+// when a release changes one, add the new statement and keep the old one here.
+func TestEveryReleasesStatementsRunOnTheNewestSchema(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 	if err := New(pool, RequireActor(false)).Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range []struct{ sql, release string }{
-		{`SELECT locked_stream, locked_seq, locked_at FROM cairn.lock_streams($1)`, "Handle in two round trips"},
-		{`SELECT locked_stream, locked_seq FROM cairn.lock_streams($1)`, "the state cache"},
+	for _, stmt := range []struct {
+		release, sql string
+		args         []any
+	}{
+		{"v0.1.0", `SELECT locked_stream, locked_seq FROM cairn.lock_streams($1)`, []any{[]string{"counter/a"}}},
+		{"v0.1.0", `SELECT cairn.lock_stream_at($1, $2)`, []any{"counter/a", int64(0)}},
 	} {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows, err := tx.Query(ctx, stmt.sql, []string{"counter/a"})
+		rows, err := tx.Query(ctx, stmt.sql, stmt.args...)
 		if err == nil {
 			_, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (any, error) { return r.Values() })
 		}
 		_ = tx.Rollback(ctx)
 		if err != nil {
-			t.Errorf("%s's lock statement fails on the newest schema: %v", stmt.release, err)
+			t.Errorf("%s's %q fails on the newest schema: %v", stmt.release, stmt.sql, err)
 		}
+	}
+}
+
+// Postgres assigns a transaction its ID at its first write, and the global log
+// is ordered by that ID, so a transaction that wrote before taking its locks
+// could land in the log ahead of one it queued behind.
+func TestLockRefusesATransactionThatHasWritten(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := New(emptyDatabase(t), RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Transact(ctx, func(tx *Tx) error {
+		// Assigns the transaction its ID, as any write would.
+		if _, err := tx.Exec(ctx, `SELECT pg_current_xact_id()`); err != nil {
+			return err
+		}
+		return tx.Lock(ctx, Stream{Kind: "counter", ID: "a"})
+	})
+	if !errors.Is(err, errLockAfterWrite) {
+		t.Fatalf("Lock after a write: %v, want errLockAfterWrite", err)
 	}
 }

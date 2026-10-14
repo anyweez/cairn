@@ -90,7 +90,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 			switch stored, err := a.storedResult(e); {
 			case err != nil:
 				diverge("decode", "result", err)
-			case e.Result.Type != "" && e.Result.Type != now.Type:
+			case e.Result.Type != now.Type:
 				diverge("result", e.Result.Type, now.Type)
 			case !coversJSON(stored, now.Data):
 				diverge("result", string(stored), string(now.Data))
@@ -137,13 +137,9 @@ func sameSlice[T any](a, b []T) bool {
 }
 
 // storedResult is an accepted entry's result, upcast to the current version.
-// One recorded before results were versioned is compared as it was stored.
 func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, error) {
 	if e.Result == nil {
 		return nil, errors.New("accepted entry has no result")
-	}
-	if e.Result.Type == "" {
-		return e.Result.Data, nil
 	}
 	return a.Results.Latest(*e.Result)
 }

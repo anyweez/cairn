@@ -11,8 +11,18 @@ import (
 // through this package and never write to it directly: the guarantees below
 // (append-only entries, refusals carry nothing, effects tied to the entry that
 // produced them) hold only while that is true.
+//
+// A migration that has been released is never edited or reordered: databases
+// record how many have run, so a change would only reach a fresh one. Append
+// the next one instead. Processes on an earlier release keep running against
+// the newest schema during a deploy, so a
+// migration never changes the shape of a table, column or function an earlier
+// release reads; it adds alongside, and drops only once no supported release
+// reads it. TestEveryReleasesStatementsRunOnTheNewestSchema holds the
+// statements earlier releases send.
 var migrations = []string{
-	// 1: streams, the log, snapshots, the outbox and projection checkpoints.
+	// 1: streams, the log, snapshots, the outbox, projection checkpoints and
+	// the lock functions.
 	`
 CREATE TABLE cairn.streams (
     stream     text PRIMARY KEY,
@@ -26,6 +36,7 @@ CREATE INDEX streams_kind ON cairn.streams (kind, stream);
 -- One row per decided message, refused or not. txid orders the global log:
 -- a reader consumes only rows whose transaction is older than every
 -- transaction still running, so a row can never appear behind its cursor.
+-- actor through extra say who sent the message, through what, and why.
 CREATE TABLE cairn.entries (
     position        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     txid            xid8 NOT NULL DEFAULT pg_current_xact_id(),
@@ -39,6 +50,12 @@ CREATE TABLE cairn.entries (
     effects         jsonb NOT NULL DEFAULT '[]',
     idempotency_key text,
     recorded_at     timestamptz NOT NULL DEFAULT now(),
+    actor           text,
+    via             text,
+    correlation_id  text,
+    causation_id    text,
+    occurred_at     timestamptz,
+    extra           jsonb NOT NULL DEFAULT '{}',
     UNIQUE (stream, seq),
     CONSTRAINT entries_refusal_inert
         CHECK (refusal IS NULL OR (events = '[]'::jsonb AND effects = '[]'::jsonb))
@@ -47,6 +64,8 @@ CREATE UNIQUE INDEX entries_idempotency ON cairn.entries (stream, idempotency_ke
     WHERE idempotency_key IS NOT NULL;
 CREATE INDEX entries_log ON cairn.entries (txid, position);
 CREATE INDEX entries_kind_log ON cairn.entries (kind, txid, position);
+CREATE INDEX entries_actor ON cairn.entries (actor, position) WHERE actor IS NOT NULL;
+CREATE INDEX entries_correlation ON cairn.entries (correlation_id, position) WHERE correlation_id IS NOT NULL;
 
 CREATE FUNCTION cairn.refuse_change() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -58,13 +77,15 @@ CREATE TRIGGER entries_no_truncate BEFORE TRUNCATE ON cairn.entries
     FOR EACH STATEMENT EXECUTE FUNCTION cairn.refuse_change();
 
 -- A cache. Deleting every row is always safe; version names the state's shape,
--- and a snapshot of any other version is ignored.
-CREATE TABLE cairn.snapshots (
-    stream   text PRIMARY KEY REFERENCES cairn.streams (stream),
-    seq      bigint NOT NULL,
+-- and each version keeps its own snapshot, so processes running different
+-- versions side by side don't evict each other's.
+CREATE TABLE cairn.state_snapshots (
+    stream   text NOT NULL REFERENCES cairn.streams (stream),
     version  text NOT NULL,
+    seq      bigint NOT NULL,
     state    jsonb NOT NULL,
-    taken_at timestamptz NOT NULL DEFAULT now()
+    taken_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream, version)
 );
 
 CREATE TABLE cairn.outbox (
@@ -91,46 +112,13 @@ CREATE TABLE cairn.checkpoints (
     position   bigint NOT NULL DEFAULT 0,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
-`,
-	// 2: who sent each message, through what, and why.
-	`
-ALTER TABLE cairn.entries
-    ADD COLUMN actor          text,
-    ADD COLUMN via            text,
-    ADD COLUMN correlation_id text,
-    ADD COLUMN causation_id   text,
-    ADD COLUMN occurred_at    timestamptz,
-    ADD COLUMN extra          jsonb NOT NULL DEFAULT '{}';
-CREATE INDEX entries_actor ON cairn.entries (actor, position) WHERE actor IS NOT NULL;
-CREATE INDEX entries_correlation ON cairn.entries (correlation_id, position) WHERE correlation_id IS NOT NULL;
-`,
-	// 3: snapshots keyed by version as well as stream. With one row per
-	// stream, processes running different StateVersions during a rolling
-	// deploy overwrite each other's snapshot, and each then folds the whole
-	// stream and writes a fresh snapshot on every message. The new table sits
-	// beside the old one rather than replacing its key, so processes still on
-	// the old code keep writing cairn.snapshots instead of failing; a later
-	// migration drops it.
-	`
-CREATE TABLE cairn.state_snapshots (
-    stream   text NOT NULL REFERENCES cairn.streams (stream),
-    version  text NOT NULL,
-    seq      bigint NOT NULL,
-    state    jsonb NOT NULL,
-    taken_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (stream, version)
-);
-INSERT INTO cairn.state_snapshots (stream, version, seq, state, taken_at)
-SELECT stream, version, seq, state, taken_at FROM cairn.snapshots;
-`,
-	// 4: take a transaction's stream locks and read their seqs in one
-	// statement, so locking costs one round trip and can share a batch with
-	// what follows it. Its lock keys are each stream name's
-	// hashtextextended, the same keys every release takes, so processes on
-	// different releases still exclude each other.
-	`
+
+-- Take a transaction's stream locks and read their seqs in one statement, so
+-- locking costs one round trip and can share a batch with what follows it.
+-- The lock key is each stream name's hashtextextended; every release must
+-- take the same keys, so processes on different releases exclude each other.
 CREATE FUNCTION cairn.lock_streams(names text[])
-RETURNS TABLE (locked_stream text, locked_seq bigint, locked_at timestamptz)
+RETURNS TABLE (locked_stream text, locked_seq bigint)
 LANGUAGE plpgsql AS $$
 DECLARE
     k bigint;
@@ -148,18 +136,15 @@ BEGIN
         PERFORM pg_advisory_xact_lock(k);
     END LOOP;
     -- A fresh snapshot, taken now that every lock is held. A stream that does
-    -- not exist yet reads as seq 0. locked_at is the transaction's now();
-    -- current code doesn't read it, but releases that do may still be running
-    -- during a deploy, so the column stays.
+    -- not exist yet reads as seq 0.
     RETURN QUERY
-        SELECT n, coalesce(s.seq, 0), now()
+        SELECT n, coalesce(s.seq, 0)
         FROM unnest(names) AS n LEFT JOIN cairn.streams s ON s.stream = n;
 END $$;
-`,
-	// 5: lock one stream on the condition that it is still at the seq the
-	// caller last saw, so a process can decide from state it holds in memory
-	// and record the decision in the same round trip as the lock.
-	`
+
+-- Lock one stream on the condition that it is still at the seq the caller
+-- last saw, so a process can decide from state it holds in memory and record
+-- the decision in the same round trip as the lock.
 CREATE FUNCTION cairn.lock_stream_at(name text, expected bigint) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE

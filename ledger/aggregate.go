@@ -597,14 +597,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry, state S) (Handled[S, R
 	return h, nil
 }
 
-// decodeResult decodes a stored result through Results. One recorded before
-// results were versioned is unmarshalled as it was stored.
+// decodeResult decodes a stored result through Results.
 func (a *Aggregate[S, M, R, Ev, Ef]) decodeResult(env codec.Envelope) (R, error) {
-	if env.Type == "" {
-		var r R
-		err := json.Unmarshal(env.Data, &r)
-		return r, err
-	}
 	if a.Results == nil {
 		var zero R
 		return zero, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
