@@ -114,27 +114,38 @@ type Deposited struct{ Amount int }  // events
 type Withdrew struct{ Amount int }
 type WarnLowBalance struct{ Balance int } // an effect
 
+// Go can't infer a Decision's type parameters from a return, so a machine
+// names them once, in an alias and two helpers.
+type decision = cairn.Decision[int, Event, Effect]
+
+func refuse(code, format string, args ...any) decision {
+	return cairn.Refuse[int, Event, Effect](code, format, args...)
+}
+func accept(balance int, events []Event, effects ...Effect) decision {
+	return cairn.Accept(balance, events, effects...)
+}
+
 var Bank = cairn.Decider[Account, Msg, int, Event, Effect]{
 	Initial: func() Account { return Account{} },
-	Decide: func(a Account, m Msg) cairn.Decision[int, Event, Effect] {
+	Decide: func(a Account, m Msg) decision {
 		switch m := m.(type) {
 		case Deposit:
 			if m.Amount <= 0 {
-				return cairn.Refuse[int, Event, Effect]("invalid", "deposit of %d", m.Amount)
+				return refuse("invalid", "deposit of %d", m.Amount)
 			}
-			return cairn.Accept[int, Event, Effect](a.Balance+m.Amount, []Event{Deposited{m.Amount}})
+			return accept(a.Balance+m.Amount, []Event{Deposited{m.Amount}})
 		case Withdraw:
 			if m.Amount <= 0 || m.Amount > a.Balance {
-				return cairn.Refuse[int, Event, Effect]("insufficient", "%d of %d", m.Amount, a.Balance)
+				return refuse("insufficient", "%d of %d", m.Amount, a.Balance)
 			}
 			left := a.Balance - m.Amount
 			var effects []Effect
 			if left < 10 {
 				effects = append(effects, WarnLowBalance{left})
 			}
-			return cairn.Accept(left, []Event{Withdrew{m.Amount}}, effects...)
+			return accept(left, []Event{Withdrew{m.Amount}}, effects...)
 		}
-		return cairn.Refuse[int, Event, Effect]("unknown", "%T", m)
+		return refuse("unknown", "%T", m)
 	},
 	Evolve: func(a Account, e Event) Account {
 		switch e := e.(type) {
