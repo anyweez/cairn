@@ -748,7 +748,7 @@ func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(divergences) != 1 || divergences[0].Aspect != "refusal" || divergences[0].Stream != agg.Stream("b") {
+	if len(divergences) != 1 || divergences[0].Aspect != ledger.Refused || divergences[0].Stream != agg.Stream("b") {
 		t.Fatalf("divergences: %v", divergences)
 	}
 	t.Log(divergences[0])
@@ -803,7 +803,7 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 	if d := v2(totalOnly, same); len(d) != 0 {
 		t.Errorf("a field the entries predate must not diverge: %v", d)
 	}
-	if d := v2(totalOnly, func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N + 1} }); len(d) != 2 || d[0].Aspect != "result" {
+	if d := v2(totalOnly, func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N + 1} }); len(d) != 2 || d[0].Aspect != ledger.Returned {
 		t.Errorf("a field the entries carry must still be compared: %v", d)
 	}
 	// An upcaster that can fill the new field in has it checked: these
@@ -811,7 +811,7 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 	withCap := func(old json.RawMessage) (json.RawMessage, error) {
 		return []byte(`{"total":` + string(old) + `,"cap":10}`), nil
 	}
-	if d := v2(withCap, same); len(d) != 2 || d[0].Aspect != "result" {
+	if d := v2(withCap, same); len(d) != 2 || d[0].Aspect != ledger.Returned {
 		t.Errorf("a field the upcaster fills in must be compared: %v", d)
 	}
 }
