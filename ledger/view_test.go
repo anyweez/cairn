@@ -56,6 +56,7 @@ func readTotals(t *testing.T, q interface {
 }
 
 func TestAViewShowsAWriteAsSoonAsHandleReturns(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 
@@ -69,6 +70,7 @@ func TestAViewShowsAWriteAsSoonAsHandleReturns(t *testing.T) {
 }
 
 func TestAViewCommitsAndRollsBackWithItsMessage(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 	errAbandon := errors.New("abandon")
@@ -99,6 +101,7 @@ func TestAViewCommitsAndRollsBackWithItsMessage(t *testing.T) {
 }
 
 func TestARefusalLeavesTheViewAlone(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 
@@ -118,6 +121,7 @@ func TestARefusalLeavesTheViewAlone(t *testing.T) {
 }
 
 func TestAFailingViewRefusesToRecordTheMessage(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	broken := errors.New("view is broken")
 	agg.Views = []ledger.View[counter]{{Name: "broken", Write: func(*ledger.Batch, ledger.Loaded[counter], ledger.Entry) error {
@@ -138,6 +142,7 @@ func TestAFailingViewRefusesToRecordTheMessage(t *testing.T) {
 // sent together. A statement can fail as the batch is prepared, before any
 // runs, or as it runs.
 func TestAViewWhoseStatementFailsRefusesToRecordTheMessage(t *testing.T) {
+	t.Parallel()
 	for _, failing := range []string{
 		`INSERT INTO no_such_table VALUES ($1)`,
 		`INSERT INTO counter_totals VALUES ($1 || '-copy', NULL, 0)`,
@@ -167,6 +172,7 @@ func TestAViewWhoseStatementFailsRefusesToRecordTheMessage(t *testing.T) {
 }
 
 func TestRebuildFillsAViewFromCurrentState(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	view := totalsView(t, agg)
 
@@ -194,6 +200,8 @@ func TestRebuildFillsAViewFromCurrentState(t *testing.T) {
 // Rebuild locks each stream while it reads and writes, so a message that
 // arrives mid-rebuild waits, and its own write lands last.
 func TestAWriteDuringRebuildIsNotOverwritten(t *testing.T) {
+	// Not parallel: sleeps order the writes, and load from other tests could
+	// reorder them.
 	agg := newCounter(t)
 	view := totalsView(t, agg)
 	if _, err := agg.Handle(ctx, "a", add{1, 10}); err != nil {

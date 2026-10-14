@@ -12,6 +12,7 @@ import (
 )
 
 func TestMetadataIsRecordedWithTheEntry(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	occurred := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	request := ledger.ContextWithMeta(ctx, ledger.Meta{
@@ -51,6 +52,7 @@ func TestMetadataIsRecordedWithTheEntry(t *testing.T) {
 }
 
 func TestAStoreThatRequiresAnActorRefusesToRecordWithoutOne(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Store = ledgertest.NewStore(t, ledger.RequireActor(true))
 
@@ -66,6 +68,7 @@ func TestAStoreThatRequiresAnActorRefusesToRecordWithoutOne(t *testing.T) {
 }
 
 func TestStoresRequireAnActorByDefault(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	// The same database, opened the way an application would.
 	agg.Store = ledger.New(agg.Store.Pool())
@@ -75,6 +78,7 @@ func TestStoresRequireAnActorByDefault(t *testing.T) {
 }
 
 func TestTheActorAMessageNamesFillsAndGuardsItsMetadata(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Store = ledgertest.NewStore(t, ledger.RequireActor(true))
 	// The counter's message has no "by" field, so its cap stands in for one.
@@ -98,6 +102,7 @@ func TestTheActorAMessageNamesFillsAndGuardsItsMetadata(t *testing.T) {
 }
 
 func TestAPerCallActorCannotStandInForTheRequestsActor(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Actor = func(m msg) string { return fmt.Sprintf("u_%d", m.(add).Cap) }
 
@@ -109,6 +114,7 @@ func TestAPerCallActorCannotStandInForTheRequestsActor(t *testing.T) {
 }
 
 func TestAMessageThatNamesNoActorKeepsTheRequestsActor(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Actor = func(msg) string { return "" }
 	h, err := agg.Handle(ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_ana"}), "a", add{1, 10})
@@ -118,6 +124,7 @@ func TestAMessageThatNamesNoActorKeepsTheRequestsActor(t *testing.T) {
 }
 
 func TestMetadataReadFromAContextIsACopy(t *testing.T) {
+	t.Parallel()
 	carrying := ledger.ContextWithMeta(ctx, ledger.Meta{Extra: map[string]any{"a": 1}})
 	ledger.MetaFrom(carrying).Extra["b"] = 2
 	derived := ledger.ContextWithMeta(carrying, ledger.Meta{Actor: "u_ana"})
@@ -132,6 +139,7 @@ func TestMetadataReadFromAContextIsACopy(t *testing.T) {
 // A retry is answered from the first entry before its metadata is checked, so
 // one that lost the request's metadata still gets the answer.
 func TestARetryWithoutMetadataGetsTheFirstAnswer(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Store = ledgertest.NewStore(t, ledger.RequireActor(true))
 	as := ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_ana"})
@@ -145,6 +153,7 @@ func TestARetryWithoutMetadataGetsTheFirstAnswer(t *testing.T) {
 }
 
 func TestARetryKeepsTheFirstMessagesMetadata(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	first := ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_ana", CorrelationID: "req-1"})
 	if _, err := agg.Handle(first, "a", add{1, 10}, ledger.IdempotencyKey("k")); err != nil {
@@ -163,6 +172,7 @@ func TestARetryKeepsTheFirstMessagesMetadata(t *testing.T) {
 // A message recorded while carrying out an effect is attributed to the
 // effect: same actor and flow, caused by the delivery.
 func TestAMessageRecordedByAnEffectHandlerIsCausedByTheDelivery(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	request := ledger.ContextWithMeta(ctx, ledger.Meta{Actor: "u_ana", Via: "ui", CorrelationID: "req-1"})
 	if _, err := agg.Handle(request, "a", add{2, 10}); err != nil {
@@ -198,6 +208,7 @@ func TestAMessageRecordedByAnEffectHandlerIsCausedByTheDelivery(t *testing.T) {
 // effect; with no actor, the outbox is the actor, so a follow-up is not
 // refused by a store that requires one.
 func TestAnEffectStartsAFlowWhenItsEntryHadNone(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "a", add{2, 10}); err != nil {
 		t.Fatal(err)
@@ -221,6 +232,7 @@ func TestAnEffectStartsAFlowWhenItsEntryHadNone(t *testing.T) {
 // A view reads who changed a stream from the entry that caused the write, and
 // a rebuild hands it the same entry a live write did.
 func TestAViewWritesTheActorFromTheEntryThatCausedIt(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Store.Pool().Exec(ctx,
 		`CREATE TABLE edited (id text PRIMARY KEY, total int NOT NULL, updated_by text NOT NULL)`); err != nil {

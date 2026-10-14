@@ -20,6 +20,7 @@ type bumped struct{}
 // index can't see. Locking at the cached seq refuses it, and the message is
 // decided from the stored state instead.
 func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := New(emptyDatabase(t), RequireActor(false))
 	if err := store.Migrate(ctx); err != nil {
