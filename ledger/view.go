@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -86,6 +85,9 @@ func viewError[S any](err error, at Loaded[S]) error {
 // rows change shape. Each stream is locked and written in its own
 // transaction, so Rebuild can run while the aggregate is taking messages.
 func (a *Aggregate[S, M, R, Ev, Ef]) Rebuild(ctx context.Context, v View[S]) (int, error) {
+	if err := a.Validate(); err != nil {
+		return 0, err
+	}
 	// A stream with no events has nothing in any view.
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries
@@ -98,12 +100,9 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 		return 0, err
 	}
 	for i, name := range names {
-		id := strings.TrimPrefix(name, a.Kind+"/")
-		err := a.Store.Transact(ctx, func(tx *Tx) error {
-			if err := tx.Lock(ctx, a.Stream(id)); err != nil {
-				return err
-			}
-			at, err := a.LoadLocked(ctx, tx, id)
+		stream := parseStream(name, a.Kind)
+		err := a.Store.Transact(ctx, []Stream{stream}, func(tx *Tx) error {
+			at, err := a.LoadLocked(ctx, tx, stream.ID)
 			if err != nil {
 				return err
 			}
@@ -127,7 +126,7 @@ WHERE stream = $1 AND events <> '[]'::jsonb ORDER BY seq DESC LIMIT 1`, name)
 			if err := queueView(&b, v, at, cause[0]); err != nil {
 				return err
 			}
-			return viewError(b.send(ctx, tx.Tx), at)
+			return viewError(b.send(ctx, tx.tx), at)
 		})
 		if err != nil {
 			return i, fmt.Errorf("cairn: rebuilding view %s at %s: %w", v.Name, name, err)

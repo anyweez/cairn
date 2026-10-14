@@ -42,15 +42,6 @@ var (
 		Statement: "A state does not survive a JSON snapshot round trip unchanged."}
 )
 
-// Codecs, when given, are round-tripped on every message, accepted result,
-// event and effect. A nil codec is not checked.
-type Codecs[M, R, Ev, Ef any] struct {
-	Messages *codec.Codec[M]
-	Results  *codec.Codec[R]
-	Events   *codec.Codec[Ev]
-	Effects  *codec.Codec[Ef]
-}
-
 // Machine is a Decider with everything needed to check it.
 type Machine[S, M, R, Ev, Ef any] struct {
 	Decider cairn.Decider[S, M, R, Ev, Ef]
@@ -61,6 +52,7 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	Messages func(t *rapid.T, state S) M
 
 	Laws       []spec.Law[S, M, R, Ev, Ef]
+	Changes    []spec.Change[S, M]
 	Invariants []spec.Invariant[S]
 	Models     []Refinement[S, M, R]
 
@@ -70,7 +62,9 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	// Steps caps the messages in one run. Defaults to 40.
 	Steps int
 
-	Codecs *Codecs[M, R, Ev, Ef]
+	// Codecs, when given, are round-tripped on every message, accepted result,
+	// event and effect. A nil codec in the set is not checked.
+	Codecs *codec.Set[M, R, Ev, Ef]
 
 	// Snapshots says the state is persisted as JSON, so it must round-trip.
 	Snapshots bool
@@ -106,6 +100,9 @@ func (m Machine[S, M, R, Ev, Ef]) rules() []spec.Rule {
 	}
 	for _, l := range m.Laws {
 		rules = append(rules, l.Rule)
+	}
+	for _, c := range m.Changes {
+		rules = append(rules, c.Rule)
 	}
 	for _, i := range m.Invariants {
 		rules = append(rules, i.Rule)
@@ -190,6 +187,9 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, rep *report) {
 		tr := spec.Transition[S, M, R, Ev, Ef]{Before: state, Msg: msg, Decision: decision, After: after}
 		for _, l := range m.Laws {
 			j(l.Rule, checked(func() spec.Verdict { return l.Check(tr) }))
+		}
+		for _, c := range m.Changes {
+			j(c.Rule, checked(func() spec.Verdict { return c.Check(state, msg, after) }))
 		}
 		for i, r := range models {
 			for _, v := range r.step(msg, decision.Result, decision.Refusal, after) {
@@ -482,6 +482,36 @@ func (r *report) log(t rapid.TB) {
 	}
 }
 
+// kindsMatch fails t for a rule whose Kind disagrees with how it is checked:
+// a model's rule must be Refines, and a law, change or invariant's must not
+// be, since nothing compares it with a model.
+func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
+	t.Helper()
+	ok := true
+	notRefines := func(r spec.Rule, how string) {
+		if r.Kind == spec.Refines {
+			t.Errorf("%s is checked by %s, not a model, so its Kind cannot be Refines", r.ID, how)
+			ok = false
+		}
+	}
+	for _, l := range m.Laws {
+		notRefines(l.Rule, "a law")
+	}
+	for _, c := range m.Changes {
+		notRefines(c.Rule, "a change")
+	}
+	for _, i := range m.Invariants {
+		notRefines(i.Rule, "an invariant")
+	}
+	for _, r := range m.Models {
+		if r.rule().Kind != spec.Refines {
+			t.Errorf("%s is checked by a model, so its Kind must be Refines", r.rule().ID)
+			ok = false
+		}
+	}
+	return ok
+}
+
 // gateVacuity fails t for every established rule that never applied, unless
 // allowed names it. Proposed rules only report, so their vacuity does too.
 func (r *report) gateVacuity(t rapid.TB, allowed []string) {
@@ -527,6 +557,9 @@ func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	}
 	if m.Steps == 0 {
 		m.Steps = 40
+	}
+	if !m.kindsMatch(t) {
+		return nil
 	}
 	rep := newReport()
 	for _, r := range m.rules() {

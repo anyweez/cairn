@@ -452,7 +452,8 @@ func cloneMap[K comparable, V any](m map[K]V) map[K]V {
 
 // ---- codecs --------------------------------------------------------------------
 
-func Codecs() (*codec.Codec[Msg], *codec.Codec[Result], *codec.Codec[Event], *codec.Codec[Effect]) {
+// Codecs are the register's stored types.
+func Codecs() *codec.Set[Msg, Result, Event, Effect] {
 	msgs := codec.New[Msg]()
 	codec.Register[Create](msgs, "decision.create", 1)
 	codec.Register[Edit](msgs, "decision.edit", 1)
@@ -479,5 +480,5 @@ func Codecs() (*codec.Codec[Msg], *codec.Codec[Result], *codec.Codec[Event], *co
 
 	effects := codec.New[Effect]()
 	codec.Register[IndexReferences](effects, "decision.index_references", 1)
-	return msgs, results, events, effects
+	return &codec.Set[Msg, Result, Event, Effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
 }

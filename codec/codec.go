@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"sort"
 )
 
 // Envelope is one encoded value as the ledger stores it.
@@ -164,19 +163,14 @@ func (c *Codec[T]) DecodeAll(envs []Envelope) ([]T, error) {
 	return out, nil
 }
 
-// Type describes one registered type, for manifests and review tooling.
-type Type struct {
-	Name    string
-	Version int
-	Go      string
-}
-
-// Types lists the registered types by name.
-func (c *Codec[T]) Types() []Type {
-	out := make([]Type, 0, len(c.byName))
-	for _, e := range c.byName {
-		out = append(out, Type{Name: e.name, Version: e.version, Go: e.typ.String()})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+// Set is the four codecs a Decider's values are stored through: its messages,
+// results, events and effects. The ledger stores every entry through one, and
+// the checker round-trips every value through one (D6).
+type Set[M, R, Ev, Ef any] struct {
+	Messages *Codec[M]
+	// Results encodes what an accepted message returns. A single struct R
+	// registers as Register[R, R].
+	Results *Codec[R]
+	Events  *Codec[Ev]
+	Effects *Codec[Ef]
 }

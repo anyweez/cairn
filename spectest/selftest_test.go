@@ -123,7 +123,7 @@ func messages(t *rapid.T, a account) msg {
 	return withdraw{N: n}
 }
 
-func codecs() *spectest.Codecs[msg, int, event, effect] {
+func codecs() *codec.Set[msg, int, event, effect] {
 	msgs := codec.New[msg]()
 	codec.Register[deposit](msgs, "deposit", 1)
 	codec.Register[withdraw](msgs, "withdraw", 1)
@@ -134,7 +134,7 @@ func codecs() *spectest.Codecs[msg, int, event, effect] {
 	codec.Register[lowBalance](effects, "low_balance", 1)
 	results := codec.New[int]()
 	codec.Register[int](results, "balance", 1)
-	return &spectest.Codecs[msg, int, event, effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
+	return &codec.Set[msg, int, event, effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
 }
 
 // The fixture's own rules, built in functions because they are not cairn's:
@@ -489,5 +489,43 @@ func assertCaught(t *testing.T, m acct, rule, detail string) {
 	}
 	if detail != "" && !strings.Contains(msg, detail) {
 		t.Fatalf("want %q in the %s failure, got:\n%s", detail, rule, msg)
+	}
+}
+
+// A rule's Kind must match how it is checked: Refines for a model and
+// nothing else.
+func TestKindMustMatchTheCheck(t *testing.T) {
+	m := machine()
+	wrong := refinesLedger()
+	wrong.Kind = spec.Never
+	model := ledgerModel()
+	model.Rule = wrong
+	m.Models = []spectest.Refinement[account, msg, int]{spectest.Refines(model)}
+	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A2 is checked by a model, so its Kind must be Refines") {
+		t.Fatalf("a model whose rule is not Refines must fail the check, got %q", msg)
+	}
+
+	m = machine()
+	m.Changes = []spec.Change[account, msg]{{Rule: refinesLedger(), Check: func(account, msg, account) spec.Verdict { return spec.Pass }}}
+	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A2 is checked by a change, not a model") {
+		t.Fatalf("a change whose rule is Refines must fail the check, got %q", msg)
+	}
+}
+
+// A Change is judged on every transition, like a Law.
+func TestChangesAreJudged(t *testing.T) {
+	m := machine()
+	m.Changes = []spec.Change[account, msg]{{Rule: neverOverdrawn(), Check: func(before account, _ msg, after account) spec.Verdict {
+		return spec.Check(after.Balance >= 0, "balance went from %d to %d", before.Balance, after.Balance)
+	}}}
+	m.Invariants = nil
+	if msg, failed := spectest.Fails(t, m.Check); failed {
+		t.Fatalf("a change that holds must pass: %s", msg)
+	}
+	m.Changes[0].Check = func(before account, _ msg, after account) spec.Verdict {
+		return spec.Check(after.Balance <= before.Balance, "balance rose from %d to %d", before.Balance, after.Balance)
+	}
+	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A1 violated") {
+		t.Fatalf("a change that fails must fail the check, got %q", msg)
 	}
 }

@@ -82,12 +82,17 @@ type Stream struct {
 
 func (s Stream) String() string { return s.Kind + "/" + s.ID }
 
+// parseStream is the Stream a stored name and kind denote: the name joins the
+// two with a slash, so the ID is what follows the kind.
+func parseStream(name, kind string) Stream {
+	return Stream{Kind: kind, ID: strings.TrimPrefix(name, kind+"/")}
+}
+
 // Entry is one decided message as stored.
 type Entry struct {
 	Position int64
 	TxID     uint64
-	Stream   string
-	Kind     string
+	Stream   Stream
 	Seq      int64
 	Message  codec.Envelope
 	// Result is nil when the message was refused.
@@ -117,11 +122,32 @@ type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// Tx is a transaction that may write to the ledger. Streams are written only
-// while locked, and all of a transaction's locks are taken in one Lock call.
+// Tx is a transaction that may write to the ledger: the streams Transact
+// locked, and nothing else. It runs a caller's own statements too, each in a
+// round trip of its own; Transact owns its begin, commit and rollback.
 type Tx struct {
-	pgx.Tx
+	tx    pgx.Tx
 	locks *locks
+}
+
+// Exec runs a statement.
+func (tx *Tx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return tx.tx.Exec(ctx, sql, args...)
+}
+
+// Query runs a query.
+func (tx *Tx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return tx.tx.Query(ctx, sql, args...)
+}
+
+// QueryRow runs a query that returns one row.
+func (tx *Tx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return tx.tx.QueryRow(ctx, sql, args...)
+}
+
+// SendBatch runs several statements in one round trip.
+func (tx *Tx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return tx.tx.SendBatch(ctx, b)
 }
 
 // locks is what a transaction's Lock found: the seq of each stream it locked,
@@ -140,44 +166,38 @@ func recordingTime() time.Time { return time.Now().Truncate(time.Microsecond) }
 // ErrNotLocked is returned when a transaction writes a stream it did not lock.
 var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
 
-// Transact runs fn in a transaction, committing if it returns nil.
+// Transact runs fn in a transaction that holds the write lock on streams,
+// committing if fn returns nil. Pass every stream the transaction will write;
+// Apply on any other fails with ErrNotLocked. Locking a stream that does not
+// exist yet does not create it: its row is written with its first entry, so a
+// stream locked only to be read leaves nothing behind.
+//
+// The locks are taken before anything else, in a fixed order, so two
+// transactions that lock overlapping streams can never deadlock. The global
+// log is ordered by transaction ID, and Postgres assigns that ID at a
+// transaction's first write. Every stream lock is therefore an advisory lock
+// taken while the transaction has no ID yet: a transaction that queues behind
+// another for a stream is assigned its ID after the other's, so its entries
+// follow the other's in the log as they do in the stream.
 //
 // fn may run its own statements on tx, such as claiming a number from an
-// application table, but nothing that writes may come before tx.Lock: Lock
-// refuses a transaction that has already written (see Lock).
-func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
+// application table. Each costs a round trip; see docs/CONVENTIONS.md.
+func (s *Store) Transact(ctx context.Context, streams []Stream, fn func(tx *Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(ptx pgx.Tx) error {
-		return fn(&Tx{Tx: ptx})
+		tx := &Tx{tx: ptx}
+		if len(streams) > 0 {
+			var b Batch
+			l, err := queueLock(&b, streams)
+			if err != nil {
+				return err
+			}
+			if err := b.send(ctx, ptx); err != nil {
+				return err
+			}
+			tx.locks = l
+		}
+		return fn(tx)
 	})
-}
-
-// Lock takes the write lock on every stream the transaction will touch.
-// Locking a stream that does not exist yet does not create it: its row is
-// written with its first entry, so a stream locked only to be read leaves
-// nothing behind. Locks are taken in a fixed order,
-// which is why they must all be taken at once: two transactions that lock
-// overlapping streams can then never deadlock. Lock may be called once, and
-// must come before the transaction's first write.
-//
-// The global log is ordered by transaction ID, and Postgres assigns that ID at
-// a transaction's first write. Every stream lock is therefore an advisory
-// lock taken while the transaction has no ID yet: a transaction that queues
-// behind another for a stream is assigned its ID after the other's, so its
-// entries follow the other's in the log as they do in the stream.
-func (tx *Tx) Lock(ctx context.Context, streams ...Stream) error {
-	if tx.locks != nil {
-		return errors.New("cairn: Lock may be called once per transaction; pass every stream to one call")
-	}
-	var b Batch
-	l, err := queueLock(&b, streams)
-	if err != nil {
-		return err
-	}
-	if err := b.send(ctx, tx.Tx); err != nil {
-		return err
-	}
-	tx.locks = l
-	return nil
 }
 
 // errLockAfterWrite is cairn.lock_streams refusing a transaction that has
@@ -277,7 +297,7 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if err != nil {
 		return err
 	}
-	e.Stream, e.Kind, e.Seq, e.RecordedAt = stream.String(), stream.Kind, seq+1, at
+	e.Stream, e.Seq, e.RecordedAt = stream, seq+1, at
 
 	message, err := json.Marshal(e.Message)
 	if err != nil {
@@ -335,7 +355,7 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	}, `
 INSERT INTO cairn.streams (stream, kind, seq) VALUES ($1, $2, $3)
 ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
-		e.Stream, e.Kind, e.Seq)
+		stream.String(), stream.Kind, e.Seq)
 
 	b.own(func(r pgx.BatchResults) error {
 		var txid string
@@ -351,7 +371,7 @@ INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
     nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15, $16)
 RETURNING position, txid::text`,
-		e.Stream, e.Kind, e.Seq, jsonArg(message), jsonArg(result), jsonArg(refusal), jsonArg(events), jsonArg(effects), key,
+		stream.String(), stream.Kind, e.Seq, jsonArg(message), jsonArg(result), jsonArg(refusal), jsonArg(events), jsonArg(effects), key,
 		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, jsonArg(extra), e.RecordedAt)
 
 	// Every effect in one statement, numbered from 0 in order.
@@ -364,9 +384,9 @@ RETURNING position, txid::text`,
 		}, `
 INSERT INTO cairn.outbox (stream, seq, idx, kind, effect)
 SELECT $1, $2, i - 1, $3, effect::jsonb FROM unnest($4::text[]) WITH ORDINALITY AS t(effect, i)`,
-			e.Stream, e.Seq, e.Kind, outbox)
+			stream.String(), e.Seq, stream.Kind, outbox)
 	}
-	l.seqs[e.Stream] = e.Seq
+	l.seqs[stream.String()] = e.Seq
 	return nil
 }
 
@@ -400,17 +420,18 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	for rows.Next() {
 		var (
 			e                       Entry
-			txid                    string
+			txid, name, kind        string
 			message, events, effect []byte
 			result, refusal         []byte
 			occurred                *time.Time
 			extra                   []byte
 		)
-		if err := rows.Scan(&e.Position, &txid, &e.Stream, &e.Kind, &e.Seq, &message, &result, &refusal,
+		if err := rows.Scan(&e.Position, &txid, &name, &kind, &e.Seq, &message, &result, &refusal,
 			&events, &effect, &e.IdempotencyKey, &e.RecordedAt,
 			&e.Meta.Actor, &e.Meta.Via, &e.Meta.CorrelationID, &e.Meta.CausationID, &occurred, &extra); err != nil {
 			return nil, err
 		}
+		e.Stream = parseStream(name, kind)
 		if occurred != nil {
 			e.Meta.OccurredAt = *occurred
 		}
@@ -510,7 +531,7 @@ func (s *Store) Streams(ctx context.Context, kind string) ([]Stream, error) {
 	}
 	out := make([]Stream, 0, len(names))
 	for _, n := range names {
-		out = append(out, Stream{Kind: kind, ID: strings.TrimPrefix(n, kind+"/")})
+		out = append(out, parseStream(n, kind))
 	}
 	return out, nil
 }

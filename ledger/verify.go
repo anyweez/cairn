@@ -11,14 +11,30 @@ import (
 
 // Divergence is one stored decision the current Decider would make differently.
 type Divergence struct {
-	Stream string
+	Stream Stream
 	Seq    int64
-	// Aspect is what differs: "refusal", "result", "events" or "effects", or
-	// "decode" when the stored message no longer decodes.
-	Aspect string
+	Aspect Aspect
 	Stored string
 	Now    string
 }
+
+// Aspect is what a Divergence found to differ.
+type Aspect string
+
+const (
+	// Refused: one decision refused the message and the other accepted it,
+	// or both refused with different codes.
+	Refused Aspect = "refusal"
+	// Returned: the accepted decisions returned different results.
+	Returned Aspect = "result"
+	// Emitted: the accepted decisions emitted different events.
+	Emitted Aspect = "events"
+	// Effected: the accepted decisions queued different effects.
+	Effected Aspect = "effects"
+	// Undecodable: the stored message or result no longer decodes, so it
+	// could not be re-decided or compared.
+	Undecodable Aspect = "decode"
+)
 
 func (d Divergence) String() string {
 	return fmt.Sprintf("%s#%d %s: stored %s, now %s", d.Stream, d.Seq, d.Aspect, d.Stored, d.Now)
@@ -40,8 +56,8 @@ func (d Divergence) String() string {
 // only when the stored result carries it, and a map in R only on the keys the
 // stored result has.
 func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]Divergence, error) {
-	if a.Results == nil {
-		return nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+	if err := a.Validate(); err != nil {
+		return nil, err
 	}
 	stream := a.Stream(id)
 	entries, err := readStream(ctx, a.Store.pool, stream, 0)
@@ -52,19 +68,19 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 	var out []Divergence
 	state := a.Decider.Initial()
 	for _, e := range entries {
-		diverge := func(aspect string, stored, now any) {
+		diverge := func(aspect Aspect, stored, now any) {
 			out = append(out, Divergence{Stream: e.Stream, Seq: e.Seq, Aspect: aspect,
 				Stored: fmt.Sprintf("%+v", stored), Now: fmt.Sprintf("%+v", now)})
 		}
 
-		storedEvents, err := a.Events.DecodeAll(e.Events)
+		storedEvents, err := a.Codecs.Events.DecodeAll(e.Events)
 		if err != nil {
 			return out, fmt.Errorf("cairn: %s#%d: %w", e.Stream, e.Seq, err)
 		}
 
-		msg, err := a.Messages.Decode(e.Message)
+		msg, err := a.Codecs.Messages.Decode(e.Message)
 		if err != nil {
-			diverge("decode", e.Message.Type, err)
+			diverge(Undecodable, e.Message.Type, err)
 			state = a.Decider.Fold(state, storedEvents)
 			continue
 		}
@@ -73,37 +89,37 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 
 		switch {
 		case e.Refusal != nil && d.Refusal == nil:
-			diverge("refusal", e.Refusal.Code, "accepted")
+			diverge(Refused, e.Refusal.Code, "accepted")
 		case e.Refusal == nil && d.Refusal != nil:
-			diverge("refusal", "accepted", d.Refusal.Code)
+			diverge(Refused, "accepted", d.Refusal.Code)
 		case e.Refusal != nil && d.Refusal != nil && e.Refusal.Code != d.Refusal.Code:
-			diverge("refusal", e.Refusal.Code, d.Refusal.Code)
+			diverge(Refused, e.Refusal.Code, d.Refusal.Code)
 		}
 
 		// Once the verdict differs, so must everything that follows from it;
 		// the refusal is the one divergence worth reading.
 		if e.Refusal == nil && d.Refusal == nil {
-			now, err := a.Results.Encode(d.Result)
+			now, err := a.Codecs.Results.Encode(d.Result)
 			if err != nil {
 				return out, err
 			}
 			switch stored, err := a.storedResult(e); {
 			case err != nil:
-				diverge("decode", "result", err)
+				diverge(Undecodable, "result", err)
 			case e.Result.Type != now.Type:
-				diverge("result", e.Result.Type, now.Type)
+				diverge(Returned, e.Result.Type, now.Type)
 			case !coversJSON(stored, now.Data):
-				diverge("result", string(stored), string(now.Data))
+				diverge(Returned, string(stored), string(now.Data))
 			}
 			if !sameSlice(storedEvents, d.Events) {
-				diverge("events", storedEvents, d.Events)
+				diverge(Emitted, storedEvents, d.Events)
 			}
-			storedEffects, err := a.Effects.DecodeAll(e.Effects)
+			storedEffects, err := a.Codecs.Effects.DecodeAll(e.Effects)
 			if err != nil {
 				return out, fmt.Errorf("cairn: %s#%d: %w", e.Stream, e.Seq, err)
 			}
 			if !sameSlice(storedEffects, d.Effects) {
-				diverge("effects", storedEffects, d.Effects)
+				diverge(Effected, storedEffects, d.Effects)
 			}
 		}
 
@@ -117,6 +133,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 // runs may or may not be checked; run it against a quiet database, or treat a
 // clean result as covering the history up to its start.
 func (a *Aggregate[S, M, R, Ev, Ef]) VerifyAll(ctx context.Context) ([]Divergence, error) {
+	if err := a.Validate(); err != nil {
+		return nil, err
+	}
 	streams, err := a.Store.Streams(ctx, a.Kind)
 	if err != nil {
 		return nil, err
@@ -141,7 +160,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, err
 	if e.Result == nil {
 		return nil, errors.New("accepted entry has no result")
 	}
-	return a.Results.Latest(*e.Result)
+	return a.Codecs.Results.Latest(*e.Result)
 }
 
 // coversJSON reports whether now agrees with every field stored carries.

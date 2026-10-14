@@ -3,13 +3,10 @@ package ledger
 import (
 	"container/list"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -39,6 +36,10 @@ import (
 // committed, but one stream takes many messages per commit.
 // Views and snapshots are written once per transaction, from the state after
 // its last message.
+//
+// Nothing hands the cached state to a caller: Handled carries no state, and
+// Load reads the stream. Decide, Evolve and views are handed it, and must not
+// change it, which spectest holds deciders to.
 type stateCache struct {
 	mu      sync.Mutex
 	size    int
@@ -167,62 +168,6 @@ func (c *stateCache) take(lane laneKey, n int) []any {
 // groupMax is the most messages one transaction records.
 const groupMax = 100
 
-// copier returns how to copy a state so that the copy shares nothing with the
-// original, or nil when there is no copy that is sure to be faithful, in which
-// case the aggregate's streams are not cached: Handled.State must never be
-// the cached value itself, which a caller could change.
-func (a *Aggregate[S, M, R, Ev, Ef]) copier() func(S) (S, error) {
-	switch {
-	case a.Clone != nil:
-		return func(s S) (S, error) { return a.Clone(s), nil }
-	case plainValue(reflect.TypeFor[S]()):
-		return func(s S) (S, error) { return s, nil }
-	case a.StateVersion != "":
-		// Snapshots already rely on the state surviving JSON.
-		return func(s S) (S, error) {
-			data, err := json.Marshal(s)
-			if err != nil {
-				return s, err
-			}
-			var copied S
-			err = json.Unmarshal(data, &copied)
-			return copied, err
-		}
-	}
-	return nil
-}
-
-var plainValues sync.Map // reflect.Type → bool
-
-// plainValue reports whether values of t share nothing when assigned: no
-// maps, slices, pointers, interfaces, channels or functions anywhere in them.
-// A time.Time counts, although it holds a pointer to its location, since
-// locations are never changed.
-func plainValue(t reflect.Type) bool {
-	if v, ok := plainValues.Load(t); ok {
-		return v.(bool)
-	}
-	plain := true
-	switch t.Kind() {
-	case reflect.Map, reflect.Slice, reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		plain = false
-	case reflect.Array:
-		plain = plainValue(t.Elem())
-	case reflect.Struct:
-		if t == reflect.TypeFor[time.Time]() {
-			break
-		}
-		for i := range t.NumField() {
-			if !plainValue(t.Field(i).Type) {
-				plain = false
-				break
-			}
-		}
-	}
-	plainValues.Store(t, plain)
-	return plain
-}
-
 // cacheKey names a stream's cached state. A snapshot's seq is only meaningful
 // to the StateVersion that took it, so each version has its own.
 func (a *Aggregate[S, M, R, Ev, Ef]) cacheKey(stream Stream) string {
@@ -233,8 +178,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) cacheKey(stream Stream) string {
 // caller whose context ends while its message is in flight returns at once,
 // and the message may still be recorded, as with any write abandoned
 // mid-flight.
-func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream Stream, r *request[S, M, R]) result[S, R] {
-	r.done = make(chan result[S, R], 1)
+func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream Stream, r *request[M, R]) result[R] {
+	r.done = make(chan result[R], 1)
 	lane := laneKey{agg: a, name: stream.String()}
 	if a.Store.cache.enqueue(lane, r) {
 		go a.drain(stream, lane)
@@ -243,7 +188,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream St
 	case res := <-r.done:
 		return res
 	case <-ctx.Done():
-		return result[S, R]{err: ctx.Err()}
+		return result[R]{err: ctx.Err()}
 	}
 }
 
@@ -254,11 +199,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) drain(stream Stream, lane laneKey) {
 		if taken == nil {
 			return
 		}
-		var reqs []*request[S, M, R]
+		var reqs []*request[M, R]
 		for _, item := range taken {
-			r := item.(*request[S, M, R])
+			r := item.(*request[M, R])
 			if err := r.ctx.Err(); err != nil {
-				r.done <- result[S, R]{err: err}
+				r.done <- result[R]{err: err}
 				continue
 			}
 			reqs = append(reqs, r)
@@ -274,7 +219,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) drain(stream Stream, lane laneKey) {
 // groupLen is how many of reqs, from the first, can share a transaction: up
 // to one that repeats an idempotency key, which must find the first one
 // recorded.
-func groupLen[S, M, R any](reqs []*request[S, M, R]) int {
+func groupLen[M, R any](reqs []*request[M, R]) int {
 	keys := map[string]bool{}
 	for i, r := range reqs {
 		if r.o.key == "" {
@@ -291,13 +236,13 @@ func groupLen[S, M, R any](reqs []*request[S, M, R]) int {
 // record records reqs in one transaction, from the cached state when
 // fromCache is set and the cache trusts what it holds, and delivers every
 // result.
-func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M, R], fromCache bool) {
+func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[M, R], fromCache bool) {
 	cache, key := a.Store.cache, a.cacheKey(stream)
 	ctx, stop := groupContext(reqs)
 	defer stop()
-	var results []result[S, R] // set once the transaction has committed
+	var results []result[R] // set once the transaction has committed
 	defer func() {
-		// A panic in the decider, or in Clone, would otherwise end the process
+		// A panic in the decider would otherwise end the process
 		// from a goroutine no caller can recover in. Callers not yet answered
 		// learn whether their messages were recorded, so that one without an
 		// idempotency key isn't recorded twice by a retry.
@@ -311,7 +256,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 				case results != nil:
 					err = fmt.Errorf("cairn: the message to %s was recorded, but its result could not be returned: panic: %v", stream, p)
 				}
-				deliver(r, result[S, R]{err: err})
+				deliver(r, result[R]{err: err})
 			}
 		}
 	}()
@@ -347,39 +292,28 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[S, M,
 		if len(reqs) > 1 && retryable(err) {
 			// One message spoiled the transaction for all; find which.
 			for _, r := range reqs {
-				a.record(stream, []*request[S, M, R]{r}, false)
+				a.record(stream, []*request[M, R]{r}, false)
 			}
 			return
 		}
 		for _, r := range reqs {
-			deliver(r, result[S, R]{err: err})
+			deliver(r, result[R]{err: err})
 		}
 		return
 	}
 
 	results = attempt
 	cache.put(key, after)
-	copyState := a.copier()
 	for i, r := range reqs {
-		res := results[i]
-		if errors.Is(res.err, errUnchecked) {
-			a.record(stream, []*request[S, M, R]{r}, false)
+		if errors.Is(results[i].err, errUnchecked) {
+			a.record(stream, []*request[M, R]{r}, false)
 			continue
 		}
-		if res.err == nil {
-			if s, err := copyState(res.h.State); err == nil {
-				res.h.State = s
-			} else {
-				// Without a copy, the caller gets the state itself, so it
-				// must not stay cached.
-				cache.drop(key)
-			}
-		}
-		deliver(r, res)
+		deliver(r, results[i])
 	}
 }
 
-func deliver[S, M, R any](r *request[S, M, R], res result[S, R]) {
+func deliver[M, R any](r *request[M, R], res result[R]) {
 	select {
 	case r.done <- res:
 	default: // already answered
@@ -402,7 +336,7 @@ func retryable(err error) bool {
 
 // groupContext is a context for recording reqs together, which ends once every
 // one of their callers has given up.
-func groupContext[S, M, R any](reqs []*request[S, M, R]) (context.Context, func()) {
+func groupContext[M, R any](reqs []*request[M, R]) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(reqs[0].ctx))
 	var waiting atomic.Int64
 	waiting.Store(int64(len(reqs)))

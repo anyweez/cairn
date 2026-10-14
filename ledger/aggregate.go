@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,20 +16,17 @@ import (
 )
 
 // Aggregate binds a Decider to the ledger: one kind of stream, its codecs,
-// and how its state is snapshotted.
+// and how its state is snapshotted. Every method checks the aggregate with
+// Validate before it does anything.
 type Aggregate[S, M, R, Ev, Ef any] struct {
 	Store   *Store
 	Kind    string
 	Decider cairn.Decider[S, M, R, Ev, Ef]
 
-	Messages *codec.Codec[M]
-	Events   *codec.Codec[Ev]
-	Effects  *codec.Codec[Ef]
-	// Results encodes what an accepted message returns. A single struct R
-	// registers as codec.Register[R, R]. A retry decodes its stored result
-	// through Results' upcasters, and Verify compares only the fields the
-	// upcast stored result carries (see Verify).
-	Results *codec.Codec[R]
+	// Codecs are how messages, results, events and effects are stored. A
+	// retry decodes its stored result through Results' upcasters, and Verify
+	// compares only the fields the upcast stored result carries (see Verify).
+	Codecs *codec.Set[M, R, Ev, Ef]
 
 	// StateVersion names the shape of S as stored in snapshots. Change it
 	// whenever S changes shape; snapshots of any other version are ignored and
@@ -53,19 +51,60 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// field), which then fills Meta.Actor. A message whose metadata names a
 	// different actor is not recorded, so the two can never disagree.
 	Actor func(M) string
-
-	// Clone, when set, returns a copy of a state that shares nothing with it.
-	// The store's state cache needs one (see StateCacheSize), so that a
-	// caller can never change the state it keeps. Without Clone, a state with
-	// no maps, slices, pointers or interfaces in it is copied by assignment;
-	// otherwise one is copied through JSON when StateVersion is set, since
-	// snapshots already rely on it surviving JSON; otherwise the aggregate's
-	// streams are not cached.
-	Clone func(S) S
 }
 
 // Stream names one of this aggregate's streams.
 func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Kind: a.Kind, ID: id} }
+
+// Validate reports the first thing wrong with how the aggregate is set up: no
+// store, a kind that is empty or contains a slash, a Decider missing a
+// function, a codec missing from Codecs, or a view or entry view whose name is
+// empty or repeats another's. Every other method runs it first, so a mistake
+// is an error rather than a nil-pointer panic on the first message; call it
+// at startup to fail before then.
+func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
+	switch {
+	case a.Store == nil:
+		return fail("Store is nil")
+	case a.Kind == "" || strings.Contains(a.Kind, "/"):
+		return fail("Kind must be non-empty and contain no slash")
+	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
+		return fail("Decider needs Initial, Decide and Evolve")
+	case a.Codecs == nil:
+		return fail("Codecs is nil")
+	case a.Codecs.Messages == nil:
+		return fail("Codecs.Messages is nil")
+	case a.Codecs.Results == nil:
+		return fail("Codecs.Results is nil")
+	case a.Codecs.Events == nil:
+		return fail("Codecs.Events is nil")
+	case a.Codecs.Effects == nil:
+		return fail("Codecs.Effects is nil")
+	}
+	// Batch attributes a failing statement to the view that queued it by name,
+	// so a view needs one of its own.
+	names := map[string]bool{}
+	for _, v := range a.Views {
+		if v.Name == "" {
+			return fail("a view has no Name")
+		}
+		if names[v.Name] {
+			return fail("two views are named " + v.Name)
+		}
+		names[v.Name] = true
+	}
+	for _, v := range a.EntryViews {
+		if v.Name == "" {
+			return fail("an entry view has no Name")
+		}
+		if names[v.Name] {
+			return fail("two views are named " + v.Name)
+		}
+		names[v.Name] = true
+	}
+	return nil
+}
 
 // Loaded is a stream's state as of a sequence number.
 type Loaded[S any] struct {
@@ -76,15 +115,16 @@ type Loaded[S any] struct {
 	snapshotSeq int64
 }
 
-// Handled is what recording one message produced.
-type Handled[S, R any] struct {
+// Handled is what recording one message produced. The stream's state after
+// it is not returned: what a caller needs from a decision belongs in R, and
+// Load reads the state.
+type Handled[R any] struct {
 	Entry   Entry
-	State   S
 	Result  R
 	Refusal *cairn.Refusal
 	// Duplicate is true when the idempotency key matched an earlier entry:
 	// nothing was decided or recorded, and Result and Refusal are the earlier
-	// entry's. State is the stream's current state.
+	// entry's.
 	Duplicate bool
 }
 
@@ -119,21 +159,24 @@ func collect(opts []Option) options {
 // transaction, locks the stream and reads it; the second records the decision
 // and commits, or for a duplicate, rolls back. Messages that arrive together
 // for one stream are recorded together. See docs/PERFORMANCE.md.
-func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg M, opts ...Option) (Handled[S, R], error) {
+func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg M, opts ...Option) (Handled[R], error) {
+	if err := a.Validate(); err != nil {
+		return Handled[R]{}, err
+	}
 	o := collect(opts)
-	r := &request[S, M, R]{ctx: ctx, msg: msg, o: o}
+	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
 
-	var res result[S, R]
-	if a.Store.cache != nil && a.copier() != nil {
+	var res result[R]
+	if a.Store.cache != nil {
 		res = a.handleCached(ctx, a.Stream(id), r)
-	} else if results, _, _, err := a.runGroup(ctx, a.Stream(id), []*request[S, M, R]{r}, nil); err != nil {
+	} else if results, _, _, err := a.runGroup(ctx, a.Stream(id), []*request[M, R]{r}, nil); err != nil {
 		res.err = err
 	} else {
 		res = results[0]
 	}
 	if res.err != nil {
-		return Handled[S, R]{}, res.err
+		return Handled[R]{}, res.err
 	}
 	if res.h.Refusal != nil {
 		return res.h, res.h.Refusal
@@ -142,17 +185,17 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg 
 }
 
 // request is one message on its way to being recorded.
-type request[S, M, R any] struct {
+type request[M, R any] struct {
 	ctx     context.Context
 	msg     M
 	o       options
 	meta    Meta
 	metaErr error
-	done    chan result[S, R]
+	done    chan result[R]
 }
 
-type result[S, R any] struct {
-	h   Handled[S, R]
+type result[R any] struct {
+	h   Handled[R]
 	err error
 }
 
@@ -174,7 +217,7 @@ var errUnchecked = errors.New("cairn: the message needs its idempotency key look
 // An error is the transaction's, and nothing in it was recorded when the
 // database reported it (see retryable). Each request's own result says
 // whether its message was refused, a duplicate, or failed before it was sent.
-func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[S, M, R], cached *Loaded[S]) (results []result[S, R], before, after Loaded[S], err error) {
+func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[M, R], cached *Loaded[S]) (results []result[R], before, after Loaded[S], err error) {
 	conn, err := a.Store.pool.Acquire(ctx)
 	if err != nil {
 		return nil, Loaded[S]{}, Loaded[S]{}, err
@@ -216,8 +259,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	}
 	before = at
 
-	results = make([]result[S, R], len(reqs))
-	finishes := make([]func() Handled[S, R], len(reqs))
+	results = make([]result[R], len(reqs))
+	finishes := make([]func() Handled[R], len(reqs))
 	// cause is the last entry with events, and viewAt the state it left: the
 	// entries after it changed nothing a view shows, and a view is written as
 	// of the entry that caused it, as Rebuild writes it.
@@ -232,7 +275,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		// A retry gets its first answer even when it lost the request's
 		// metadata: the message was attributed when it was recorded.
 		case dups[i] != nil && dups[i].found:
-			results[i].h, results[i].err = a.duplicateOf(dups[i].entry, at.State)
+			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
 			continue
 		case r.metaErr != nil && r.o.key != "" && cached != nil:
 			results[i].err = errUnchecked
@@ -297,7 +340,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	return results, before, at, nil
 }
 
-func anyRecorded[S, R any](finishes []func() Handled[S, R]) bool {
+func anyRecorded[R any](finishes []func() Handled[R]) bool {
 	for _, f := range finishes {
 		if f != nil {
 			return true
@@ -342,6 +385,9 @@ func commitStep(r pgx.BatchResults) error {
 
 // Load reads a stream's current state without locking it, in one round trip.
 func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loaded[S], error) {
+	if err := a.Validate(); err != nil {
+		return Loaded[S]{}, err
+	}
 	stream := a.Stream(id)
 	var (
 		b   Batch
@@ -373,6 +419,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 
 // LoadLocked reads the state of a stream the transaction has locked.
 func (a *Aggregate[S, M, R, Ev, Ef]) LoadLocked(ctx context.Context, tx *Tx, id string) (Loaded[S], error) {
+	if err := a.Validate(); err != nil {
+		return Loaded[S]{}, err
+	}
 	stream := a.Stream(id)
 	seq, err := tx.locks.seq(stream)
 	if err != nil {
@@ -380,7 +429,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) LoadLocked(ctx context.Context, tx *Tx, id 
 	}
 	var b Batch
 	load := a.queueLoad(&b, stream)
-	if err := b.send(ctx, tx.Tx); err != nil {
+	if err := b.send(ctx, tx.tx); err != nil {
 		return Loaded[S]{}, err
 	}
 	return a.finishLoad(ctx, tx, load, seq)
@@ -465,7 +514,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 		if e.Seq > seq {
 			break
 		}
-		events, err := a.Events.DecodeAll(e.Events)
+		events, err := a.Codecs.Events.DecodeAll(e.Events)
 		if err != nil {
 			return Loaded[S]{}, fmt.Errorf("cairn: %s#%d: %w", p.stream, e.Seq, err)
 		}
@@ -477,26 +526,32 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 // Apply decides msg against a locked, loaded stream and records the result in
 // tx, updating at to the state after it. A refusal is not an error here: it is
 // recorded like any other decision and reported in Handled.Refusal, so a
-// caller composing several streams decides for itself whether to commit.
+// caller composing several streams decides for itself whether to commit. The
+// usual check of err therefore passes over a refusal; read Handled.Refusal, or
+// the transaction commits past it. Handle, by contrast, returns the refusal as
+// its error.
 //
 // It costs one round trip, and one more to look up an idempotency key.
-func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Loaded[S], msg M, opts ...Option) (Handled[S, R], error) {
+func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Loaded[S], msg M, opts ...Option) (Handled[R], error) {
+	if err := a.Validate(); err != nil {
+		return Handled[R]{}, err
+	}
 	o := collect(opts)
 	// A retry gets its first answer even when it lost the request's metadata:
 	// the message was attributed when it was recorded.
 	if o.key != "" {
 		var b Batch
 		dup := queueDuplicate(&b, at.Stream, o.key)
-		if err := b.send(ctx, tx.Tx); err != nil {
-			return Handled[S, R]{}, err
+		if err := b.send(ctx, tx.tx); err != nil {
+			return Handled[R]{}, err
 		}
 		if dup.found {
-			return a.duplicateOf(dup.entry, at.State)
+			return a.duplicateOf(dup.entry)
 		}
 	}
 	meta, err := a.meta(ctx, msg, o)
 	if err != nil {
-		return Handled[S, R]{}, err
+		return Handled[R]{}, err
 	}
 
 	var b Batch
@@ -522,10 +577,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		if notLocked == nil {
 			tx.locks.seqs[at.Stream.String()] = seq
 		}
-		return Handled[S, R]{}, err
+		return Handled[R]{}, err
 	}
-	if err := b.send(ctx, tx.Tx); err != nil {
-		return Handled[S, R]{}, viewError(err, next)
+	if err := b.send(ctx, tx.tx); err != nil {
+		return Handled[R]{}, viewError(err, next)
 	}
 	*at = next
 	return finish(), nil
@@ -535,27 +590,24 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 // entry recorded at now, with its effects. next is the stream's state after
 // it; finish returns what was recorded, once the batch has run. events are
 // the decision's.
-func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[S, R], next Loaded[S], entry *Entry, events []Ev, err error) {
+func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[R], next Loaded[S], entry *Entry, events []Ev, err error) {
 	decision := a.Decider.Decide(at.State, msg)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
 		return nil, at, nil, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
 	}
 
 	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
-	if entry.Message, err = a.Messages.Encode(msg); err != nil {
+	if entry.Message, err = a.Codecs.Messages.Encode(msg); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if entry.Events, err = a.Events.EncodeAll(decision.Events); err != nil {
+	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if entry.Effects, err = a.Effects.EncodeAll(decision.Effects); err != nil {
+	if entry.Effects, err = a.Codecs.Effects.EncodeAll(decision.Effects); err != nil {
 		return nil, at, nil, nil, err
 	}
 	if !decision.Refused() {
-		if a.Results == nil {
-			return nil, at, nil, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
-		}
-		result, err := a.Results.Encode(decision.Result)
+		result, err := a.Codecs.Results.Encode(decision.Result)
 		if err != nil {
 			return nil, at, nil, nil, err
 		}
@@ -569,8 +621,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	next.State = a.Decider.Fold(at.State, decision.Events)
 	next.Seq = entry.Seq
 
-	return func() Handled[S, R] {
-		return Handled[S, R]{Entry: *entry, State: next.State, Result: decision.Result, Refusal: decision.Refusal}
+	return func() Handled[R] {
+		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: decision.Refusal}
 	}, next, entry, decision.Events, nil
 }
 
@@ -601,12 +653,12 @@ func queueDuplicate(b *Batch, stream Stream, key string) *pendingDuplicate {
 }
 
 // duplicateOf answers a retry with the entry that first answered it.
-func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry, state S) (Handled[S, R], error) {
-	h := Handled[S, R]{Entry: e, State: state, Refusal: e.Refusal, Duplicate: true}
+func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry) (Handled[R], error) {
+	h := Handled[R]{Entry: e, Refusal: e.Refusal, Duplicate: true}
 	if e.Result != nil {
 		var err error
 		if h.Result, err = a.decodeResult(*e.Result); err != nil {
-			return Handled[S, R]{}, fmt.Errorf("cairn: decoding result of %s#%d: %w", e.Stream, e.Seq, err)
+			return Handled[R]{}, fmt.Errorf("cairn: decoding result of %s#%d: %w", e.Stream, e.Seq, err)
 		}
 	}
 	return h, nil
@@ -614,11 +666,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry, state S) (Handled[S, R
 
 // decodeResult decodes a stored result through Results.
 func (a *Aggregate[S, M, R, Ev, Ef]) decodeResult(env codec.Envelope) (R, error) {
-	if a.Results == nil {
-		var zero R
-		return zero, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
-	}
-	return a.Results.Decode(env)
+	return a.Codecs.Results.Decode(env)
 }
 
 // queueSnapshot queues a snapshot of at when one is due.

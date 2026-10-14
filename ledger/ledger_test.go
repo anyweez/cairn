@@ -72,7 +72,7 @@ func counterOn(store *ledger.Store) *ledger.Aggregate[counter, msg, int, event, 
 	codec.Register[int](results, "total", 1)
 	return &ledger.Aggregate[counter, msg, int, event, effect]{
 		Store: store, Kind: "counter", Decider: counterDecider,
-		Messages: msgs, Events: events, Effects: effects, Results: results,
+		Codecs: &codec.Set[msg, int, event, effect]{Messages: msgs, Results: results, Events: events, Effects: effects},
 	}
 }
 
@@ -89,8 +89,11 @@ func TestHandleRecordsDecisionsAndRefusals(t *testing.T) {
 	if !errors.Is(err, &cairn.Refusal{Code: "over_cap"}) {
 		t.Fatalf("expected an over_cap refusal, got %v", err)
 	}
-	if h.Entry.Seq != 2 || h.State.Total != 3 {
-		t.Fatalf("a refusal is recorded and changes nothing: %+v", h)
+	if h.Entry.Seq != 2 {
+		t.Fatalf("a refusal is recorded: %+v", h)
+	}
+	if loaded, err := agg.Load(ctx, "a"); err != nil || loaded.State.Total != 3 {
+		t.Fatalf("a refusal changes nothing: %+v, %v", loaded, err)
 	}
 	h, err = agg.Handle(ctx, "a", add{2, 10})
 	if err != nil {
@@ -157,10 +160,7 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		wg.Go(func() {
 			for i := range 15 {
 				pair := []string{ids[(w+i)%len(ids)], ids[(w+2*i+1)%len(ids)]}
-				err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-					if err := tx.Lock(ctx, agg.Stream(pair[0]), agg.Stream(pair[1])); err != nil {
-						return err
-					}
+				err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream(pair[0]), agg.Stream(pair[1])}, func(tx *ledger.Tx) error {
 					for _, id := range pair {
 						at, err := agg.LoadLocked(ctx, tx, id)
 						if err != nil {
@@ -191,7 +191,7 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 	// The cutoff is the oldest transaction running anywhere on the server, so
 	// another database's transaction can hold entries back for a while: keep
 	// reading until every entry has arrived.
-	last := map[string]int64{}
+	last := map[ledger.Stream]int64{}
 	deadline := time.Now().Add(10 * time.Second)
 	for cursor, total := (ledger.Cursor{}), 0; total < written; {
 		entries, next, err := agg.Store.ReadAll(ctx, cursor, 50)
@@ -258,7 +258,7 @@ func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 		}
 		entries, cursor = append(entries, more...), next
 	}
-	if len(entries) != 2 || entries[0].Stream != "counter/first" || entries[1].Stream != "counter/second" {
+	if len(entries) != 2 || entries[0].Stream != agg.Stream("first") || entries[1].Stream != agg.Stream("second") {
 		t.Fatalf("got %d entries, first %v", len(entries), entries)
 	}
 }
@@ -271,10 +271,7 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	agg := newCounter(t)
 	appended, release, done := make(chan struct{}), make(chan struct{}), make(chan error)
 	go func() {
-		done <- agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-			if err := tx.Lock(ctx, agg.Stream("slow")); err != nil {
-				return err
-			}
+		done <- agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("slow")}, func(tx *ledger.Tx) error {
 			at, err := agg.LoadLocked(ctx, tx, "slow")
 			if err != nil {
 				return err
@@ -317,35 +314,15 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 		}
 		entries, cursor = append(entries, more...), next
 	}
-	if len(entries) != 2 || entries[0].Stream != "counter/slow" || entries[1].Stream != "counter/fast" {
+	if len(entries) != 2 || entries[0].Stream != agg.Stream("slow") || entries[1].Stream != agg.Stream("fast") {
 		t.Fatalf("got %+v", entries)
-	}
-}
-
-func TestLockMustComeBeforeAnyWrite(t *testing.T) {
-	t.Parallel()
-	agg := newCounter(t)
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE scratch (x int)`); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO scratch VALUES (1)`); err != nil {
-			return err
-		}
-		return tx.Lock(ctx, agg.Stream("late"))
-	})
-	if err == nil {
-		t.Fatal("Lock after a write must fail: the transaction already has its place in the log")
 	}
 }
 
 func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("read"), agg.Stream("written")); err != nil {
-			return err
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("read"), agg.Stream("written")}, func(tx *ledger.Tx) error {
 		read, err := agg.LoadLocked(ctx, tx, "read")
 		if err != nil {
 			return err
@@ -388,7 +365,7 @@ func TestIdempotencyKeyAnswersARetryWithoutDecidingAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !again.Duplicate || again.Result != first.Result || again.State.Total != 4 || again.Entry.Seq != 1 {
+	if !again.Duplicate || again.Result != first.Result || again.Entry.Seq != 1 {
 		t.Fatalf("retry: %+v", again)
 	}
 
@@ -486,6 +463,7 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	projection := ledger.Projection{
+		Store:     agg.Store,
 		Name:      "totals",
 		Kinds:     []string{"counter"},
 		BatchSize: 2,
@@ -496,7 +474,7 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 			}
 			b.Queue(`
 INSERT INTO totals VALUES ($1, $2, 1)
-ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries = totals.entries + 1`, e.Stream, total)
+ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries = totals.entries + 1`, e.Stream.String(), total)
 			return nil
 		},
 	}
@@ -506,13 +484,13 @@ ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries =
 			t.Fatal(err)
 		}
 	}
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 3 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 3 {
 		t.Fatalf("caught up %d, %v", n, err)
 	}
 	if _, err := agg.Handle(ctx, "b", add{2, 9}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 1 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 1 {
 		t.Fatalf("second catch-up applied %d, %v; only the new entry should be applied", n, err)
 	}
 
@@ -537,8 +515,8 @@ func seenProjection(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event
 		`CREATE TABLE seen (stream text NOT NULL, seq bigint NOT NULL, PRIMARY KEY (stream, seq))`); err != nil {
 		t.Fatal(err)
 	}
-	return ledger.Projection{Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
-		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream, e.Seq)
+	return ledger.Projection{Store: agg.Store, Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
+		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream.String(), e.Seq)
 		return nil
 	}}
 }
@@ -571,12 +549,12 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 		if err := apply(ctx, b, e); err != nil {
 			return err
 		}
-		if e.Stream == "counter/a" && e.Seq == 2 {
-			b.Queue(`INSERT INTO seen VALUES ($1, NULL)`, e.Stream)
+		if e.Stream.ID == "a" && e.Seq == 2 {
+			b.Queue(`INSERT INTO seen VALUES ($1, NULL)`, e.Stream.String())
 		}
 		return nil
 	}
-	n, err := agg.Store.CatchUp(ctx, broken)
+	n, err := broken.CatchUp(ctx)
 	if n != 0 || err == nil || !strings.Contains(err.Error(), "projection seen at counter/a#2: statement 1:") {
 		t.Fatalf("want the failing entry and statement named, got %d, %v", n, err)
 	}
@@ -584,7 +562,7 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 		t.Fatalf("a failed batch left %d rows", got)
 	}
 
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 3 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 3 {
 		t.Fatalf("after the failure, caught up %d, %v; want all 3 from the start", n, err)
 	}
 }
@@ -617,7 +595,7 @@ func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
 	var total atomic.Int64
 	for range 2 {
 		wg.Go(func() {
-			n, err := agg.Store.CatchUp(ctx, projection)
+			n, err := projection.CatchUp(ctx)
 			if err != nil {
 				t.Error(err)
 			}
@@ -647,7 +625,7 @@ func TestOutboxRetriesUntilDelivered(t *testing.T) {
 	var delivered []string
 	failOnce := true
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, Batch: 1,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, BatchSize: 1,
 		Backoff: func(int) time.Duration { return 0 },
 		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
 			if failOnce {
@@ -683,14 +661,14 @@ func TestAnExpiredClaimCannotRecordAnOutcome(t *testing.T) {
 	var calls []string
 	var slow *ledger.Dispatcher[effect]
 	fast := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
 		Handle: func(_ context.Context, d ledger.Delivery[effect]) error {
 			calls = append(calls, fmt.Sprintf("fast@%d", d.Attempt))
 			return nil
 		},
 	}
 	slow = &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, Lease: 50 * time.Millisecond,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, Lease: 50 * time.Millisecond,
 		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
 			calls = append(calls, fmt.Sprintf("slow@%d", d.Attempt))
 			<-ctx.Done() // outlives its lease
@@ -730,7 +708,7 @@ func TestAnEffectClaimedTooOftenWithoutAnOutcomeIsFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Effects, MaxAttempts: 2,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, MaxAttempts: 2,
 		Handle: func(context.Context, ledger.Delivery[effect]) error {
 			t.Error("an effect past MaxAttempts must not be delivered again")
 			return nil
@@ -770,7 +748,7 @@ func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(divergences) != 1 || divergences[0].Aspect != "refusal" || divergences[0].Stream != "counter/b" {
+	if len(divergences) != 1 || divergences[0].Aspect != ledger.Refused || divergences[0].Stream != agg.Stream("b") {
 		t.Fatalf("divergences: %v", divergences)
 	}
 	t.Log(divergences[0])
@@ -799,8 +777,8 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 		codec.Register[totalV2](results, "total", 2)
 		results.Upcast("total", 1, upcast)
 		next := &ledger.Aggregate[counter, msg, totalV2, event, effect]{
-			Store: agg.Store, Kind: "counter", Messages: agg.Messages, Events: agg.Events, Effects: agg.Effects,
-			Results: results,
+			Store: agg.Store, Kind: "counter",
+			Codecs: &codec.Set[msg, totalV2, event, effect]{Messages: agg.Codecs.Messages, Results: results, Events: agg.Codecs.Events, Effects: agg.Codecs.Effects},
 			Decider: cairn.Decider[counter, msg, totalV2, event, effect]{
 				Initial: counterDecider.Initial,
 				Evolve:  counterDecider.Evolve,
@@ -825,7 +803,7 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 	if d := v2(totalOnly, same); len(d) != 0 {
 		t.Errorf("a field the entries predate must not diverge: %v", d)
 	}
-	if d := v2(totalOnly, func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N + 1} }); len(d) != 2 || d[0].Aspect != "result" {
+	if d := v2(totalOnly, func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N + 1} }); len(d) != 2 || d[0].Aspect != ledger.Returned {
 		t.Errorf("a field the entries carry must still be compared: %v", d)
 	}
 	// An upcaster that can fill the new field in has it checked: these
@@ -833,7 +811,7 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 	withCap := func(old json.RawMessage) (json.RawMessage, error) {
 		return []byte(`{"total":` + string(old) + `,"cap":10}`), nil
 	}
-	if d := v2(withCap, same); len(d) != 2 || d[0].Aspect != "result" {
+	if d := v2(withCap, same); len(d) != 2 || d[0].Aspect != ledger.Returned {
 		t.Errorf("a field the upcaster fills in must be compared: %v", d)
 	}
 }
@@ -859,13 +837,7 @@ func TestTheLibraryKeepsItsOwnGuarantees(t *testing.T) {
 		t.Errorf("a refusal with events must be rejected, got %v", err)
 	}
 
-	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
-		if err := tx.Lock(ctx, agg.Stream("a")); err != nil {
-			return err
-		}
-		if err := tx.Lock(ctx, agg.Stream("b")); err == nil {
-			t.Error("a second Lock must be refused")
-		}
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a")}, func(tx *ledger.Tx) error {
 		if _, err := agg.LoadLocked(ctx, tx, "b"); !errors.Is(err, ledger.ErrNotLocked) {
 			t.Errorf("loading an unlocked stream for writing: %v", err)
 		}

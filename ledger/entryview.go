@@ -3,7 +3,6 @@ package ledger
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -83,6 +82,9 @@ var rebuildWindow = 1000
 // safe to run again. A failed rebuild leaves the windows before the failure
 // written; running it again redoes them.
 func (a *Aggregate[S, M, R, Ev, Ef]) RebuildEntries(ctx context.Context, v EntryView[S, Ev]) (int, error) {
+	if err := a.Validate(); err != nil {
+		return 0, err
+	}
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries
 WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
@@ -94,7 +96,7 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 		return 0, err
 	}
 	for i, name := range names {
-		stream := a.Stream(strings.TrimPrefix(name, a.Kind+"/"))
+		stream := parseStream(name, a.Kind)
 		if err := a.replayEntries(ctx, stream, v); err != nil {
 			return i, fmt.Errorf("cairn: rebuilding entry view %s at %s: %w", v.Name, name, err)
 		}
@@ -107,7 +109,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) replayEntries(ctx context.Context, stream S
 	at := Loaded[S]{Stream: stream, State: a.Decider.Initial()}
 	for {
 		var n int
-		err := a.Store.Transact(ctx, func(tx *Tx) error {
+		err := a.Store.Transact(ctx, nil, func(tx *Tx) error {
 			rows, err := tx.Query(ctx, `SELECT `+entryColumns+` FROM cairn.entries
 WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, rebuildWindow)
 			if err != nil {
@@ -121,7 +123,7 @@ WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, 
 			var b Batch
 			next := at
 			for _, e := range entries {
-				events, err := a.Events.DecodeAll(e.Events)
+				events, err := a.Codecs.Events.DecodeAll(e.Events)
 				if err != nil {
 					return fmt.Errorf("cairn: %s#%d: %w", stream, e.Seq, err)
 				}
@@ -133,7 +135,7 @@ WHERE stream = $1 AND seq > $2 ORDER BY seq LIMIT $3`, stream.String(), at.Seq, 
 					}
 				}
 			}
-			if err := viewError(b.send(ctx, tx.Tx), next); err != nil {
+			if err := viewError(b.send(ctx, tx.tx), next); err != nil {
 				return err
 			}
 			at = next

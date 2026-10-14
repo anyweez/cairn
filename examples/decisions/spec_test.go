@@ -121,11 +121,10 @@ func messages(t *rapid.T, s State) Msg {
 type transition = spec.Transition[State, Msg, Result, Event, Effect]
 
 func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
-	msgs, results, events, effects := Codecs()
 	return spectest.Machine[State, Msg, Result, Event, Effect]{
 		Decider:   Decider,
 		Messages:  messages,
-		Codecs:    &spectest.Codecs[Msg, Result, Event, Effect]{Messages: msgs, Results: results, Events: events, Effects: effects},
+		Codecs:    Codecs(),
 		Snapshots: true,
 		Invariants: []spec.Invariant[State]{
 			{Rule: SettledCarriesOutcome, Check: func(s State) spec.Verdict {
@@ -157,11 +156,10 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 				return spec.Pass
 			}},
 		},
-		Laws: []spec.Law[State, Msg, Result, Event, Effect]{
-			fsm.Law[State, Msg, Result, Event, Effect](FollowsLifecycle, Lifecycle,
-				func(s State) Status { return s.Status }, Trigger),
-			{Rule: FreezeOnSettle, Check: func(t transition) spec.Verdict {
-				if t.Before.Status == Open || t.Before.Status == Uncreated {
+		Changes: []spec.Change[State, Msg]{
+			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, Trigger),
+			{Rule: FreezeOnSettle, Check: func(before State, m Msg, after State) spec.Verdict {
+				if before.Status == Open || before.Status == Uncreated {
 					return spec.NA
 				}
 				stances := func(s State) map[string]Position {
@@ -171,27 +169,29 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 					}
 					return out
 				}
-				return spec.Check(slices.Equal(t.Before.Options, t.After.Options) &&
-					maps.Equal(stances(t.Before), stances(t.After)),
-					"%T changed options or positions on a %s decision", t.Msg, t.Before.Status)
+				return spec.Check(slices.Equal(before.Options, after.Options) &&
+					maps.Equal(stances(before), stances(after)),
+					"%T changed options or positions on a %s decision", m, before.Status)
 			}},
-			{Rule: OutcomeNotRewritten, Check: func(t transition) spec.Verdict {
-				if t.Before.Outcome == nil || t.After.Outcome == nil {
+			{Rule: OutcomeNotRewritten, Check: func(before State, _ Msg, after State) spec.Verdict {
+				if before.Outcome == nil || after.Outcome == nil {
 					return spec.NA
 				}
-				return spec.Check(*t.Before.Outcome == *t.After.Outcome, "outcome went %+v → %+v", *t.Before.Outcome, *t.After.Outcome)
+				return spec.Check(*before.Outcome == *after.Outcome, "outcome went %+v → %+v", *before.Outcome, *after.Outcome)
 			}},
-			{Rule: ReopenClearsAnswers, Check: func(t transition) spec.Verdict {
-				if !t.Before.Status.Settled() || t.After.Status != Open {
+			{Rule: ReopenClearsAnswers, Check: func(before State, _ Msg, after State) spec.Verdict {
+				if !before.Status.Settled() || after.Status != Open {
 					return spec.NA
 				}
-				for member, p := range t.After.Positions {
+				for member, p := range after.Positions {
 					if p.Committed != nil {
 						return spec.Fail("%s's answer survived the reopen", member)
 					}
 				}
 				return spec.Pass
 			}},
+		},
+		Laws: []spec.Law[State, Msg, Result, Event, Effect]{
 			{Rule: OnlyDissentersAnswer, Check: func(t transition) spec.Verdict {
 				ack, ok := t.Msg.(Acknowledge)
 				if !ok || t.Decision.Refused() {
