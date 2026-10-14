@@ -11,16 +11,16 @@ import (
 )
 
 // Fails runs check against a recorder instead of the real test and returns the
-// failure it reported, if any. It is how a spec proves it has teeth: swap in a
+// first failure it reported, unshrunk, if any. It is how a spec proves it has teeth: swap in a
 // mutant Decider, and assert the check fails.
 //
 //	m := machine()
 //	m.Decider.Decide = mutant
 //	if _, failed := spectest.Fails(t, m.Check); !failed { t.Fatal("mutant survived") }
 //
-// Fails changes a process-wide rapid flag while it runs, so calls are
+// Fails changes process-wide rapid flags while it runs, so calls are
 // serialized; a parallel test running an ordinary Check at the same time only
-// loses its fail file.
+// loses its fail file and the shrinking of its counterexample.
 func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	t.Helper()
 	failsMu.Lock()
@@ -28,10 +28,15 @@ func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	// A mutant's failure is the expected outcome, not one to reproduce later:
 	// a saved fail file would be replayed against the next mutant of the same
 	// test name instead of letting it search.
-	if f := flag.Lookup("rapid.nofailfile"); f != nil {
-		previous := f.Value.String()
-		_ = f.Value.Set("true")
-		defer func() { _ = f.Value.Set(previous) }()
+	// Nor is it shrunk: callers ask whether and by which rule the check
+	// fails, which the first failing run already answers, and shrinking it
+	// costs seconds per mutant (tens of seconds under -race).
+	for name, value := range map[string]string{"rapid.nofailfile": "true", "rapid.shrinktime": "0s"} {
+		if f := flag.Lookup(name); f != nil {
+			previous := f.Value.String()
+			_ = f.Value.Set(value)
+			defer func() { _ = f.Value.Set(previous) }()
+		}
 	}
 	r := &recorder{TB: t}
 	func() {
