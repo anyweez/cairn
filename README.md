@@ -1,4 +1,4 @@
-<h1>
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cairn-logo-dark.svg">
     <img alt="cairn" src="docs/assets/cairn-logo-light.svg" height="64">
