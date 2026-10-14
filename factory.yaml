@@ -53,8 +53,8 @@ gate:
   note: >-
     gofmt, go vet, `go test -race ./...` with the ledger's Postgres-backed tests
     required rather than skipped, the manifest tool's vet and tests, and a check
-    that spec.manifest.yaml is current — the same steps as
-    .github/workflows/ci.yml's test job. Needs Docker for a throwaway
+    that spec.manifest.yaml is current. CI's test job runs this same script.
+    Needs Docker for a throwaway
     postgres:17-alpine unless CAIRN_TEST_DATABASE_URL points at a server. CI's
     PR-only checks (commit messages, stored types against the base branch) are
     not in it. Under a minute with a warm module cache

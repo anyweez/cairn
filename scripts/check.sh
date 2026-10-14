@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the same checks as CI's test job: gofmt, go vet, every test including
-# the ledger's Postgres-backed ones, the manifest tool, and manifest freshness.
+# The checks CI's test job runs: gofmt, go vet, every test including the
+# ledger's Postgres-backed ones, the manifest tool, and manifest freshness.
 #
 # Uses CAIRN_TEST_DATABASE_URL when it is set, and otherwise starts a
 # throwaway Postgres with scripts/test-postgres.sh (which needs Docker).
@@ -32,6 +32,12 @@ go -C cmd/cairn-manifest run . -dir ../..
 # status, not diff: it also catches a manifest that was never committed.
 if [ -n "$(git status --porcelain -- spec.manifest.yaml)" ]; then
   git diff -- spec.manifest.yaml
-  echo "spec.manifest.yaml is stale: run 'go -C cmd/cairn-manifest run . -dir ../..' and commit it" >&2
+  msg="spec.manifest.yaml is stale: run 'go -C cmd/cairn-manifest run . -dir ../..' and commit it"
+  # In GitHub Actions, an ::error:: line becomes an annotation on the run.
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::error::$msg"
+  else
+    echo "$msg" >&2
+  fi
   exit 1
 fi
