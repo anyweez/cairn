@@ -1,0 +1,25 @@
+{#- commitizen's default Markdown template, except that the first release
+    (the oldest entry) has no breaking-change section: nothing came before it
+    to break. -#}
+{% for entry in tree %}
+{% set first_release = loop.last %}
+
+## {{ entry.version }}{% if entry.date %} ({{ entry.date }}){% endif %}
+
+{% for change_key, changes in entry.changes.items() %}
+{% if not (first_release and change_key == "BREAKING CHANGE") %}
+
+{% if change_key %}
+### {{ change_key }}
+{% endif %}
+
+{% for change in changes %}
+{% if change.scope %}
+- **{{ change.scope }}**: {{ change.message }}
+{% elif change.message %}
+- {{ change.message }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endfor %}
