@@ -1,0 +1,45 @@
+name: Release
+
+# Pushing a vX.Y.Z tag publishes a GitHub Release whose notes are that
+# version's section of the changelog, built by commitizen from the commit
+# messages. The tag itself is the Go module version; this only adds the notes.
+# docs/RELEASING.md has the whole procedure.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: the tag is on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main; release only from main"
+            exit 1
+          fi
+      - name: notes
+        # cz changelog <tag> renders every version up to the tag, newest first;
+        # keep only the first section.
+        run: |
+          pipx run --spec commitizen==4.19.2 cz changelog "$GITHUB_REF_NAME" --dry-run |
+            awk '/^## /{n++} n==1' > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            echo "::error::no changelog section for $GITHUB_REF_NAME"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notes.md"
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --verify-tag
+          --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
