@@ -1,9 +1,14 @@
 ---
 name: cairn-release
 description: Cut a cairn release — compute the next semantic version from conventional commits, open a release PR with the regenerated CHANGELOG.md, and after approval merge it and push the vX.Y.Z tag that publishes the GitHub Release. Use when the user says "release cairn", "cut a release", "tag a version", "ship v0.x", or "/cairn-release".
+disable-model-invocation: true
 ---
 
 # Cut a cairn release
+
+Only a person cuts a release, in an interactive session where they invoked
+this skill themselves. In a factory run, or any session without a person
+answering, stop: don't run any step below.
 
 `docs/RELEASING.md` is the procedure and the versioning policy; read it
 first. This skill runs that procedure and adds the checks and approval stops

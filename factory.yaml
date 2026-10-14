@@ -18,6 +18,7 @@ rules:
   - "Never hand a caller a `pgx.Tx`, connection or pool to write with. A public API that writes inside a cairn transaction takes a `*ledger.Batch` (docs/CONVENTIONS.md)."
   - "Never add a round trip to `Handle`. `TestEachPathKeepsToItsRoundTrips` and cache_test.go hold the budgets; throughput over a slow database link is the priority."
   - "Commit messages are conventional commits (commitizen). CI checks every commit in a PR, and release notes are built from them."
+  - "Never cut a release. Don't create or push a tag, open a release/ branch or PR, run `cz bump` or `cz changelog` without --dry-run, edit CHANGELOG.md, or run the cairn-release skill. A person cuts every release; a task that asks for one is out of scope."
 
 scope:
   prefer:
@@ -153,6 +154,6 @@ docs:
     - path: docs/BENCHMARKS.md
       read_when: the change claims a throughput effect, or needs a measurement before and after
     - path: docs/RELEASING.md
-      read_when: the task cuts a release, or changes versioning, the changelog or the release workflow
+      read_when: the change touches versioning, commit-message conventions or the release workflow (releases themselves are cut by a person)
     - path: docs/ROADMAP.md
       read_when: the task names a roadmap item or an open question (redaction, refusals, effect ordering)

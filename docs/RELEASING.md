@@ -4,8 +4,10 @@ A cairn release is a `vX.Y.Z` tag on main. The tag is the Go module version,
 so a project pins cairn with `go get github.com/anyweez/cairn@vX.Y.Z`. There
 is no version file to edit.
 
-The `cairn-release` skill (`.claude/skills/cairn-release/`) runs the steps
-below and stops for approval before anything is merged or tagged.
+A person cuts every release; the factory never does (a rule in
+`factory.yaml`). The `cairn-release` skill (`.claude/skills/cairn-release/`)
+runs the steps below when a person invokes it with `/cairn-release`, and
+stops for approval before anything is merged or tagged.
 
 ## Versions
 
