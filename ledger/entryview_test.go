@@ -211,6 +211,27 @@ func TestAnEntryViewsRowsCanReferenceAViewsRows(t *testing.T) {
 	checkHistory(t, readHistory(t, agg), "a", 3)
 }
 
+// A live write can't know an entry's Position or TxID, so a rebuild must not
+// pass them either, or it could write rows a live write never would.
+func TestAnEntryViewSeesNoPositionLiveOrRebuilding(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	v := ledger.EntryView[counter, event]{Name: "positions",
+		Write: func(_ *ledger.Batch, _, _ ledger.Loaded[counter], e ledger.Entry, _ []event) error {
+			if e.Position != 0 || e.TxID != 0 {
+				return fmt.Errorf("entry %d has position %d, txid %d", e.Seq, e.Position, e.TxID)
+			}
+			return nil
+		}}
+	agg.EntryViews = []ledger.EntryView[counter, event]{v}
+	if _, err := agg.Handle(ctx, "a", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agg.RebuildEntries(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRebuildEntriesReplaysEveryEntry(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
