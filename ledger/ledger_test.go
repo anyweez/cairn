@@ -57,6 +57,10 @@ var counterDecider = cairn.Decider[counter, msg, int, event, effect]{
 
 func newCounter(t *testing.T) *ledger.Aggregate[counter, msg, int, event, effect] {
 	t.Helper()
+	return counterOn(ledgertest.NewStore(t))
+}
+
+func counterOn(store *ledger.Store) *ledger.Aggregate[counter, msg, int, event, effect] {
 	msgs := codec.New[msg]()
 	codec.Register[add](msgs, "add", 1)
 	events := codec.New[event]()
@@ -64,7 +68,7 @@ func newCounter(t *testing.T) *ledger.Aggregate[counter, msg, int, event, effect
 	effects := codec.New[effect]()
 	codec.Register[announce](effects, "announce", 1)
 	return &ledger.Aggregate[counter, msg, int, event, effect]{
-		Store: ledgertest.NewStore(t), Kind: "counter", Decider: counterDecider,
+		Store: store, Kind: "counter", Decider: counterDecider,
 		Messages: msgs, Events: events, Effects: effects,
 	}
 }
