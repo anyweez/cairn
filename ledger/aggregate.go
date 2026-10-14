@@ -215,8 +215,12 @@ var errUnchecked = errors.New("cairn: the message needs its idempotency key look
 // key in a round trip of its own first.
 //
 // An error is the transaction's, and nothing in it was recorded when the
-// database reported it (see retryable). Each request's own result says
-// whether its message was refused, a duplicate, or failed before it was sent.
+// database reported it (see retryable), or when a caller's own handler failed
+// before anything was sent. The one exception is a handler that fails in Go
+// reading a result from the batch that ends the transaction: it may already
+// have committed, and the error then wraps ErrRecorded. Each request's own
+// result says whether its message was refused, a duplicate, or failed before
+// it was sent.
 func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[M, R], cached *Loaded[S]) (results []result[R], before, after Loaded[S], err error) {
 	conn, err := a.Store.pool.Acquire(ctx)
 	if err != nil {
@@ -329,6 +333,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	if cached == nil {
 		b.own(commitStep, `COMMIT`)
 	}
+	// The cached batch is the connection's whole implicit transaction, and the
+	// uncached one closes the transaction the load batch began: either way the
+	// server commits it, whether or not a result can be read back.
+	b.commits = true
 	if err := b.send(ctx, conn); err != nil {
 		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, viewAt)
 	}

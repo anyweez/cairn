@@ -284,6 +284,12 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   included. A stored result is decoded through the `Results` codec's
   upcasters, so a retry gets the current shape; a field added since it was
   recorded comes back as its zero value unless the upcaster fills it in.
+- **Told when a message was recorded.** Every statement in a write batch runs
+  before the caller reads any result, so a handler can fail in Go — a scan or
+  a parse — after the transaction has committed. That error wraps
+  `ErrRecorded`, which says the message is in the ledger even though the
+  caller cannot be given its result. A caller must not replay it unless it
+  carries an idempotency key.
 - **Replay verification.** `Aggregate.Verify` re-decides every stored message
   with today's code and reports each divergence. State between messages comes
   from the stored events, so one divergence doesn't cascade. A stored result

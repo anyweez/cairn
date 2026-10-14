@@ -67,7 +67,8 @@ and its messages are recorded one transaction at a time:
   stored state, in two round trips. A failure that spoils a shared
   transaction is narrowed down by recording its messages one at a time. Only
   failures the database reported are retried. When it is unknown whether a
-  commit happened, the callers get the error.
+  commit happened, the callers get the error; when a batch's transaction is
+  known to have committed, the error wraps `ErrRecorded`.
 - **A stream other processes write too is read before each decision.** Every
   message shows whether the cached state would have been right. One decided
   from the cache either succeeds or goes stale; one read first finds the
