@@ -51,6 +51,29 @@ func emptyDatabase(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// After a rollback, an earlier build migrates a database a later release has
+// already migrated. It must leave the schema alone and start.
+func TestMigrateLeavesANewerSchemaAlone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	newer := len(migrations) + 1
+	if _, err := pool.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrating a database a later release migrated: %v", err)
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil || version != newer {
+		t.Fatalf("schema version %d, %v; want %d left as it was", version, err, newer)
+	}
+}
+
 // During a deploy, and after a rollback, processes on an earlier release run
 // their own statements against the newest schema. Every statement a release
 // sends against a cairn function must still work once every migration has run;

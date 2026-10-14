@@ -15,7 +15,7 @@ import (
 // A migration that has been released is never edited or reordered: databases
 // record how many have run, so a change would only reach a fresh one. Append
 // the next one instead. Processes on an earlier release keep running against
-// the newest schema during a deploy, so a
+// the newest schema during a deploy and after a rollback (see Migrate), so a
 // migration never changes the shape of a table, column or function an earlier
 // release reads; it adds alongside, and drops only once no supported release
 // reads it. TestEveryReleasesStatementsRunOnTheNewestSchema holds the
@@ -166,6 +166,10 @@ END $$;
 
 // Migrate brings the cairn schema up to date. It is safe to call from every
 // process at startup: concurrent callers serialize on an advisory lock.
+//
+// A database a later release has already migrated is left as it is, so an
+// earlier build still starts after a rollback: migrations only add, and never
+// change what an earlier release reads.
 func (s *Store) Migrate(ctx context.Context) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cairn.migrate'))`); err != nil {
@@ -182,9 +186,6 @@ CREATE TABLE IF NOT EXISTS cairn.schema_version (
 		var current int
 		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM cairn.schema_version`).Scan(&current); err != nil {
 			return fmt.Errorf("cairn: reading schema version: %w", err)
-		}
-		if current > len(migrations) {
-			return fmt.Errorf("cairn: database schema is at version %d, newer than this build's %d", current, len(migrations))
 		}
 		for v := current + 1; v <= len(migrations); v++ {
 			if _, err := tx.Exec(ctx, migrations[v-1]); err != nil {
