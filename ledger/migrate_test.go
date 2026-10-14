@@ -53,6 +53,7 @@ func emptyDatabase(t *testing.T) *pgxpool.Pool {
 // Entries written before a migration must read back after it. This builds a
 // database at version 1 by hand, with an entry in it, then migrates.
 func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 	if _, err := pool.Exec(ctx, `
@@ -99,6 +100,7 @@ WHERE stream = 'counter/a'`).Scan(&snapshot); err != nil {
 // statements against the newest schema. Every lock statement any release has
 // sent must still work once every migration has run.
 func TestEveryReleasesLockStatementsRunOnTheNewestSchema(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 	if err := New(pool, RequireActor(false)).Migrate(ctx); err != nil {

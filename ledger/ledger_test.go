@@ -76,6 +76,7 @@ func counterOn(store *ledger.Store) *ledger.Aggregate[counter, msg, int, event, 
 var ctx = context.Background()
 
 func TestHandleRecordsDecisionsAndRefusals(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 
 	if _, err := agg.Handle(ctx, "a", add{3, 10}); err != nil {
@@ -114,6 +115,7 @@ func TestHandleRecordsDecisionsAndRefusals(t *testing.T) {
 }
 
 func TestConcurrentHandlesOnOneStreamSerialize(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	var wg sync.WaitGroup
 	for range 20 {
@@ -143,6 +145,8 @@ func TestConcurrentHandlesOnOneStreamSerialize(t *testing.T) {
 // The global log must still hand out each stream's entries in seq order, or a
 // projection would fold a stream's history out of order.
 func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	ids := []string{"s0", "s1", "s2", "s3"}
 	var wg sync.WaitGroup
@@ -212,6 +216,8 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 // Transaction IDs order the log as numbers, including across a change in their
 // number of digits.
 func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	pool := agg.Store.Pool()
 	if _, err := agg.Handle(ctx, "first", add{1, 10}); err != nil {
@@ -257,6 +263,8 @@ func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 // An entry that commits after a later one must not be skipped by a reader that
 // has already moved its cursor past the later one.
 func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	appended, release, done := make(chan struct{}), make(chan struct{}), make(chan error)
 	go func() {
@@ -312,6 +320,7 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 }
 
 func TestLockMustComeBeforeAnyWrite(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
 		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE scratch (x int)`); err != nil {
@@ -328,6 +337,7 @@ func TestLockMustComeBeforeAnyWrite(t *testing.T) {
 }
 
 func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
 		if err := tx.Lock(ctx, agg.Stream("read"), agg.Stream("written")); err != nil {
@@ -365,6 +375,7 @@ func TestLockingAStreamDoesNotCreateIt(t *testing.T) {
 }
 
 func TestIdempotencyKeyAnswersARetryWithoutDecidingAgain(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	first, err := agg.Handle(ctx, "a", add{4, 10}, ledger.IdempotencyKey("req-1"))
 	if err != nil {
@@ -389,6 +400,7 @@ func TestIdempotencyKeyAnswersARetryWithoutDecidingAgain(t *testing.T) {
 }
 
 func TestSnapshotsAreUsedAndIgnoredWhenTheirVersionChanges(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.StateVersion, agg.SnapshotEvery = "v1", 2
 	for range 5 {
@@ -430,6 +442,7 @@ func TestSnapshotsAreUsedAndIgnoredWhenTheirVersionChanges(t *testing.T) {
 // each keep their own snapshot instead of evicting the other's and
 // re-snapshotting on every message.
 func TestSnapshotsOfDifferentVersionsCoexist(t *testing.T) {
+	t.Parallel()
 	v1 := newCounter(t)
 	v1.StateVersion, v1.SnapshotEvery = "v1", 3
 	v2 := *v1
@@ -462,6 +475,8 @@ func TestSnapshotsOfDifferentVersionsCoexist(t *testing.T) {
 }
 
 func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	pool := agg.Store.Pool()
 	if _, err := pool.Exec(ctx, `CREATE TABLE totals (stream text PRIMARY KEY, total int NOT NULL, entries int NOT NULL)`); err != nil {
@@ -537,6 +552,8 @@ func countSeen(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, eff
 // A statement that fails rolls back the whole batch of entries with the
 // checkpoint's advance, so the next catch-up starts from the same place.
 func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	projection := seenProjection(t, agg)
 	for _, id := range []string{"a", "a", "b"} {
@@ -573,6 +590,8 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 // checkpoint. The loser's writes, sent in the same round trip as its claim,
 // roll back with it, so every entry is applied once.
 func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
+	// Not parallel: the global log waits on open transactions in every database
+	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	projection := seenProjection(t, agg)
 	for _, id := range []string{"a", "b", "a", "c", "b"} {
@@ -613,6 +632,7 @@ func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
 }
 
 func TestOutboxRetriesUntilDelivered(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
 		t.Fatal(err)
@@ -652,6 +672,7 @@ func TestOutboxRetriesUntilDelivered(t *testing.T) {
 // A dispatcher whose lease ran out must not record an outcome for an effect
 // another dispatcher has since claimed.
 func TestAnExpiredClaimCannotRecordAnOutcome(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
 		t.Fatal(err)
@@ -696,6 +717,7 @@ FROM cairn.outbox`).Scan(&attempts, &done, &failed, &lastError); err != nil {
 // An effect whose dispatchers keep dying before recording an outcome is given
 // up on rather than claimed forever.
 func TestAnEffectClaimedTooOftenWithoutAnOutcomeIsFailed(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
 		t.Fatal(err)
@@ -724,6 +746,7 @@ func TestAnEffectClaimedTooOftenWithoutAnOutcomeIsFailed(t *testing.T) {
 }
 
 func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	for _, n := range []int{3, 4, 5} {
 		_, _ = agg.Handle(ctx, "a", add{n, 9}) // the 5 is refused: 12 passes 9
@@ -751,6 +774,7 @@ func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
 }
 
 func TestTheLibraryKeepsItsOwnGuarantees(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
 		t.Fatal(err)

@@ -54,6 +54,7 @@ func checkStream(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, e
 }
 
 func TestACachedStreamCostsOneRoundTrip(t *testing.T) {
+	t.Parallel()
 	agg, trips := tracedCounter(t, 1)
 	agg.StateVersion, agg.SnapshotEvery = "v1", 3
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
@@ -82,6 +83,7 @@ func TestACachedStreamCostsOneRoundTrip(t *testing.T) {
 // decision is never recorded: the message is decided again from the stored
 // state. (A cache ahead of the stream is tested inside the package.)
 func TestACacheNeverRecordsAgainstStaleState(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	// Another process: its own store, and its own cache.
 	other := counterOn(ledger.New(agg.Store.Pool(), ledger.RequireActor(false)))
@@ -104,6 +106,7 @@ func TestACacheNeverRecordsAgainstStaleState(t *testing.T) {
 }
 
 func TestMessagesArrivingTogetherShareATransaction(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 	const n = 60
@@ -140,6 +143,7 @@ func TestMessagesArrivingTogetherShareATransaction(t *testing.T) {
 // Messages recorded together are decided in order, each against the state
 // the ones before it left.
 func TestMessagesRecordedTogetherSeeTheOnesBeforeThem(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	hs, errs := handleAll(agg, "a", slices.Repeat([]msg{add{1, 10}}, 30))
 	accepted := 0
@@ -158,6 +162,7 @@ func TestMessagesRecordedTogetherSeeTheOnesBeforeThem(t *testing.T) {
 }
 
 func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	first, err := agg.Handle(ctx, "a", add{4, 10}, ledger.IdempotencyKey("k"))
 	if err != nil {
@@ -201,6 +206,8 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 // it shares with others. The others are then recorded one by one, and only
 // the message whose view fails is refused.
 func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
+	// Not parallel: sleeps order the writes, and load from other tests could
+	// reorder them.
 	agg := newCounter(t)
 	view := totalsView(t, agg)
 	var writes atomic.Int64
@@ -250,6 +257,8 @@ func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 // A transaction whose last message is a refusal writes its views as of the
 // last entry that changed the state, as Rebuild would.
 func TestAViewWrittenForSeveralMessagesHasTheSeqOfItsCause(t *testing.T) {
+	// Not parallel: sleeps order the writes, and load from other tests could
+	// reorder them.
 	agg := newCounter(t)
 	view := totalsView(t, agg)
 	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
@@ -281,6 +290,7 @@ func TestAViewWrittenForSeveralMessagesHasTheSeqOfItsCause(t *testing.T) {
 
 // The composable API records every entry of one transaction at one time.
 func TestOneTransactionsEntriesShareTheirRecordingTime(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	err := agg.Store.Transact(ctx, func(tx *ledger.Tx) error {
 		if err := tx.Lock(ctx, agg.Stream("a"), agg.Stream("b")); err != nil {
@@ -311,6 +321,7 @@ func TestOneTransactionsEntriesShareTheirRecordingTime(t *testing.T) {
 // A kind with a slash in it could name another kind's stream ("a/b" + "c" is
 // "a" + "b/c"). It is refused even when that stream is already cached.
 func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	if _, err := agg.Handle(ctx, "b/c", add{1, 10}); err != nil {
 		t.Fatal(err)
@@ -327,6 +338,7 @@ func TestAnInvalidKindIsRefusedOnACachedStream(t *testing.T) {
 // message was recorded, so that a retry without an idempotency key doesn't
 // record it twice.
 func TestAPanicAfterCommittingSaysTheMessageWasRecorded(t *testing.T) {
+	t.Parallel()
 	agg := newBasket(t, ledgertest.NewStore(t))
 	agg.Clone = func(basket) basket { panic("clone") }
 	_, err := agg.Handle(ctx, "a", put{"apple"})
@@ -339,6 +351,7 @@ func TestAPanicAfterCommittingSaysTheMessageWasRecorded(t *testing.T) {
 }
 
 func TestAPanickingDeciderReachesItsCaller(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.Decider.Decide = func(s counter, m msg) cairn.Decision[int, event, effect] {
 		if m.(add).N == 13 {
@@ -355,6 +368,7 @@ func TestAPanickingDeciderReachesItsCaller(t *testing.T) {
 }
 
 func TestACallerThatHasGivenUpIsNotRecorded(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	gone, cancel := context.WithCancel(ctx)
 	cancel()
@@ -365,6 +379,7 @@ func TestACallerThatHasGivenUpIsNotRecorded(t *testing.T) {
 }
 
 func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
+	t.Parallel()
 	agg := counterOn(ledgertest.NewStore(t, ledger.StateCacheSize(1)))
 	for i := range 6 {
 		for _, id := range []string{"a", "b", "c"} {
@@ -414,6 +429,7 @@ func newBasket(t *testing.T, store *ledger.Store) *ledger.Aggregate[basket, put,
 // The state Handle returns is a copy, so a caller that changes it changes
 // nothing the next decision sees.
 func TestACallerCannotChangeTheCachedState(t *testing.T) {
+	t.Parallel()
 	for _, how := range []string{"Clone", "StateVersion"} {
 		agg := newBasket(t, ledgertest.NewStore(t))
 		if how == "Clone" {
@@ -435,6 +451,7 @@ func TestACallerCannotChangeTheCachedState(t *testing.T) {
 // With no faithful way to copy its state, an aggregate's streams are not
 // cached: each message costs the two round trips it would with no cache.
 func TestAStateThatCannotBeCopiedIsNotCached(t *testing.T) {
+	t.Parallel()
 	pool, trips := tracedPool(t, 1)
 	agg := newBasket(t, ledger.New(pool, ledger.RequireActor(false)))
 	for i := range 4 {
@@ -454,6 +471,7 @@ func TestAStateThatCannotBeCopiedIsNotCached(t *testing.T) {
 // The cache notices, and reads the stream instead, so a message costs about
 // the two round trips it would with no cache rather than three.
 func TestAStreamSharedWithAnotherProcessCostsNoMoreThanWithoutACache(t *testing.T) {
+	t.Parallel()
 	agg, trips := tracedCounter(t, 1)
 	other := counterOn(ledger.New(agg.Store.Pool(), ledger.RequireActor(false)))
 
@@ -492,6 +510,7 @@ func TestAStreamSharedWithAnotherProcessCostsNoMoreThanWithoutACache(t *testing.
 // that doesn't route by stream: a write by one between two of the other's is
 // a matter of timing, and the cache must still cost no more than none.
 func TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache(t *testing.T) {
+	t.Parallel()
 	pool, trips := tracedPool(t, 2)
 	const each = 150
 	var wg sync.WaitGroup

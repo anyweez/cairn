@@ -39,6 +39,7 @@ func tracedPool(t *testing.T, conns int32) (*pgxpool.Pool, *tripCounter) {
 // per connection. These are the budgets with no state cache; the cache's are
 // in cache_test.go.
 func TestEachPathKeepsToItsRoundTrips(t *testing.T) {
+	t.Parallel()
 	agg, trips := tracedCounter(t, 1, ledger.StateCacheSize(0))
 	agg.StateVersion, agg.SnapshotEvery = "v1", 2
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
@@ -99,6 +100,7 @@ func TestEachPathKeepsToItsRoundTrips(t *testing.T) {
 // A view is written in the round trip that records its entry, so it is told
 // when the entry was recorded but not where in the log it landed.
 func TestAViewIsToldWhenItsEntryWasRecorded(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	var cause ledger.Entry
 	agg.Views = []ledger.View[counter]{{Name: "spy", Write: func(_ *ledger.Batch, _ ledger.Loaded[counter], c ledger.Entry) error {
@@ -129,6 +131,7 @@ func TestAViewIsToldWhenItsEntryWasRecorded(t *testing.T) {
 // A Handle that fails mid-transaction ends the transaction itself, so the pool
 // keeps the connection instead of closing it and opening another.
 func TestAFailedHandleKeepsItsConnection(t *testing.T) {
+	t.Parallel()
 	agg, _ := tracedCounter(t, 1)
 	if _, err := agg.Handle(ctx, "a", add{1, 10}); err != nil {
 		t.Fatal(err)
@@ -166,6 +169,7 @@ func TestAFailedHandleKeepsItsConnection(t *testing.T) {
 // A snapshot past its stream's seq can only come from damaged data. It is
 // ignored, by readers and writers alike, and state is folded from the start.
 func TestASnapshotAheadOfItsStreamIsIgnored(t *testing.T) {
+	t.Parallel()
 	agg := newCounter(t)
 	agg.StateVersion, agg.SnapshotEvery = "v1", 2
 	for range 3 {
