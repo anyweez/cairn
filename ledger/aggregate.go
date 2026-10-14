@@ -45,6 +45,10 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// produces events.
 	Views []View[S]
 
+	// EntryViews are written once for each entry with events, in the same
+	// transaction, after Views.
+	EntryViews []EntryView[S, Ev]
+
 	// Actor, when set, returns the actor a message itself names (its "by"
 	// field), which then fills Meta.Actor. A message whose metadata names a
 	// different actor is not recorded, so the two can never disagree.
@@ -220,6 +224,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	var (
 		cause  *Entry
 		viewAt Loaded[S]
+		// entryViews are the entry views' writes, sent after the views.
+		entryViews Batch
 	)
 	for i, r := range reqs {
 		switch {
@@ -237,9 +243,12 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		}
 		// Each message's statements join the batch only once all of them are
 		// queued, so one that fails leaves nothing of itself behind.
-		var one Batch
+		var one, ev Batch
 		seq := l.seqs[stream.String()]
-		finish, next, entry, err := a.queueEntry(&one, l, at, r.msg, r.o, r.meta, l.at)
+		finish, next, entry, events, err := a.queueEntry(&one, l, at, r.msg, r.o, r.meta, l.at)
+		if err == nil && len(events) > 0 {
+			err = a.queueEntryViews(&ev, at, next, *entry, events)
+		}
 		if err != nil {
 			l.seqs[stream.String()] = seq
 			results[i].err = err
@@ -251,6 +260,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			continue
 		}
 		b.merge(&one)
+		entryViews.merge(&ev)
 		if len(entry.Events) > 0 {
 			cause, viewAt = entry, next
 		}
@@ -272,6 +282,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
 	}
+	b.merge(&entryViews)
 	if cached == nil {
 		b.own(commitStep, `COMMIT`)
 	}
@@ -495,12 +506,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	if tx.locks != nil {
 		recordedAt = tx.locks.at
 	}
-	finish, next, entry, err := a.queueEntry(&b, tx.locks, *at, msg, o, meta, recordedAt)
+	finish, next, entry, events, err := a.queueEntry(&b, tx.locks, *at, msg, o, meta, recordedAt)
 	if err == nil {
 		err = a.queueSnapshot(&b, &next)
 	}
 	if err == nil && len(entry.Events) > 0 {
 		err = a.queueViews(&b, next, *entry)
+	}
+	if err == nil && len(events) > 0 {
+		err = a.queueEntryViews(&b, *at, next, *entry, events)
 	}
 	if err != nil {
 		// Nothing was sent, so the transaction can go on as if Apply hadn't
@@ -519,36 +533,37 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 
 // queueEntry decides msg against at and queues recording the decision as an
 // entry recorded at now, with its effects. next is the stream's state after
-// it; finish returns what was recorded, once the batch has run.
-func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[S, R], next Loaded[S], entry *Entry, err error) {
+// it; finish returns what was recorded, once the batch has run. events are
+// the decision's.
+func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[S, R], next Loaded[S], entry *Entry, events []Ev, err error) {
 	decision := a.Decider.Decide(at.State, msg)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
-		return nil, at, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
+		return nil, at, nil, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
 	}
 
 	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
 	if entry.Message, err = a.Messages.Encode(msg); err != nil {
-		return nil, at, nil, err
+		return nil, at, nil, nil, err
 	}
 	if entry.Events, err = a.Events.EncodeAll(decision.Events); err != nil {
-		return nil, at, nil, err
+		return nil, at, nil, nil, err
 	}
 	if entry.Effects, err = a.Effects.EncodeAll(decision.Effects); err != nil {
-		return nil, at, nil, err
+		return nil, at, nil, nil, err
 	}
 	if !decision.Refused() {
 		if a.Results == nil {
-			return nil, at, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+			return nil, at, nil, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
 		}
 		result, err := a.Results.Encode(decision.Result)
 		if err != nil {
-			return nil, at, nil, err
+			return nil, at, nil, nil, err
 		}
 		entry.Result = &result
 	}
 
 	if err := l.queueAppend(b, at.Stream, entry, now); err != nil {
-		return nil, at, nil, err
+		return nil, at, nil, nil, err
 	}
 	next = at
 	next.State = a.Decider.Fold(at.State, decision.Events)
@@ -556,7 +571,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 
 	return func() Handled[S, R] {
 		return Handled[S, R]{Entry: *entry, State: next.State, Result: decision.Result, Refusal: decision.Refusal}
-	}, next, entry, nil
+	}, next, entry, decision.Events, nil
 }
 
 // pendingDuplicate is the entry an idempotency key names, if any, as read by
