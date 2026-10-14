@@ -60,6 +60,19 @@ gate:
     PR-only checks (commit messages, stored types against the base branch) are
     not in it. Under a minute with a warm module cache
 
+# The ledger's Postgres. test-postgres.sh reuses a running container, so `up`
+# is safe to call again, and check.sh reuses the same one rather than starting
+# a second.
+fixtures:
+  up: scripts/test-postgres.sh
+  down: docker rm -f cairn-test-postgres
+  required_by_gate: true
+  note: >-
+    one Postgres 17 on 127.0.0.1:55871, user and password both `cairn`. Export
+    CAIRN_TEST_DATABASE_URL=postgres://cairn:cairn@127.0.0.1:55871/postgres?sslmode=disable
+    to run the ledger tests by hand; without it they skip. Each test creates
+    and drops its own database. Starts in a few seconds
+
 tools:
   - "`go doc <pkg>.<Symbol>`: a package's or symbol's API, for this module and its dependencies, without reading the source."
   - "`go test -short ./spec/... ./spectest/... ./blocks/... .`: the inner loop, no database needed."
