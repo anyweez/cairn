@@ -6,6 +6,21 @@ on:
   pull_request:
 
 jobs:
+  commits:
+    # Release notes are generated from commit messages, so every commit a PR
+    # brings in must be in commitizen (conventional commits) format. Merge
+    # commits are exempt.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: commit messages
+        run: >-
+          pipx run --spec commitizen==4.19.2 cz check
+          --rev-range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
   test:
     runs-on: ubuntu-latest
     services:
