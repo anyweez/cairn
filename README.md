@@ -60,6 +60,12 @@ Most subsystems are a decision core inside a CRUD shell. An issue's
 lifecycle belongs in cairn, and its comment text does not. Draw the line
 inside the subsystem, not around it.
 
+**Personal data.** Messages, events, effects, results and metadata must
+carry opaque identifiers, never personal data — cairn stores whatever it is
+given and can never delete it. The decision *about* the data belongs in
+cairn; the data itself stays in your own mutable tables, where ordinary
+deletion works. See [docs/REDACTION.md](docs/REDACTION.md).
+
 ## When not to use cairn
 
 - **CRUD with no rules:** profile fields, content bodies, settings.
@@ -67,8 +73,11 @@ inside the subsystem, not around it.
 - **Caches and derived data:** a projection's job, not a stream's.
 - **Mirrors of an external system**, where that system is the source of
   truth.
-- **Sessions, tokens and other data that must be deletable on demand.**
-  Entries are append-only, and there is no redaction path yet.
+- **The value of a session, token or other secret, or any personal data.**
+  Entries are append-only and are never redacted, so content stays in your
+  own mutable tables. A decision *about* it — issue, expire, revoke —
+  belongs in cairn, named by an opaque id. See
+  [docs/REDACTION.md](docs/REDACTION.md).
 - **High-frequency simulation:** game ticks, movement, physics, AI.
 
 For simulation, the rule is that **the simulation proposes and the ledger

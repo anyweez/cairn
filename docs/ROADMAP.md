@@ -44,11 +44,6 @@
 
 ## Open questions
 
-- **Redaction.** Entries are append-only, enforced by a trigger. Honouring a
-  deletion request needs a sanctioned path, either tombstoning an entry's
-  payloads or encrypting per subject and discarding the key. Which one should
-  the library offer, and should events be allowed to carry personal data at
-  all?
 - **Refusals advance the stream sequence.** Recording them is the point (they
   are the evidence for "this change would refuse N real requests"). A refused
   message to a stream that doesn't exist also creates that stream. But a
