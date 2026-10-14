@@ -1,6 +1,6 @@
 module example.com/good
 
-go 1.26.3
+go 1.26.0
 
 require github.com/anyweez/cairn v0.0.0
 

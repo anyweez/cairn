@@ -1,6 +1,6 @@
 module github.com/anyweez/cairn/cmd/cairn-manifest
 
-go 1.26.3
+go 1.26.0
 
 require (
 	go.yaml.in/yaml/v3 v3.0.5
