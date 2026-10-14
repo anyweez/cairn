@@ -351,8 +351,8 @@ INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
     nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15, $16)
 RETURNING position, txid::text`,
-		e.Stream, e.Kind, e.Seq, message, result, refusal, events, effects, key,
-		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra, e.RecordedAt)
+		e.Stream, e.Kind, e.Seq, jsonArg(message), jsonArg(result), jsonArg(refusal), jsonArg(events), jsonArg(effects), key,
+		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, jsonArg(extra), e.RecordedAt)
 
 	// Every effect in one statement, numbered from 0 in order.
 	if len(outbox) > 0 {
@@ -368,6 +368,16 @@ SELECT $1, $2, i - 1, $3, effect::jsonb FROM unnest($4::text[]) WITH ORDINALITY 
 	}
 	l.seqs[e.Stream] = e.Seq
 	return nil
+}
+
+// jsonArg passes encoded JSON to a json or jsonb parameter as text, or NULL
+// when there is none. Sent as []byte, it would reach the server as bytea under
+// pgx's simple protocol, which carries no parameter types, and fail to parse.
+func jsonArg(data []byte) any {
+	if data == nil {
+		return nil
+	}
+	return string(data)
 }
 
 func nonNil(envs []codec.Envelope) []codec.Envelope {

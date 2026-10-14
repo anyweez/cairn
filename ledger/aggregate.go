@@ -640,7 +640,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueSnapshot(b *Batch, at *Loaded[S]) erro
 	b.own(sqlStep("saving snapshot of "+at.Stream.String()), `
 INSERT INTO cairn.state_snapshots (stream, seq, version, state) VALUES ($1, $2, $3, $4)
 ON CONFLICT (stream, version) DO UPDATE SET seq = excluded.seq, state = excluded.state, taken_at = now()`,
-		at.Stream.String(), at.Seq, a.StateVersion, data)
+		at.Stream.String(), at.Seq, a.StateVersion, jsonArg(data))
 	at.snapshotSeq = at.Seq
 	return nil
 }
