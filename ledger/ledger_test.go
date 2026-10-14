@@ -463,6 +463,7 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	projection := ledger.Projection{
+		Store:     agg.Store,
 		Name:      "totals",
 		Kinds:     []string{"counter"},
 		BatchSize: 2,
@@ -483,13 +484,13 @@ ON CONFLICT (stream) DO UPDATE SET total = greatest(totals.total, $2), entries =
 			t.Fatal(err)
 		}
 	}
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 3 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 3 {
 		t.Fatalf("caught up %d, %v", n, err)
 	}
 	if _, err := agg.Handle(ctx, "b", add{2, 9}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 1 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 1 {
 		t.Fatalf("second catch-up applied %d, %v; only the new entry should be applied", n, err)
 	}
 
@@ -514,7 +515,7 @@ func seenProjection(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event
 		`CREATE TABLE seen (stream text NOT NULL, seq bigint NOT NULL, PRIMARY KEY (stream, seq))`); err != nil {
 		t.Fatal(err)
 	}
-	return ledger.Projection{Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
+	return ledger.Projection{Store: agg.Store, Name: "seen", Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
 		b.Queue(`INSERT INTO seen VALUES ($1, $2)`, e.Stream.String(), e.Seq)
 		return nil
 	}}
@@ -553,7 +554,7 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 		}
 		return nil
 	}
-	n, err := agg.Store.CatchUp(ctx, broken)
+	n, err := broken.CatchUp(ctx)
 	if n != 0 || err == nil || !strings.Contains(err.Error(), "projection seen at counter/a#2: statement 1:") {
 		t.Fatalf("want the failing entry and statement named, got %d, %v", n, err)
 	}
@@ -561,7 +562,7 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 		t.Fatalf("a failed batch left %d rows", got)
 	}
 
-	if n, err := agg.Store.CatchUp(ctx, projection); err != nil || n != 3 {
+	if n, err := projection.CatchUp(ctx); err != nil || n != 3 {
 		t.Fatalf("after the failure, caught up %d, %v; want all 3 from the start", n, err)
 	}
 }
@@ -594,7 +595,7 @@ func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
 	var total atomic.Int64
 	for range 2 {
 		wg.Go(func() {
-			n, err := agg.Store.CatchUp(ctx, projection)
+			n, err := projection.CatchUp(ctx)
 			if err != nil {
 				t.Error(err)
 			}
@@ -624,7 +625,7 @@ func TestOutboxRetriesUntilDelivered(t *testing.T) {
 	var delivered []string
 	failOnce := true
 	d := &ledger.Dispatcher[effect]{
-		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, Batch: 1,
+		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, BatchSize: 1,
 		Backoff: func(int) time.Duration { return 0 },
 		Handle: func(ctx context.Context, d ledger.Delivery[effect]) error {
 			if failOnce {

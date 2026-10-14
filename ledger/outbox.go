@@ -42,8 +42,8 @@ type Dispatcher[Ef any] struct {
 	// actor with ContextWithMeta when the handler acts as itself.
 	Handle func(ctx context.Context, d Delivery[Ef]) error
 
-	// Batch is how many effects one claim takes. Defaults to 20.
-	Batch int
+	// BatchSize is how many effects one claim takes. Defaults to 20.
+	BatchSize int
 	// Lease is how long one delivery may take before the effect is offered to
 	// another dispatcher. Defaults to a minute.
 	Lease time.Duration
@@ -65,7 +65,7 @@ type dispatchConfig struct {
 }
 
 func (d *Dispatcher[Ef]) config() dispatchConfig {
-	c := dispatchConfig{batch: d.Batch, lease: d.Lease, backoff: d.Backoff}
+	c := dispatchConfig{batch: d.BatchSize, lease: d.Lease, backoff: d.Backoff}
 	if c.batch <= 0 {
 		c.batch = 20
 	}
@@ -204,27 +204,10 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byt
 // Run drains the outbox every interval until ctx is done. An error ends it
 // unless OnError is set.
 func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		for {
-			n, err := d.DrainOnce(ctx)
-			if err != nil && ctx.Err() == nil {
-				if d.OnError == nil {
-					return err
-				}
-				d.OnError(err)
-			}
-			if err != nil || n == 0 {
-				break
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
-	}
+	return poll(ctx, interval, d.OnError, func(ctx context.Context) (bool, error) {
+		n, err := d.DrainOnce(ctx)
+		return n > 0, err
+	})
 }
 
 // caused is the metadata for a message recorded while carrying out d: the

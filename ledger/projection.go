@@ -21,7 +21,8 @@ import (
 // Apply directly, using ctx. It sees each entry at least once, and must be
 // idempotent.
 type Projection struct {
-	Name string
+	Store *Store
+	Name  string
 	// Kinds limits the projection to these stream kinds. Empty means all.
 	Kinds []string
 	Apply func(ctx context.Context, b *Batch, e Entry) error
@@ -33,7 +34,7 @@ type Projection struct {
 }
 
 // CatchUp applies every entry visible now, returning how many it applied.
-func (s *Store) CatchUp(ctx context.Context, p Projection) (int, error) {
+func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 	batch := p.BatchSize
 	if batch <= 0 {
 		batch = 100
@@ -41,7 +42,7 @@ func (s *Store) CatchUp(ctx context.Context, p Projection) (int, error) {
 	total := 0
 	for {
 		n := 0
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		err := pgx.BeginFunc(ctx, p.Store.pool, func(tx pgx.Tx) error {
 			// Read the batch before touching the checkpoint row: locking it gives
 			// this transaction an ID, and the log only shows entries older than
 			// every running transaction.
@@ -116,16 +117,33 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runner")
 
 // Run catches the projection up every interval until ctx is done. An error
-// ends it unless the projection sets OnError.
-func (s *Store) Run(ctx context.Context, p Projection, interval time.Duration) error {
+// ends it unless OnError is set.
+func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
+	return poll(ctx, interval, p.OnError, func(ctx context.Context) (bool, error) {
+		// CatchUp applies everything visible, so there is nothing to repeat.
+		_, err := p.CatchUp(ctx)
+		return false, err
+	})
+}
+
+// poll calls once every interval until ctx is done, and again at once while
+// once reports more to do. An error ends it unless onError is set, in which
+// case it is reported there and the next interval tries again.
+func poll(ctx context.Context, interval time.Duration, onError func(error), once func(context.Context) (bool, error)) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if _, err := s.CatchUp(ctx, p); err != nil && ctx.Err() == nil {
-			if p.OnError == nil {
-				return err
+		for {
+			again, err := once(ctx)
+			if err != nil && ctx.Err() == nil {
+				if onError == nil {
+					return err
+				}
+				onError(err)
 			}
-			p.OnError(err)
+			if err != nil || !again {
+				break
+			}
 		}
 		select {
 		case <-ctx.Done():
