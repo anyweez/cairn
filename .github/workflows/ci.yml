@@ -38,23 +38,11 @@ jobs:
           --health-retries 30
     env:
       CAIRN_TEST_DATABASE_URL: postgres://cairn:cairn@127.0.0.1:5432/postgres?sslmode=disable
-      # Fail, rather than skip, the ledger tests if the database is missing.
-      CAIRN_REQUIRE_DATABASE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "gofmt needed on:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: go vet
-        run: go vet ./...
       - name: skip disk syncs in the test database
         # Every test creates and drops a database, and each waits on the
         # runner's slow disk. Nothing here tests crash durability.
@@ -64,21 +52,10 @@ jobs:
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "ALTER SYSTEM SET full_page_writes = off" \
             -c "SELECT pg_reload_conf()"
-      - name: go test
-        run: go test -race ./...
-      - name: manifest tool
-        run: |
-          go -C cmd/cairn-manifest vet ./...
-          go -C cmd/cairn-manifest test ./...
-      - name: spec manifest is current
-        run: |
-          go -C cmd/cairn-manifest run . -dir ../..
-          # status, not diff: it also catches a manifest that was never committed.
-          if [ -n "$(git status --porcelain -- spec.manifest.yaml)" ]; then
-            git diff -- spec.manifest.yaml
-            echo "::error::spec.manifest.yaml is stale: run 'go -C cmd/cairn-manifest run . -dir ../..' and commit it"
-            exit 1
-          fi
+      - name: check
+        # gofmt, vet, every test, the manifest tool and manifest freshness. The
+        # same script is the factory's gate and the local pre-push check.
+        run: scripts/check.sh
       - name: stored types stay readable
         if: github.event_name == 'pull_request'
         run: |
