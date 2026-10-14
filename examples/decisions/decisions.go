@@ -452,7 +452,7 @@ func cloneMap[K comparable, V any](m map[K]V) map[K]V {
 
 // ---- codecs --------------------------------------------------------------------
 
-func Codecs() (*codec.Codec[Msg], *codec.Codec[Event], *codec.Codec[Effect]) {
+func Codecs() (*codec.Codec[Msg], *codec.Codec[Result], *codec.Codec[Event], *codec.Codec[Effect]) {
 	msgs := codec.New[Msg]()
 	codec.Register[Create](msgs, "decision.create", 1)
 	codec.Register[Edit](msgs, "decision.edit", 1)
@@ -462,6 +462,9 @@ func Codecs() (*codec.Codec[Msg], *codec.Codec[Event], *codec.Codec[Effect]) {
 	codec.Register[SetStatus](msgs, "decision.set_status", 1)
 	codec.Register[Supersede](msgs, "decision.supersede", 1)
 	codec.Register[Acknowledge](msgs, "decision.acknowledge", 1)
+
+	results := codec.New[Result]()
+	codec.Register[Result](results, "decision.result", 1)
 
 	events := codec.New[Event]()
 	codec.Register[Created](events, "decision.created", 1)
@@ -476,5 +479,5 @@ func Codecs() (*codec.Codec[Msg], *codec.Codec[Event], *codec.Codec[Effect]) {
 
 	effects := codec.New[Effect]()
 	codec.Register[IndexReferences](effects, "decision.index_references", 1)
-	return msgs, events, effects
+	return msgs, results, events, effects
 }

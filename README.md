@@ -88,7 +88,7 @@ different kind:
 | Package | What it is |
 |---|---|
 | `cairn` | `Decider`, `Decision`, `Refusal`. Business logic as two pure functions: `Decide` turns a state and a message into events and effects (or a refusal), and `Evolve` folds one event into the state. |
-| `codec` | Versioned JSON for messages, events and effects, with upcasters for old versions. |
+| `codec` | Versioned JSON for messages, results, events and effects, with upcasters for old versions. |
 | `ledger` | The Postgres shell. It takes per-stream locks, appends every decided message (refusals included) to an append-only log, queues effects in an outbox in the same transaction, runs projections over the global log, and re-decides stored history with `Verify`. |
 | `spec` / `spectest` | Rules (`Never` / `Can` / `Refines`, `Established` / `Proposed`) and a rapid-based checker. It holds every machine to the framework's own rules (deterministic, total, refusals carry nothing, no mutation of the given state, replayable) as well as to the machine's rules, and reports how often each rule actually applied. |
 | `blocks/fsm` | A lifecycle as a table of allowed transitions. `Decide` consults it, the spec enforces it, and review renders it. |
@@ -178,7 +178,7 @@ if err := store.Migrate(ctx); err != nil { ... }
 
 accounts := &ledger.Aggregate[Account, Msg, int, Event, Effect]{
 	Store: store, Kind: "account", Decider: Bank,
-	Messages: msgs, Events: events, Effects: effects, // codecs
+	Messages: msgs, Results: results, Events: events, Effects: effects, // codecs
 }
 
 // Usually set once per request, by middleware. Every entry needs an actor.
@@ -229,10 +229,15 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   transaction has finished, so a reader never skips past an entry that
   commits late.
 - **Safe retries.** `IdempotencyKey` returns the first answer, refusals
-  included.
+  included. A stored result is decoded through the `Results` codec's
+  upcasters, so a retry gets the current shape; a field added since it was
+  recorded comes back as its zero value unless the upcaster fills it in.
 - **Replay verification.** `Aggregate.Verify` re-decides every stored message
   with today's code and reports each divergence. State between messages comes
-  from the stored events, so one divergence doesn't cascade.
+  from the stored events, so one divergence doesn't cascade. A stored result
+  is upcast and compared on the fields it carries, so a field added to the
+  result since an entry was recorded is checked only when its upcaster can
+  fill it in.
 
 The library owns the `cairn` schema. Applications read from it through this
 package and never write to it directly.
@@ -248,7 +253,7 @@ Every machine is held to the framework's rules (D1–D7) in addition to its own:
 | D3 | A refusal carries no events or effects. |
 | D4 | Decide and Evolve never modify the state they're given. This catches a map shared between states. |
 | D5 | Folding a run's events from the initial state reproduces the run. |
-| D6 | Messages, events and effects survive their codecs (when codecs are given). |
+| D6 | Messages, accepted results, events and effects survive their codecs (when codecs are given). |
 | D7 | State survives a JSON snapshot round trip (when `Snapshots` is set). |
 
 Established rules fail the test with a shrunk counterexample. Proposed rules

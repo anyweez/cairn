@@ -37,14 +37,16 @@ var (
 	Replayable = spec.Rule{ID: "D5", Kind: spec.Never, Status: spec.Established,
 		Statement: "Folding a run's events from the initial state ends anywhere but where the run did."}
 	Encodable = spec.Rule{ID: "D6", Kind: spec.Never, Status: spec.Established,
-		Statement: "A message, event or effect does not survive encoding and decoding unchanged."}
+		Statement: "A message, result, event or effect does not survive encoding and decoding unchanged."}
 	Snapshottable = spec.Rule{ID: "D7", Kind: spec.Never, Status: spec.Established,
 		Statement: "A state does not survive a JSON snapshot round trip unchanged."}
 )
 
-// Codecs, when given, are round-tripped on every message, event and effect.
-type Codecs[M, Ev, Ef any] struct {
+// Codecs, when given, are round-tripped on every message, accepted result,
+// event and effect. A nil codec is not checked.
+type Codecs[M, R, Ev, Ef any] struct {
 	Messages *codec.Codec[M]
+	Results  *codec.Codec[R]
 	Events   *codec.Codec[Ev]
 	Effects  *codec.Codec[Ef]
 }
@@ -68,7 +70,7 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	// Steps caps the messages in one run. Defaults to 40.
 	Steps int
 
-	Codecs *Codecs[M, Ev, Ef]
+	Codecs *Codecs[M, R, Ev, Ef]
 
 	// Snapshots says the state is persisted as JSON, so it must round-trip.
 	Snapshots bool
@@ -223,6 +225,9 @@ func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), m
 		return
 	}
 	j(Encodable, roundTrip(m.Codecs.Messages, msg))
+	if !d.Refused() {
+		j(Encodable, roundTrip(m.Codecs.Results, d.Result))
+	}
 	for _, e := range d.Events {
 		j(Encodable, roundTrip(m.Codecs.Events, e))
 	}

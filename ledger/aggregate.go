@@ -24,6 +24,11 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	Messages *codec.Codec[M]
 	Events   *codec.Codec[Ev]
 	Effects  *codec.Codec[Ef]
+	// Results encodes what an accepted message returns. A single struct R
+	// registers as codec.Register[R, R]. A retry decodes its stored result
+	// through Results' upcasters, and Verify compares only the fields the
+	// upcast stored result carries (see Verify).
+	Results *codec.Codec[R]
 
 	// StateVersion names the shape of S as stored in snapshots. Change it
 	// whenever S changes shape; snapshots of any other version are ignored and
@@ -532,9 +537,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 		return nil, at, nil, err
 	}
 	if !decision.Refused() {
-		if entry.Result, err = json.Marshal(decision.Result); err != nil {
+		if a.Results == nil {
+			return nil, at, nil, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+		}
+		result, err := a.Results.Encode(decision.Result)
+		if err != nil {
 			return nil, at, nil, err
 		}
+		entry.Result = &result
 	}
 
 	if err := l.queueAppend(b, at.Stream, entry, now); err != nil {
@@ -578,12 +588,28 @@ func queueDuplicate(b *Batch, stream Stream, key string) *pendingDuplicate {
 // duplicateOf answers a retry with the entry that first answered it.
 func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry, state S) (Handled[S, R], error) {
 	h := Handled[S, R]{Entry: e, State: state, Refusal: e.Refusal, Duplicate: true}
-	if len(e.Result) > 0 {
-		if err := json.Unmarshal(e.Result, &h.Result); err != nil {
+	if e.Result != nil {
+		var err error
+		if h.Result, err = a.decodeResult(*e.Result); err != nil {
 			return Handled[S, R]{}, fmt.Errorf("cairn: decoding result of %s#%d: %w", e.Stream, e.Seq, err)
 		}
 	}
 	return h, nil
+}
+
+// decodeResult decodes a stored result through Results. One recorded before
+// results were versioned is unmarshalled as it was stored.
+func (a *Aggregate[S, M, R, Ev, Ef]) decodeResult(env codec.Envelope) (R, error) {
+	if env.Type == "" {
+		var r R
+		err := json.Unmarshal(env.Data, &r)
+		return r, err
+	}
+	if a.Results == nil {
+		var zero R
+		return zero, fmt.Errorf("cairn: %s has no Results codec", a.Kind)
+	}
+	return a.Results.Decode(env)
 }
 
 // queueSnapshot queues a snapshot of at when one is due.

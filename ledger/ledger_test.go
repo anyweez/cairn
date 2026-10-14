@@ -2,6 +2,7 @@ package ledger_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,9 +68,11 @@ func counterOn(store *ledger.Store) *ledger.Aggregate[counter, msg, int, event, 
 	codec.Register[added](events, "added", 1)
 	effects := codec.New[effect]()
 	codec.Register[announce](effects, "announce", 1)
+	results := codec.New[int]()
+	codec.Register[int](results, "total", 1)
 	return &ledger.Aggregate[counter, msg, int, event, effect]{
 		Store: store, Kind: "counter", Decider: counterDecider,
-		Messages: msgs, Events: events, Effects: effects,
+		Messages: msgs, Events: events, Effects: effects, Results: results,
 	}
 }
 
@@ -132,8 +135,8 @@ func TestConcurrentHandlesOnOneStreamSerialize(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, e := range entries {
-		if e.Seq != int64(i+1) || string(e.Result) != fmt.Sprint(i+1) {
-			t.Fatalf("entry %d: seq %d result %s; every handle must see the one before it", i, e.Seq, e.Result)
+		if e.Seq != int64(i+1) || string(e.Result.Data) != fmt.Sprint(i+1) {
+			t.Fatalf("entry %d: seq %d result %s; every handle must see the one before it", i, e.Seq, e.Result.Data)
 		}
 	}
 	if len(entries) != 20 {
@@ -489,7 +492,7 @@ func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
 		Apply: func(_ context.Context, b *ledger.Batch, e ledger.Entry) error {
 			total := 0
 			if e.Refusal == nil {
-				total = int(e.Result[0] - '0')
+				total = int(e.Result.Data[0] - '0')
 			}
 			b.Queue(`
 INSERT INTO totals VALUES ($1, $2, 1)
@@ -771,6 +774,106 @@ func TestVerifyReportsWhereTheCurrentDeciderDisagrees(t *testing.T) {
 		t.Fatalf("divergences: %v", divergences)
 	}
 	t.Log(divergences[0])
+}
+
+// Version 2 of the counter's result: the total gained the cap it was checked
+// against, and a v1 result can't say what that was.
+type totalV2 struct {
+	Total int `json:"total"`
+	Cap   int `json:"cap"`
+}
+
+func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	for _, n := range []int{3, 4} {
+		if _, err := agg.Handle(ctx, "a", add{n, 9}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The next release returns a struct, registered as version 2 of "total".
+	// Its upcaster can carry the total over but has to leave the cap out.
+	v2 := func(upcast codec.Upcaster, decide func(counter, add) totalV2) []ledger.Divergence {
+		results := codec.New[totalV2]()
+		codec.Register[totalV2](results, "total", 2)
+		results.Upcast("total", 1, upcast)
+		next := &ledger.Aggregate[counter, msg, totalV2, event, effect]{
+			Store: agg.Store, Kind: "counter", Messages: agg.Messages, Events: agg.Events, Effects: agg.Effects,
+			Results: results,
+			Decider: cairn.Decider[counter, msg, totalV2, event, effect]{
+				Initial: counterDecider.Initial,
+				Evolve:  counterDecider.Evolve,
+				Decide: func(s counter, m msg) cairn.Decision[totalV2, event, effect] {
+					d := decide(s, m.(add))
+					a := m.(add)
+					return cairn.Accept[totalV2, event, effect](d, []event{added{a.N}}, announce{s.Total + a.N})
+				},
+			},
+		}
+		divergences, err := next.Verify(ctx, "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return divergences
+	}
+	totalOnly := func(old json.RawMessage) (json.RawMessage, error) {
+		return []byte(`{"total":` + string(old) + `}`), nil
+	}
+	same := func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N, Cap: a.Cap} }
+
+	if d := v2(totalOnly, same); len(d) != 0 {
+		t.Errorf("a field the entries predate must not diverge: %v", d)
+	}
+	if d := v2(totalOnly, func(s counter, a add) totalV2 { return totalV2{Total: s.Total + a.N + 1} }); len(d) != 2 || d[0].Aspect != "result" {
+		t.Errorf("a field the entries carry must still be compared: %v", d)
+	}
+	// An upcaster that can fill the new field in has it checked: these
+	// entries say the cap was 10, and the decider says 9.
+	withCap := func(old json.RawMessage) (json.RawMessage, error) {
+		return []byte(`{"total":` + string(old) + `,"cap":10}`), nil
+	}
+	if d := v2(withCap, same); len(d) != 2 || d[0].Aspect != "result" {
+		t.Errorf("a field the upcaster fills in must be compared: %v", d)
+	}
+}
+
+// Results recorded before they were versioned are bare JSON. They still answer
+// retries and still verify.
+func TestAResultRecordedBeforeVersioningStillReads(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	if _, err := agg.Store.Pool().Exec(ctx, `
+INSERT INTO cairn.streams (stream, kind, seq) VALUES ('counter/a', 'counter', 1);
+INSERT INTO cairn.entries (stream, kind, seq, message, result, events, effects, idempotency_key)
+VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{"N":7,"Cap":9}}', '7',
+    '[{"type":"added","v":1,"data":{"N":7}}]', '[{"type":"announce","v":1,"data":{"Total":7}}]', 'req-1');`); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("%v %v", entries, err)
+	}
+	if r := entries[0].Result; r == nil || r.Type != "" || r.Version != 0 || string(r.Data) != "7" {
+		t.Fatalf("a bare result should read back as an untyped envelope: %+v", r)
+	}
+	again, err := agg.Handle(ctx, "a", add{7, 9}, ledger.IdempotencyKey("req-1"))
+	if err != nil || !again.Duplicate || again.Result != 7 {
+		t.Fatalf("retry: %+v %v", again, err)
+	}
+	if d, err := agg.Verify(ctx, "a"); err != nil || len(d) != 0 {
+		t.Fatalf("a bare result the decider agrees with must verify: %v %v", d, err)
+	}
+
+	// New entries on the same stream are versioned.
+	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = agg.Store.ReadStream(ctx, agg.Stream("a"), 1)
+	if err != nil || len(entries) != 1 || entries[0].Result.Type != "total" || entries[0].Result.Version != 1 {
+		t.Fatalf("%+v %v", entries, err)
+	}
 }
 
 func TestTheLibraryKeepsItsOwnGuarantees(t *testing.T) {

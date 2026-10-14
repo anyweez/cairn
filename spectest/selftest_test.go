@@ -123,7 +123,7 @@ func messages(t *rapid.T, a account) msg {
 	return withdraw{N: n}
 }
 
-func codecs() *spectest.Codecs[msg, event, effect] {
+func codecs() *spectest.Codecs[msg, int, event, effect] {
 	msgs := codec.New[msg]()
 	codec.Register[deposit](msgs, "deposit", 1)
 	codec.Register[withdraw](msgs, "withdraw", 1)
@@ -132,7 +132,9 @@ func codecs() *spectest.Codecs[msg, event, effect] {
 	codec.Register[withdrew](events, "withdrew", 1)
 	effects := codec.New[effect]()
 	codec.Register[lowBalance](effects, "low_balance", 1)
-	return &spectest.Codecs[msg, event, effect]{Messages: msgs, Events: events, Effects: effects}
+	results := codec.New[int]()
+	codec.Register[int](results, "balance", 1)
+	return &spectest.Codecs[msg, int, event, effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
 }
 
 // The fixture's own rules, built in functions because they are not cairn's:

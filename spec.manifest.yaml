@@ -29,7 +29,7 @@ rules:
   - id: D6
     kind: never
     status: established
-    statement: A message, event or effect does not survive encoding and decoding unchanged.
+    statement: A message, result, event or effect does not survive encoding and decoding unchanged.
     package: github.com/anyweez/cairn/spectest
   - id: D7
     kind: never
@@ -212,6 +212,12 @@ codecs:
       - 'with: string'
       - 'with_status: string'
       - 'with_superseded_by?: string'
+  - sum: github.com/anyweez/cairn/examples/decisions.Result
+    name: decision.result
+    version: 1
+    type: github.com/anyweez/cairn/examples/decisions.Result
+    fields:
+      - 'status: string'
 tables:
   - name: github.com/anyweez/cairn/examples/decisions.Lifecycle
     edges:

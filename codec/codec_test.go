@@ -42,6 +42,14 @@ func TestOldVersionsAreUpcastBeforeDecoding(t *testing.T) {
 	if err != nil || env.Version != 2 || env.Type != "square" {
 		t.Fatalf("encoded %+v, %v", env, err)
 	}
+
+	latest, err := c.Latest(codec.Envelope{Type: "square", Version: 1, Data: json.RawMessage(`{"side":3}`)})
+	if err != nil || string(latest) != `{"edge":3}` {
+		t.Fatalf("latest %s, %v", latest, err)
+	}
+	if _, err := c.Latest(codec.Envelope{Type: "square", Version: 3, Data: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("a version newer than the build has no latest form")
+	}
 }
 
 func TestDecodingRefusesWhatItCannotRead(t *testing.T) {
