@@ -8,8 +8,9 @@ package ledger_test
 //	go test ./ledger -run '^$' -bench Handle -benchtime 5s
 //
 // CAIRN_BENCH_RTT_MS picks the added round-trip times (default "0,2,5").
-// Besides ns/op, each reports msgs/s, p50 and p99 latency, round trips and
-// statements per message, and the round trip it measured before starting.
+// Each load runs with the state cache off, then on, suffixed /cache. Besides
+// ns/op, each reports msgs/s, p50 and p99 latency, round trips and statements
+// per message, and the round trip it measured before starting.
 
 import (
 	"bytes"
@@ -34,21 +35,39 @@ import (
 )
 
 type benchLoad struct {
-	name    string
-	callers int // goroutines calling Handle
-	pool    int // connections
-	hot     bool
+	name      string
+	callers   int // goroutines calling Handle
+	pool      int // connections
+	hot       bool
+	instances int  // stores, each with its own cache, as separate processes would have
+	cache     bool // with the store's state cache on
 }
 
-var benchLoads = []benchLoad{
+var benchLoads = withCache([]benchLoad{
 	// One caller on one stream: one message's full latency.
 	{name: "hot/callers=1", callers: 1, pool: 1, hot: true},
 	// Callers queued on one stream's lock: the most it can take.
 	{name: "hot/callers=8", callers: 8, pool: 8, hot: true},
+	// One stream's callers split between two processes, as an unrouted load
+	// balancer would leave them: each process's cache keeps going stale.
+	{name: "hot/callers=2/instances=2", callers: 2, pool: 2, hot: true, instances: 2},
+	// More callers split the same way: the stream's lock caps them however
+	// many there are, where routed to one process they'd share transactions.
+	{name: "hot/callers=8/instances=2", callers: 8, pool: 8, hot: true, instances: 2},
 	// A stream per caller and a connection per caller: no contention.
 	{name: "spread/callers=32/pool=32", callers: 32, pool: 32},
 	// The same callers on pgxpool's default size on a 4-CPU host.
 	{name: "spread/callers=32/pool=4", callers: 32, pool: 4},
+})
+
+// withCache adds a cached run of every load after it.
+func withCache(loads []benchLoad) []benchLoad {
+	out := slices.Clone(loads)
+	for _, l := range loads {
+		l.name, l.cache = l.name+"/cache", true
+		out = append(out, l)
+	}
+	return out
 }
 
 // BenchmarkHandle records messages shaped like an ordinary aggregate's:
@@ -99,9 +118,20 @@ func benchHandle(b *testing.B, proxyAddr string, load benchLoad) {
 	}
 	defer pool.Close()
 
-	agg := counterOn(ledger.New(pool, ledger.RequireActor(false)))
-	agg.StateVersion = "bench/1"
-	agg.Views = []ledger.View[counter]{totalsView(b, agg)}
+	opts := []ledger.StoreOption{ledger.RequireActor(false)}
+	if !load.cache {
+		opts = append(opts, ledger.StateCacheSize(0))
+	}
+	aggs := make([]*ledger.Aggregate[counter, msg, int, event, effect], max(load.instances, 1))
+	for i := range aggs {
+		aggs[i] = counterOn(ledger.New(pool, opts...))
+		aggs[i].StateVersion = "bench/1"
+		if i == 0 {
+			aggs[i].Views = []ledger.View[counter]{totalsView(b, aggs[0])}
+		} else {
+			aggs[i].Views = aggs[0].Views
+		}
+	}
 
 	stream := func(caller int) string {
 		if load.hot {
@@ -112,6 +142,7 @@ func benchHandle(b *testing.B, proxyAddr string, load benchLoad) {
 	var keys atomic.Int64
 	handle := func(caller int) {
 		key := ledger.IdempotencyKey(fmt.Sprintf("k%d", keys.Add(1)))
+		agg := aggs[caller%len(aggs)]
 		if _, err := agg.Handle(ctx, stream(caller), add{1, 1 << 30}, key); err != nil {
 			b.Error(err)
 		}

@@ -38,6 +38,13 @@ func (b *Batch) Queue(sql string, args ...any) {
 // Len is how many statements are queued.
 func (b *Batch) Len() int { return b.queued.Len() }
 
+// merge moves every statement queued on other to the end of b.
+func (b *Batch) merge(other *Batch) {
+	b.queued.QueuedQueries = append(b.queued.QueuedQueries, other.queued.QueuedQueries...)
+	b.items = append(b.items, other.items...)
+	*other = Batch{}
+}
+
 // own adds one of the ledger's own statements. handle reads its result, after
 // every statement before it has been read, and an error from handle is
 // returned as it is: handle wraps its own.

@@ -110,11 +110,65 @@ Next to the baseline:
 
 - **The slower the link, the bigger the gain:** 2.5× or less on a local
   connection, 5–8× at 3–6 ms.
-- **A hot stream now gains from more callers,** 1.6–1.8× instead of 1.3×. The
-  lock is held for about 1.5 of the 2 round trips, and none of that time
-  depends on how much a message writes.
-- **The pool still caps total throughput,** at about connections ÷ latency:
+- **A hot stream gains from more callers:** 1.6–1.8×, against 1.3× in the
+  baseline. The lock is held for about 1.5 of the 2 round trips, and none of
+  that time depends on how much a message writes.
+- **The pool caps total throughput,** at about connections ÷ latency:
   4 ÷ 9.2 ms ≈ 435/s, against 423/s measured. Pool size remains the setting
   that matters most for many streams.
 - **Tails are tighter.** No case's p99 was more than about twice its median
   except one `pool=4` run on the local connection.
+
+## With a state cache
+
+A store's state cache is on by default. The plain runs turn it off with
+`StateCacheSize(0)`, and the `/cache` runs leave it on. Both were measured
+from the same build, on 2026-10-13. Medians of three 5-second runs.
+
+| Measured RTT | Workload | 2 round trips | Cache | Gain | Round trips per message |
+|---|---|---|---|---|---|
+| 3 ms | `hot/callers=1` | 99/s (9.3 ms) | 170/s (6.0 ms) | 1.7× | 1.0 |
+| 3 ms | `hot/callers=8` | 154/s | 654/s | 4.3× | 0.25 |
+| 3 ms | `spread`, pool 32 | 2,863/s | 5,322/s | 1.9× | 1.0 |
+| 3 ms | `spread`, pool 4 | 422/s | 753/s | 1.8× | 1.0 |
+| 6 ms | `hot/callers=1` | 61/s (16 ms) | 105/s (9.7 ms) | 1.7× | 1.0 |
+| 6 ms | `hot/callers=8` | 110/s | 427/s | 3.9× | 0.25 |
+| 6 ms | `spread`, pool 32 | 2,014/s | 3,701/s | 1.8× | 1.0 |
+| 6 ms | `spread`, pool 4 | 258/s | 469/s | 1.8× | 1.0 |
+
+- **A cached stream costs one round trip,** so latency and the connections
+  each message holds both roughly halve.
+- **A hot stream gains most.** Eight callers on one stream are recorded about
+  four messages to a transaction (0.25 round trips per message). That's 4×
+  without the cache, and over 25× the 13-round-trip baseline.
+- **On the local connection, `spread` with pool 4 is too noisy to compare.**
+  Both paths swing between about 1,300/s and 3,200/s from run to run, with
+  p99s of 130–210 ms in the slow runs. The Docker VM's disk stalling under
+  that many commits is the likely cause. Every other local case improved
+  with the cache: 2,194/s against 907/s for the hot stream with 8 callers,
+  and 7,840/s against 5,601/s for 32 streams on 32 connections.
+
+### One stream written by two processes
+
+`hot/callers=2/instances=2` splits one stream's callers between two stores,
+each with its own cache, as two processes behind a load balancer that doesn't
+route by stream would be. Both write at once, so neither process's cache
+stays current.
+
+| Measured RTT | No cache | Cache | Round trips per message, cached |
+|---|---|---|---|
+| 0.1 ms | 934/s | 911/s | 2.0 |
+| 3 ms | 175/s | 167/s | 2.0 |
+| 6 ms | 116/s | 113/s | 2.0 |
+
+- **The cache costs about what no cache does here,** within 3–5% at the
+  median, about the run-to-run noise. Once it has seen that a stream's cached
+  state is right less than three times in four, it reads before deciding,
+  which is the uncached path.
+- **One matching read is not enough to trust the cache again.** With two
+  writers racing, a read finds the stream where the cache had it about half
+  the time by chance. A cache that trusted such a read would make about 2.5
+  round trips a message, and each failed attempt would also wait behind the
+  other process for the lock.
+  `TestAStreamTwoProcessesWriteAtOnceCostsNoMoreThanWithoutACache` holds the
+  cost to about 2.

@@ -12,7 +12,15 @@ import (
 
 // tracedCounter is a counter aggregate on its own pool of conns connections,
 // with every round trip counted.
-func tracedCounter(t *testing.T, conns int32) (*ledger.Aggregate[counter, msg, int, event, effect], *tripCounter) {
+func tracedCounter(t *testing.T, conns int32, opts ...ledger.StoreOption) (*ledger.Aggregate[counter, msg, int, event, effect], *tripCounter) {
+	t.Helper()
+	pool, trips := tracedPool(t, conns)
+	return counterOn(ledger.New(pool, append([]ledger.StoreOption{ledger.RequireActor(false)}, opts...)...)), trips
+}
+
+// tracedPool is a pool of conns connections to a fresh, migrated database,
+// with every round trip counted.
+func tracedPool(t *testing.T, conns int32) (*pgxpool.Pool, *tripCounter) {
 	t.Helper()
 	cfg := ledgertest.NewStore(t).Pool().Config().Copy()
 	trips := &tripCounter{}
@@ -23,14 +31,15 @@ func tracedCounter(t *testing.T, conns int32) (*ledger.Aggregate[counter, msg, i
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return counterOn(ledger.New(pool, ledger.RequireActor(false))), trips
+	return pool, trips
 }
 
 // Round trips are what a message costs over a network, so each path has a
 // budget. Every statement is prepared before counting: preparing is a one-off
-// per connection.
+// per connection. These are the budgets with no state cache; the cache's are
+// in cache_test.go.
 func TestEachPathKeepsToItsRoundTrips(t *testing.T) {
-	agg, trips := tracedCounter(t, 1)
+	agg, trips := tracedCounter(t, 1, ledger.StateCacheSize(0))
 	agg.StateVersion, agg.SnapshotEvery = "v1", 2
 	agg.Views = []ledger.View[counter]{totalsView(t, agg)}
 	key := ledger.IdempotencyKey

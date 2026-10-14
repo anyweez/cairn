@@ -11,9 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Entries written before a migration must read back after it. This builds a
-// database at version 1 by hand, with an entry in it, then migrates.
-func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
+// emptyDatabase creates a database with nothing in it, dropped when the test
+// ends. Tests inside the package use it, since ledgertest imports ledger.
+func emptyDatabase(t *testing.T) *pgxpool.Pool {
+	t.Helper()
 	url := os.Getenv("CAIRN_TEST_DATABASE_URL")
 	if url == "" {
 		if os.Getenv("CAIRN_REQUIRE_DATABASE") != "" {
@@ -28,7 +29,7 @@ func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
 	}
 	suffix := make([]byte, 6)
 	_, _ = rand.Read(suffix)
-	name := "cairn_upgrade_" + hex.EncodeToString(suffix)
+	name := "cairn_internal_" + hex.EncodeToString(suffix)
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,14 @@ func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
 		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
 		_ = admin.Close(context.Background())
 	})
+	return pool
+}
 
+// Entries written before a migration must read back after it. This builds a
+// database at version 1 by hand, with an entry in it, then migrates.
+func TestMigratingAPopulatedLedgerKeepsItsEntriesReadable(t *testing.T) {
+	ctx := context.Background()
+	pool := emptyDatabase(t)
 	if _, err := pool.Exec(ctx, `
 CREATE SCHEMA cairn;
 CREATE TABLE cairn.schema_version (version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());`); err != nil {
@@ -84,5 +92,33 @@ WHERE stream = 'counter/a'`).Scan(&snapshot); err != nil {
 	}
 	if snapshot != `v1@1 {"Total": 1}` {
 		t.Fatalf("snapshot %q, want it carried over unchanged", snapshot)
+	}
+}
+
+// During a rolling deploy, processes on an earlier release run their own
+// statements against the newest schema. Every lock statement any release has
+// sent must still work once every migration has run.
+func TestEveryReleasesLockStatementsRunOnTheNewestSchema(t *testing.T) {
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	if err := New(pool, RequireActor(false)).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []struct{ sql, release string }{
+		{`SELECT locked_stream, locked_seq, locked_at FROM cairn.lock_streams($1)`, "Handle in two round trips"},
+		{`SELECT locked_stream, locked_seq FROM cairn.lock_streams($1)`, "the state cache"},
+	} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := tx.Query(ctx, stmt.sql, []string{"counter/a"})
+		if err == nil {
+			_, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (any, error) { return r.Values() })
+		}
+		_ = tx.Rollback(ctx)
+		if err != nil {
+			t.Errorf("%s's lock statement fails on the newest schema: %v", stmt.release, err)
+		}
 	}
 }

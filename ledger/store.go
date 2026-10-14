@@ -31,6 +31,7 @@ import (
 type Store struct {
 	pool         *pgxpool.Pool
 	requireActor bool
+	cache        *stateCache
 }
 
 // StoreOption configures a Store.
@@ -40,9 +41,29 @@ type StoreOption func(*Store)
 // It is on by default, so every entry is attributed; tests turn it off.
 func RequireActor(required bool) StoreOption { return func(s *Store) { s.requireActor = required } }
 
+// DefaultStateCacheSize is how many streams' state a store keeps in memory
+// unless told otherwise.
+const DefaultStateCacheSize = 10_000
+
+// StateCacheSize sets how many streams' state the store keeps in memory
+// between messages, for every aggregate on it. Zero turns the cache off, and
+// Handle then reads every stream before deciding. See docs/PERFORMANCE.md.
+func StateCacheSize(streams int) StoreOption {
+	return func(s *Store) {
+		s.cache = nil
+		if streams > 0 {
+			s.cache = newStateCache(streams)
+		}
+	}
+}
+
 // New returns a store over pool. Call Migrate before first use.
+//
+// The store keeps the state of up to DefaultStateCacheSize streams in memory,
+// so that Handle can record a message to a stream it has recently recorded to
+// in one round trip; StateCacheSize changes that.
 func New(pool *pgxpool.Pool, opts ...StoreOption) *Store {
-	s := &Store{pool: pool, requireActor: true}
+	s := &Store{pool: pool, requireActor: true, cache: newStateCache(DefaultStateCacheSize)}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -75,7 +96,11 @@ type Entry struct {
 	Effects        []codec.Envelope
 	IdempotencyKey string
 	Meta           Meta
-	RecordedAt     time.Time
+	// RecordedAt is when the recording process recorded the entry, by its own
+	// clock: one transaction's entries share it. The log is ordered by TxID
+	// and Position, never by time, so clocks that differ between processes
+	// can't reorder it.
+	RecordedAt time.Time
 }
 
 // Cursor is a position in the global log.
@@ -99,12 +124,17 @@ type Tx struct {
 }
 
 // locks is what a transaction's Lock found: the seq of each stream it locked,
-// advanced as entries are queued, and the transaction's start time, which is
-// every entry's recorded_at.
+// advanced as entries are queued, and the recorded_at every entry the
+// transaction records shares.
 type locks struct {
 	seqs map[string]int64
 	at   time.Time
 }
+
+// recordingTime is the recorded_at of entries recorded now. It comes from
+// this process, not the database, so that it is known before the entry is
+// sent, and is cut to the microseconds Postgres keeps.
+func recordingTime() time.Time { return time.Now().Truncate(time.Microsecond) }
 
 // ErrNotLocked is returned when a transaction writes a stream it did not lock.
 var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
@@ -157,13 +187,13 @@ func queueLock(b *Batch, streams []Stream) (*locks, error) {
 	sorted = slices.CompactFunc(sorted, func(a, b Stream) bool { return a == b })
 	names := make([]string, len(sorted))
 	for i, st := range sorted {
-		if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
-			return nil, fmt.Errorf("cairn: invalid stream %q", st)
+		if err := validStream(st); err != nil {
+			return nil, err
 		}
 		names[i] = st.String()
 	}
 
-	l := &locks{seqs: make(map[string]int64, len(names))}
+	l := &locks{seqs: make(map[string]int64, len(names)), at: recordingTime()}
 	b.own(func(r pgx.BatchResults) error {
 		rows, err := r.Query()
 		if err == nil {
@@ -171,20 +201,53 @@ func queueLock(b *Batch, streams []Stream) (*locks, error) {
 				name string
 				seq  int64
 			)
-			_, err = pgx.ForEachRow(rows, []any{&name, &seq, &l.at}, func() error {
+			_, err = pgx.ForEachRow(rows, []any{&name, &seq}, func() error {
 				l.seqs[name] = seq
 				return nil
 			})
 		}
-		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "CN001" {
-			return errLockAfterWrite
-		}
-		if err != nil {
-			return fmt.Errorf("cairn: locking streams: %w", err)
-		}
-		return nil
-	}, `SELECT locked_stream, locked_seq, locked_at FROM cairn.lock_streams($1)`, names)
+		return lockError(err)
+	}, `SELECT locked_stream, locked_seq FROM cairn.lock_streams($1)`, names)
 	return l, nil
+}
+
+// errStale is cairn.lock_stream_at finding the stream moved on from the seq
+// its caller decided against.
+var errStale = errors.New("cairn: the stream has moved on")
+
+// queueLockAt queues taking one stream's lock on the condition that it is
+// still at seq, failing the batch with errStale otherwise.
+func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
+	if err := validStream(stream); err != nil {
+		return nil, err
+	}
+	b.own(func(r pgx.BatchResults) error {
+		_, err := r.Exec()
+		return lockError(err)
+	}, `SELECT cairn.lock_stream_at($1, $2)`, stream.String(), seq)
+	return &locks{seqs: map[string]int64{stream.String(): seq}, at: recordingTime()}, nil
+}
+
+// validStream refuses a stream whose name could be another's: the name joins
+// kind and ID with a slash, so a kind may not contain one.
+func validStream(st Stream) error {
+	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
+		return fmt.Errorf("cairn: invalid stream %q", st)
+	}
+	return nil
+}
+
+func lockError(err error) error {
+	var pgErr *pgconn.PgError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &pgErr) && pgErr.Code == "CN001":
+		return errLockAfterWrite
+	case errors.As(err, &pgErr) && pgErr.Code == "CN002":
+		return fmt.Errorf("%w: %w", errStale, err)
+	}
+	return fmt.Errorf("cairn: locking streams: %w", err)
 }
 
 func (l *locks) seq(stream Stream) (int64, error) {
@@ -201,15 +264,15 @@ func (l *locks) seq(stream Stream) (int64, error) {
 	return seq, nil
 }
 
-// queueAppend queues writing e at the next seq of a locked stream, advancing
-// the stream in l. e is filled in as far as it can be now, including
-// RecordedAt; its Position and TxID are filled in when the batch runs.
-func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry) error {
+// queueAppend queues writing e at the next seq of a locked stream, recorded
+// at at, advancing the stream in l. e is filled in as far as it can be now;
+// its Position and TxID are filled in when the batch runs.
+func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) error {
 	seq, err := l.seq(stream)
 	if err != nil {
 		return err
 	}
-	e.Stream, e.Kind, e.Seq, e.RecordedAt = stream.String(), stream.Kind, seq+1, l.at
+	e.Stream, e.Kind, e.Seq, e.RecordedAt = stream.String(), stream.Kind, seq+1, at
 
 	message, err := json.Marshal(e.Message)
 	if err != nil {
@@ -265,7 +328,7 @@ ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
 
 	b.own(func(r pgx.BatchResults) error {
 		var txid string
-		if err := r.QueryRow().Scan(&e.Position, &txid, &e.RecordedAt); err != nil {
+		if err := r.QueryRow().Scan(&e.Position, &txid); err != nil {
 			return fmt.Errorf("cairn: appending to %s: %w", stream, err)
 		}
 		var err error
@@ -273,12 +336,12 @@ ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq, updated_at = now()`,
 		return err
 	}, `
 INSERT INTO cairn.entries (stream, kind, seq, message, result, refusal, events, effects, idempotency_key,
-    actor, via, correlation_id, causation_id, occurred_at, extra)
+    actor, via, correlation_id, causation_id, occurred_at, extra, recorded_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-    nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15)
-RETURNING position, txid::text, recorded_at`,
+    nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), $14, $15, $16)
+RETURNING position, txid::text`,
 		e.Stream, e.Kind, e.Seq, message, nullJSON(e.Result), refusal, events, effects, key,
-		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra)
+		e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID, occurred, extra, e.RecordedAt)
 
 	// Every effect in one statement, numbered from 0 in order.
 	if len(outbox) > 0 {
