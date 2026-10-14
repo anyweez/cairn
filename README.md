@@ -1,4 +1,9 @@
-# cairn
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cairn-logo-dark.svg">
+    <img alt="cairn" src="docs/assets/cairn-logo-light.svg" height="64">
+  </picture>
+</h1>
 
 An opinionated Go library for state machines that keep a ledger and are
 checked against a spec.
