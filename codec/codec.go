@@ -9,9 +9,11 @@ package codec
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 )
 
 // Envelope is one encoded value as the ledger stores it.
@@ -161,6 +163,120 @@ func (c *Codec[T]) DecodeAll(envs []Envelope) ([]T, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// Registration identifies one type a Codec holds: the sum type's Go identity,
+// the name it is stored under, its current version, and the versions that have
+// an upcaster to the next one.
+type Registration struct {
+	Sum     string
+	Name    string
+	Version int
+	Upcasts []int
+}
+
+// Registrations returns every type registered with c, sorted by sum type and
+// name. It is the runtime half of the check against a generated manifest: a
+// test compares what a program's codecs actually registered with what the
+// static extractor wrote, so an upcaster that never runs, or a registration the
+// extractor missed, fails there instead of when an old entry is decoded.
+func (c *Codec[T]) Registrations() []Registration {
+	sum := goTypeString(reflect.TypeFor[T]())
+	out := make([]Registration, 0, len(c.byName))
+	for _, e := range c.byName {
+		ups := make([]int, 0, len(e.upcasters))
+		for v := range e.upcasters {
+			ups = append(ups, v)
+		}
+		slices.Sort(ups)
+		out = append(out, Registration{Sum: sum, Name: e.name, Version: e.version, Upcasts: ups})
+	}
+	sortRegistrations(out)
+	return out
+}
+
+// CheckRegistrations reports every difference between the codecs a manifest
+// lists and the codecs a program built. want is the manifest's list, got the
+// built codecs'. It returns one message per difference, sorted; an empty
+// result means they agree.
+func CheckRegistrations(want, got []Registration) []string {
+	w, g := registrationMap(want), registrationMap(got)
+	var problems []string
+	for k, r := range w {
+		o, ok := g[k]
+		switch {
+		case !ok:
+			problems = append(problems, fmt.Sprintf("%s (%s) is in the manifest but not registered by the codecs", r.Name, r.Sum))
+			continue
+		case r.Version != o.Version:
+			problems = append(problems, fmt.Sprintf("%s (%s) is version %d in the manifest but version %d in the codecs", r.Name, r.Sum, r.Version, o.Version))
+			continue
+		}
+		for _, v := range r.Upcasts {
+			if !slices.Contains(o.Upcasts, v) {
+				problems = append(problems, fmt.Sprintf("%s (%s) has an upcaster from version %d in the manifest but not in the codecs", r.Name, r.Sum, v))
+			}
+		}
+		for _, v := range o.Upcasts {
+			if !slices.Contains(r.Upcasts, v) {
+				problems = append(problems, fmt.Sprintf("%s (%s) has an upcaster from version %d in the codecs but not in the manifest", r.Name, r.Sum, v))
+			}
+		}
+	}
+	for k, r := range g {
+		if _, ok := w[k]; !ok {
+			problems = append(problems, fmt.Sprintf("%s (%s) is registered by the codecs but not in the manifest", r.Name, r.Sum))
+		}
+	}
+	slices.Sort(problems)
+	return problems
+}
+
+func registrationMap(rs []Registration) map[string]Registration {
+	m := make(map[string]Registration, len(rs))
+	for _, r := range rs {
+		m[r.Sum+"\x00"+r.Name] = r
+	}
+	return m
+}
+
+func sortRegistrations(rs []Registration) {
+	slices.SortFunc(rs, func(a, b Registration) int {
+		return cmp.Or(cmp.Compare(a.Sum, b.Sum), cmp.Compare(a.Name, b.Name))
+	})
+}
+
+// goTypeString renders a runtime type as go/types does for the manifest: a
+// named type with its full import path, a basic type by name.
+func goTypeString(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + goTypeString(t.Elem())
+	case reflect.Slice:
+		return "[]" + goTypeString(t.Elem())
+	case reflect.Array:
+		return fmt.Sprintf("[%d]%s", t.Len(), goTypeString(t.Elem()))
+	case reflect.Map:
+		return "map[" + goTypeString(t.Key()) + "]" + goTypeString(t.Elem())
+	}
+	if t.Name() == "" {
+		return t.String()
+	}
+	if t.PkgPath() == "" {
+		return t.Name()
+	}
+	return t.PkgPath() + "." + t.Name()
+}
+
+// Registrations returns the registrations of all four codecs, sorted.
+func (s *Set[M, R, Ev, Ef]) Registrations() []Registration {
+	codecs := []interface{ Registrations() []Registration }{s.Messages, s.Results, s.Events, s.Effects}
+	var out []Registration
+	for _, c := range codecs {
+		out = append(out, c.Registrations()...)
+	}
+	sortRegistrations(out)
+	return out
 }
 
 // Set is the four codecs a Decider's values are stored through: its messages,
