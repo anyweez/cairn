@@ -194,6 +194,9 @@ never by time.
 
 During a rolling deploy:
 
+- **Schema:** `Migrate` leaves alone a schema that a later release has
+  already migrated, so old code keeps starting during the rollout and after
+  a rollback. Migrations only add; none changes what an earlier release reads.
 - **Snapshots:** they are kept per `StateVersion`, so old and new code don't
   evict each other's.
 - **New versions:** a new message or event version that new code writes

@@ -838,44 +838,6 @@ func TestVerifyComparesTheFieldsAStoredResultCarries(t *testing.T) {
 	}
 }
 
-// Results recorded before they were versioned are bare JSON. They still answer
-// retries and still verify.
-func TestAResultRecordedBeforeVersioningStillReads(t *testing.T) {
-	t.Parallel()
-	agg := newCounter(t)
-	if _, err := agg.Store.Pool().Exec(ctx, `
-INSERT INTO cairn.streams (stream, kind, seq) VALUES ('counter/a', 'counter', 1);
-INSERT INTO cairn.entries (stream, kind, seq, message, result, events, effects, idempotency_key)
-VALUES ('counter/a', 'counter', 1, '{"type":"add","v":1,"data":{"N":7,"Cap":9}}', '7',
-    '[{"type":"added","v":1,"data":{"N":7}}]', '[{"type":"announce","v":1,"data":{"Total":7}}]', 'req-1');`); err != nil {
-		t.Fatal(err)
-	}
-
-	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("%v %v", entries, err)
-	}
-	if r := entries[0].Result; r == nil || r.Type != "" || r.Version != 0 || string(r.Data) != "7" {
-		t.Fatalf("a bare result should read back as an untyped envelope: %+v", r)
-	}
-	again, err := agg.Handle(ctx, "a", add{7, 9}, ledger.IdempotencyKey("req-1"))
-	if err != nil || !again.Duplicate || again.Result != 7 {
-		t.Fatalf("retry: %+v %v", again, err)
-	}
-	if d, err := agg.Verify(ctx, "a"); err != nil || len(d) != 0 {
-		t.Fatalf("a bare result the decider agrees with must verify: %v %v", d, err)
-	}
-
-	// New entries on the same stream are versioned.
-	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
-		t.Fatal(err)
-	}
-	entries, err = agg.Store.ReadStream(ctx, agg.Stream("a"), 1)
-	if err != nil || len(entries) != 1 || entries[0].Result.Type != "total" || entries[0].Result.Version != 1 {
-		t.Fatalf("%+v %v", entries, err)
-	}
-}
-
 func TestTheLibraryKeepsItsOwnGuarantees(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)

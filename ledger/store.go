@@ -90,9 +90,7 @@ type Entry struct {
 	Kind     string
 	Seq      int64
 	Message  codec.Envelope
-	// Result is nil when the message was refused. A result recorded before
-	// results were versioned reads back as an envelope with an empty Type and
-	// Version 0, holding the bare JSON as its Data.
+	// Result is nil when the message was refused.
 	Result         *codec.Envelope
 	Refusal        *cairn.Refusal
 	Events         []codec.Envelope
@@ -143,6 +141,10 @@ func recordingTime() time.Time { return time.Now().Truncate(time.Microsecond) }
 var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
 
 // Transact runs fn in a transaction, committing if it returns nil.
+//
+// fn may run its own statements on tx, such as claiming a number from an
+// application table, but nothing that writes may come before tx.Lock: Lock
+// refuses a transaction that has already written (see Lock).
 func (s *Store) Transact(ctx context.Context, fn func(tx *Tx) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(ptx pgx.Tx) error {
 		return fn(&Tx{Tx: ptx})
@@ -382,16 +384,6 @@ const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, mess
 coalesce(idempotency_key, ''), recorded_at,
 coalesce(actor, ''), coalesce(via, ''), coalesce(correlation_id, ''), coalesce(causation_id, ''), occurred_at, extra`
 
-// scanResult reads a stored result: an envelope, or the bare JSON of a result
-// recorded before results were versioned.
-func scanResult(raw []byte) *codec.Envelope {
-	var env codec.Envelope
-	if json.Unmarshal(raw, &env) == nil && env.Type != "" && env.Version >= 1 && env.Data != nil {
-		return &env
-	}
-	return &codec.Envelope{Data: raw}
-}
-
 func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	defer rows.Close()
 	var out []Entry
@@ -437,7 +429,10 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 			}
 		}
 		if result != nil {
-			e.Result = scanResult(result)
+			e.Result = &codec.Envelope{}
+			if err := json.Unmarshal(result, e.Result); err != nil {
+				return nil, fmt.Errorf("cairn: %s#%d result: %w", e.Stream, e.Seq, err)
+			}
 		}
 		out = append(out, e)
 	}
