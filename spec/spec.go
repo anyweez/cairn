@@ -17,7 +17,9 @@ import (
 	"github.com/anyweez/cairn"
 )
 
-// Kind says what sort of promise a rule makes.
+// Kind says what sort of promise a rule makes. It is for the reader and the
+// manifest: the checker treats every rule alike, except that a rule checked
+// by a reference model must be Refines, and no other rule may be.
 type Kind int
 
 const (
@@ -117,10 +119,20 @@ type Transition[S, M, R, Ev, Ef any] struct {
 	After    S
 }
 
-// Law checks a rule against one transition.
+// Law checks a rule against one transition, decision included.
 type Law[S, M, R, Ev, Ef any] struct {
 	Rule  Rule
 	Check func(Transition[S, M, R, Ev, Ef]) Verdict
+}
+
+// Change checks a rule against one state change: the state before a message,
+// the message, and the state after. It is a Law that needs nothing from the
+// decision, and most rules about a lifecycle are one. Its type parameters are
+// inferred from the check, which a Law's cannot be, so a helper such as
+// fsm.Law needs none spelled out.
+type Change[S, M any] struct {
+	Rule  Rule
+	Check func(before S, msg M, after S) Verdict
 }
 
 // Invariant checks a rule against one state. Every state reached is checked,

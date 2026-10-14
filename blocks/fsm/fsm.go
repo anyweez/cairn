@@ -74,24 +74,23 @@ func (t Table[St, On]) Mermaid() string {
 }
 
 // Law is the rule a table implies: a stream's state changes only along an
-// edge, for the message that edge names. The leading type parameters are the
-// machine's and must be given; the table's are inferred.
+// edge, for the message that edge names. Every type parameter is inferred.
 //
-//	fsm.Law[State, Msg, Result, Event, Effect](rule, table, statusOf, triggerOf)
-func Law[S, M, R, Ev, Ef any, St, On comparable](
+//	fsm.Law(rule, table, statusOf, triggerOf)
+func Law[S, M any, St, On comparable](
 	rule spec.Rule,
 	table Table[St, On],
 	state func(S) St,
 	trigger func(M) On,
-) spec.Law[S, M, R, Ev, Ef] {
-	return spec.Law[S, M, R, Ev, Ef]{
+) spec.Change[S, M] {
+	return spec.Change[S, M]{
 		Rule: rule,
-		Check: func(tr spec.Transition[S, M, R, Ev, Ef]) spec.Verdict {
-			from, to := state(tr.Before), state(tr.After)
+		Check: func(before S, msg M, after S) spec.Verdict {
+			from, to := state(before), state(after)
 			if from == to {
 				return spec.NA
 			}
-			on := trigger(tr.Msg)
+			on := trigger(msg)
 			return spec.Check(table.Allows(from, on, to), "%v moved %v → %v, which the table does not allow", on, from, to)
 		},
 	}
