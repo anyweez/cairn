@@ -3,4 +3,7 @@ name = "cz_conventional_commits"
 tag_format = "v$version"
 version_scheme = "semver2"
 version_provider = "scm"
+# Below v1.0.0 a breaking change bumps the minor version. Leaving v0 is a
+# deliberate decision, never a side effect of a `!` commit.
+major_version_zero = true
 update_changelog_on_bump = true
