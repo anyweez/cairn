@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"sort"
 )
 
 // Envelope is one encoded value as the ledger stores it.
@@ -162,21 +161,4 @@ func (c *Codec[T]) DecodeAll(envs []Envelope) ([]T, error) {
 		out = append(out, v)
 	}
 	return out, nil
-}
-
-// Type describes one registered type, for manifests and review tooling.
-type Type struct {
-	Name    string
-	Version int
-	Go      string
-}
-
-// Types lists the registered types by name.
-func (c *Codec[T]) Types() []Type {
-	out := make([]Type, 0, len(c.byName))
-	for _, e := range c.byName {
-		out = append(out, Type{Name: e.name, Version: e.version, Go: e.typ.String()})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
