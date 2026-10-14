@@ -20,6 +20,11 @@ import (
 // current state with no checkpoint. A read model that combines streams
 // (counts, totals) needs a Projection.
 //
+// A view is written once per transaction, as of the transaction's last entry
+// with events, and a transaction can record several of a stream's messages.
+// So a view can't keep a row per entry; a history (a timeline, an audit trail)
+// needs an EntryView.
+//
 // cause is the stream's latest entry with events, the one that produced at.
 // Read who changed the stream and when from it (cause.Meta.Actor,
 // cause.RecordedAt) for display columns like updated_by. A fact a decision

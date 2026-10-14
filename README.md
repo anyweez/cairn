@@ -212,6 +212,13 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   write, for display columns like `updated_by`. Views queue their statements
   in a `Batch` rather than running them, so they go out with the message's
   own writes and add no round trip (see [docs/CONVENTIONS.md](docs/CONVENTIONS.md)).
+- **History in the same transaction.** A view is written once per
+  transaction, so it can't keep a row per entry. An aggregate's `EntryViews`
+  can: each is called once for every entry with events, with the state before
+  and after it and its events, and writes in the same batch, after the views.
+  That fits a timeline or an audit trail the page shows as soon as the write
+  returns. Rows keyed by the entry make it safe to run again, and
+  `Aggregate.RebuildEntries` replays every entry through it.
 - **Every entry is attributed.** Each entry records who sent the message
   (`Actor`), through what (`Via`), the flow it belongs to (`CorrelationID`),
   what directly caused it (`CausationID`) and when the producer says it
