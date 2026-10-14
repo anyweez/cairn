@@ -193,8 +193,10 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
 
 ## What the ledger guarantees
 
-- **One transaction per message.** A decided message, its events, its effects,
-  its snapshot and its views commit together, or none of them do.
+- **Atomic messages.** A decided message, its events, its effects, its
+  snapshot and its views commit together, or none of them do. Messages that
+  arrive together for one stream may share a transaction; each caller returns
+  once its own message has committed.
 - **Read your own writes.** An aggregate's `Views` are written from the
   stream's new state inside that transaction, so a caller that writes and then
   reads a view table sees its write. A view replaces a stream's rows from its
@@ -203,8 +205,8 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   Read models that combine streams use a projection instead, which is
   eventually consistent. A view is also handed the entry that caused the
   write, for display columns like `updated_by`. Views queue their statements
-  in a `Batch` rather than running them, so all of them cost one round trip
-  while the stream is locked (see [docs/CONVENTIONS.md](docs/CONVENTIONS.md)).
+  in a `Batch` rather than running them, so they go out with the message's
+  own writes and add no round trip (see [docs/CONVENTIONS.md](docs/CONVENTIONS.md)).
 - **Every entry is attributed.** Each entry records who sent the message
   (`Actor`), through what (`Via`), the flow it belongs to (`CorrelationID`),
   what directly caused it (`CausationID`) and when the producer says it
