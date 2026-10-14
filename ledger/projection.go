@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Projection folds the global log into something else — a read model table,
@@ -68,9 +67,13 @@ func (s *Store) CatchUp(ctx context.Context, p Projection) (int, error) {
 			// Claim the checkpoint, first in the batch. Another runner of the same
 			// projection that got here first has moved it; give up this batch,
 			// and roll back what the rest of it wrote, rather than apply twice.
-			b := Batch{owner: checkpointOwner}
-			b.queueChecked(func(tag pgconn.CommandTag) error {
-				if tag.RowsAffected() == 0 {
+			var b Batch
+			b.own(func(r pgx.BatchResults) error {
+				tag, err := r.Exec()
+				switch {
+				case err != nil:
+					return fmt.Errorf("cairn: advancing checkpoint %s: %w", p.Name, err)
+				case tag.RowsAffected() == 0:
 					return errLostCheckpoint
 				}
 				return nil
@@ -88,13 +91,10 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 				}
 			}
 			err = b.send(ctx, tx)
-			var failed *batchError
-			switch {
-			case errors.As(err, &failed) && failed.owner == checkpointOwner:
-				return fmt.Errorf("cairn: advancing checkpoint %s: %w", p.Name, failed.err)
-			case errors.As(err, &failed):
+			if failed := (*batchError)(nil); errors.As(err, &failed) {
 				return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, failed.owner, failed)
-			case err != nil:
+			}
+			if err != nil {
 				return err
 			}
 			n = len(entries)
@@ -114,10 +114,6 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 }
 
 var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runner")
-
-// checkpointOwner marks the checkpoint's advance among a batch's statements.
-// Entries are named stream#seq, which never looks like this.
-const checkpointOwner = "checkpoint"
 
 // Run catches the projection up every interval until ctx is done. An error
 // ends it unless the projection sets OnError.

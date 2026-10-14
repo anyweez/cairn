@@ -57,9 +57,12 @@ on wherever possible.
 
 | API | Status |
 |---|---|
-| `View.Write` | Takes a `Batch`. All views' statements go out in one round trip. |
+| `View.Write` | Takes a `Batch`. Views' statements go out with the message's own writes and its commit. |
 | `Projection.Apply` | Takes a `Batch`. A batch of entries' statements goes out in one round trip, together with the checkpoint's advance. It also takes a `ctx`, for read models that live outside the database. |
-| `Store.Transact` / `Tx` | `Tx` embeds `pgx.Tx`, for transactions that span several streams. Callers compose cairn's own calls in it (`Lock`, `LoadLocked`, `Apply`). Those calls follow this rule as cairn's internals are batched. |
+| `Store.Transact` / `Tx` | `Tx` embeds `pgx.Tx`, for transactions that span several streams. Callers compose cairn's own calls in it, and each costs one round trip: `Lock` for every stream at once, `LoadLocked` per stream, and `Apply` per message (plus one to look up an idempotency key). `Transact` adds `BEGIN` and `COMMIT`. |
 
-cairn's own statements follow the same rule as they are rewritten to make
-fewer round trips.
+cairn's own statements follow the same rule. `Handle` costs two round trips:
+one begins the transaction, locks the stream and reads it, and the other
+records the decision, its effects, any snapshot and the views, and commits.
+`Load` costs one. `TestEachPathKeepsToItsRoundTrips` holds each path to its
+budget.
