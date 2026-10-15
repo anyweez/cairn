@@ -61,6 +61,25 @@ func TestExtractReadsEverything(t *testing.T) {
 	}
 }
 
+// A type that embeds a pointer to itself is legal Go and encoding/json
+// marshals it, but the shape walk recurses through the embedded field without
+// the guard shape() keeps for named fields, so the tool loops until the stack
+// overflows.
+func TestExtractHandlesRecursiveEmbeddedPointer(t *testing.T) {
+	m, err := Extract("testdata/recurse", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	// encoding/json visits the type once and skips the recursive embedded
+	// pointer, so the stored shape is just v.
+	if got, want := m.Codecs[0].Fields, []string{"v: int"}; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
 func TestExtractRefusesToGuess(t *testing.T) {
 	_, err := Extract("testdata/bad", "./...")
 	if err == nil {
