@@ -38,6 +38,12 @@ type Node struct {
 	Next *Node `json:"next,omitempty"`
 }
 
+// nested is embedded with a tag, so encoding/json marshals it as a named
+// object, not flattened. The type is unexported but the field is anonymous.
+type nested struct {
+	N int `json:"n"`
+}
+
 type Published_ struct {
 	Meta
 	Title    string          `json:"title"`
@@ -57,6 +63,7 @@ type Published_ struct {
 	Inline   PtrMarshal        `json:"inline"`
 	Behind   *PtrMarshal       `json:"behind"`
 	Many     []PtrMarshal      `json:"many"`
+	nested   `json:"nested"`
 }
 
 // PtrMarshal marshals itself only where encoding/json can take its address.
