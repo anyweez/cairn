@@ -343,6 +343,15 @@ Each of these must be stated with constants. A rule, table or registration
 the tool can't read exactly is an error, not a guess. Declare a fixture
 rule inside a function to keep it out of the manifest.
 
+Reading codecs from source can still be fooled: an `Upcast` inside a helper
+that never runs looks like an upcaster, and a `Register` taken as a function
+value is invisible. A test closes that gap by building the module's real
+codecs and comparing them with the committed manifest. `codec.Registrations`
+reports what a codec holds, and `codec.CheckRegistrations` reports every
+difference from a manifest; `examples/decisions/manifest_test.go` is the
+example. A mismatch fails the gate before an entry already in the ledger
+would fail to decode.
+
 CI fails when the manifest is stale. On a pull request it also compares the
 codecs with the base branch's manifest and fails if a stored type was
 removed, went back a version, changed shape without a version bump, or was

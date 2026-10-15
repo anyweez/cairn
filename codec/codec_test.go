@@ -2,6 +2,7 @@ package codec_test
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -9,6 +10,10 @@ import (
 )
 
 type shape interface{ area() int }
+
+type circle struct{}
+
+func (circle) area() int { return 0 }
 
 // Version 2 of square renamed Side to Edge.
 type square struct {
@@ -77,4 +82,59 @@ func TestRegisterRejectsTypesOutsideTheSum(t *testing.T) {
 		}
 	}()
 	codec.Register[struct{ X int }](codec.New[shape](), "nope", 1)
+}
+
+func TestRegistrationsDescribeTheCodec(t *testing.T) {
+	c := codec.New[shape]()
+	codec.Register[square](c, "square", 2)
+	c.Upcast("square", 1, func(old json.RawMessage) (json.RawMessage, error) { return old, nil })
+	codec.Register[circle](c, "circle", 1)
+
+	got := c.Registrations()
+	want := []codec.Registration{
+		{Name: "circle", Version: 1},
+		{Name: "square", Version: 2, Upcasts: []int{1}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d registrations, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i].Name != want[i].Name || got[i].Version != want[i].Version || !slices.Equal(got[i].Upcasts, want[i].Upcasts) {
+			t.Errorf("registration %d: got %+v, want %+v", i, got[i], want[i])
+		}
+		if got[i].Sum != got[0].Sum || !strings.HasSuffix(got[i].Sum, ".shape") {
+			t.Errorf("registration %d: sum is %q, want the sum type's full Go path", i, got[i].Sum)
+		}
+	}
+}
+
+// The runtime half of the manifest cross-check: the two ways static extraction
+// misreads codec setup are each a difference here.
+func TestCheckRegistrations(t *testing.T) {
+	base := []codec.Registration{{Sum: "example.com/x.Event", Name: "x.happened", Version: 2, Upcasts: []int{1}}}
+	for _, tc := range []struct {
+		name      string
+		want, got []codec.Registration
+		problem   string
+	}{
+		{"agree", base, base, ""},
+		{"an upcaster that never runs", base, []codec.Registration{{Sum: "example.com/x.Event", Name: "x.happened", Version: 2}}, "upcaster from version 1 in the manifest but not in the codecs"},
+		{"an upcaster the tool missed", []codec.Registration{{Sum: "example.com/x.Event", Name: "x.happened", Version: 2}}, base, "upcaster from version 1 in the codecs but not in the manifest"},
+		{"indirect registration", nil, base, "is registered by the codecs but not in the manifest"},
+		{"a registration the tool missed", base, nil, "is in the manifest but not registered by the codecs"},
+		{"a version the tool misread", base, []codec.Registration{{Sum: "example.com/x.Event", Name: "x.happened", Version: 3, Upcasts: []int{1}}}, "version 2 in the manifest but version 3 in the codecs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Join(codec.CheckRegistrations(tc.want, tc.got), "\n")
+			if tc.problem == "" {
+				if got != "" {
+					t.Fatalf("got %q, want no problems", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.problem) {
+				t.Fatalf("got %q, want a problem containing %q", got, tc.problem)
+			}
+		})
+	}
 }
