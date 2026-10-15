@@ -13,8 +13,8 @@ measurements and how to reproduce them.
 | `Handle`, on a stream in the state cache | 1, shared by the messages recorded together |
 | `Handle`, on a stream not in it (its first message here, evicted, stale, or the cache off) | 2 |
 | `Handle` with an idempotency key that matches, not cached | 2 |
-| `Handle` with an idempotency key that matches, cached | 3 |
-| `Handle` on a stream another process wrote since this one did | 3, or 2 once the cache has seen it's shared |
+| `Handle` with an idempotency key that matches, cached | 4 |
+| `Handle` on a stream another process wrote since this one did | 4, or 2 once the cache has seen it's shared |
 | `Load` | 1 |
 | `Transact` with `LoadLocked` and `Apply` on one stream | 5 |
 | `CatchUp`, per batch of up to `BatchSize` entries | 5 |
@@ -51,11 +51,10 @@ cache off. Each stream that an aggregate writes has a lane in the process,
 and its messages are recorded one transaction at a time:
 
 - **A cached stream costs one round trip.** Its message is decided as soon as
-  it is its turn. One batch then locks the stream on condition that it is
-  still at the cached seq (`cairn.lock_stream_at`), and writes the entry,
-  effects, snapshot and views. Postgres runs that batch as one implicit
-  transaction, committed as it ends. The lock is held for no round trip at
-  all, only the commit's flush.
+  it is its turn. One batch then opens a transaction, locks the stream on
+  condition that it is still at the cached seq (`cairn.lock_stream_at`), and
+  writes the entry, effects, snapshot and views, and commits it. The lock is
+  held for no round trip at all, only the commit's flush.
 - **Messages that arrive together are recorded together.** Those that queue
   while a stream's transaction is in flight are decided in order and recorded
   in its next transaction, up to 100 at a time. Each caller still returns
@@ -64,11 +63,13 @@ and its messages are recorded one transaction at a time:
 - **A stale cache records nothing.** If another process has written the
   stream, the lock fails, as does a duplicate idempotency key on its unique
   index. Nothing is recorded, and the messages are decided again from the
-  stored state, in two round trips. A failure that spoils a shared
-  transaction is narrowed down by recording its messages one at a time. Only
-  failures the database reported are retried. When it is unknown whether a
-  commit happened, the callers get the error; when a batch's transaction is
-  known to have committed, the error wraps `ErrRecorded`.
+  stored state, in two round trips. The failed attempt costs two of its own:
+  the batch that raises, and the rollback of the aborted transaction it left
+  behind, so the first stale `Handle` costs four. A failure that spoils a
+  shared transaction is narrowed down by recording its messages one at a
+  time. Only failures the database reported are retried. When it is unknown
+  whether a commit happened, the callers get the error; when a batch's
+  transaction is known to have committed, the error wraps `ErrRecorded`.
 - **A stream other processes write too is read before each decision.** Every
   message shows whether the cached state would have been right. One decided
   from the cache either succeeds or goes stale; one read first finds the

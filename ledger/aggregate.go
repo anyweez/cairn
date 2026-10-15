@@ -235,9 +235,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		dups = make([]*pendingDuplicate, len(reqs))
 	)
 	if cached != nil {
-		// One batch, which Postgres runs as one implicit transaction: it
-		// commits as the batch ends unless a statement fails, in which case
-		// it rolls back with nothing left to end.
+		// One batch, which Postgres runs as one transaction the batch opens
+		// and commits itself.
+		b.own(sqlStep("beginning a transaction"), `BEGIN`)
 		if l, err = queueLockAt(&b, stream, cached.Seq); err != nil {
 			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
@@ -330,13 +330,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		}
 	}
 	b.merge(&entryViews)
-	if cached == nil {
-		b.own(commitStep, `COMMIT`)
-	}
-	// The cached batch is the connection's whole implicit transaction, and the
-	// uncached one closes the transaction the load batch began: either way the
-	// server commits it, whether or not a result can be read back.
-	b.commits = true
+	b.end()
 	if err := b.send(ctx, conn); err != nil {
 		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, viewAt)
 	}
@@ -410,6 +404,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 		return nil
 	}, `SELECT seq FROM cairn.streams WHERE stream = $1`, stream.String())
 	load := a.queueLoad(&b, stream)
+	// Load records nothing, so a handler failing in Go is never ErrRecorded:
+	// it queues its COMMIT with own, leaving commits and hasCommit unset.
 	b.own(commitStep, `COMMIT`)
 
 	conn, err := a.Store.pool.Acquire(ctx)

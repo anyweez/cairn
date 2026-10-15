@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // scanOneInt reads one integer, so a query that returns text fails in Go with
@@ -22,6 +23,37 @@ func insertOne(r pgx.BatchResults) error {
 	return err
 }
 
+// committedConn gives a fresh connection with a temporary table to insert
+// into, and a count of its rows.
+func committedConn(t *testing.T) (context.Context, *pgxpool.Conn, func() int) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := emptyDatabase(t).Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conn.Release)
+	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE committed (n int)`); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		t.Helper()
+		// A batch that aborted an explicit transaction leaves it open, as
+		// release rolls it back in production.
+		if pg := conn.Conn().PgConn(); !pg.IsClosed() && pg.TxStatus() != 'I' {
+			if _, err := conn.Exec(ctx, `ROLLBACK`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var rows int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM committed`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	return ctx, conn, count
+}
+
 // Postgres runs every statement in a batch before the caller reads any result,
 // so a handler can fail in Go — a scan or a parse — after the statements,
 // including the COMMIT, have already run. The caller gets an error either way,
@@ -29,68 +61,75 @@ func insertOne(r pgx.BatchResults) error {
 // failed, or a retry records it a second time.
 func TestABatchThatCommittedDespiteAFailedResultSaysSo(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE committed (n int)`); err != nil {
-		t.Fatal(err)
-	}
+	ctx, conn, rows := committedConn(t)
 
 	var b Batch
 	b.own(sqlStep("beginning a transaction"), `BEGIN`)
 	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
 	b.own(scanOneInt, `SELECT 'not an integer'`)
-	b.own(commitStep, `COMMIT`)
-	b.commits = true
+	b.end()
 
-	err = b.send(ctx, conn)
+	err := b.send(ctx, conn)
 	if !errors.Is(err, ErrRecorded) {
 		t.Fatalf("send returned %v, want ErrRecorded", err)
 	}
-	var rows int
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM committed`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 1 {
-		t.Fatalf("the batch's insert is %d rows, want 1: the error does not describe what happened", rows)
+	if n := rows(); n != 1 {
+		t.Fatalf("the batch's insert is %d rows, want 1: the error does not describe what happened", n)
 	}
 }
 
-// A cached Handle sends one batch with no BEGIN, which the connection runs as
-// an implicit transaction and commits as it ends. A client-side failure there
-// hides a commit in the same way.
-func TestAnImplicitTransactionThatCommittedSaysSo(t *testing.T) {
+// A batch that ends its own transaction can tell a commit from a rollback: an
+// aborted transaction reads 'E', and the message must not be reported as
+// recorded. Here the scan fails in Go first, so the database error behind it
+// is one the caller never reads.
+func TestABatchRefusedByTheDatabaseDoesNotSayItCommitted(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
+	ctx, conn, rows := committedConn(t)
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
+	b.own(scanOneInt, `SELECT 'not an integer'`)
+	b.own(sqlStep("dividing"), `SELECT 1/0`)
+	b.end()
+
+	err := b.send(ctx, conn)
+	if err == nil {
+		t.Fatal("send returned nil, want an error")
 	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE committed (n int)`); err != nil {
-		t.Fatal(err)
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v, but the transaction was rolled back", err)
 	}
+	if n := rows(); n != 0 {
+		t.Fatalf("the batch's insert is %d rows, want 0: it was reported as recorded", n)
+	}
+}
+
+// A batch that leaves the commit to the connection runs as one implicit
+// transaction. A later statement's database error rolls the whole thing back,
+// and the connection reads idle, the same as after a commit, so send must not
+// claim the message was recorded. The cached Handle path used to send such a
+// batch and used to claim that.
+func TestAnImplicitBatchDoesNotSayItCommitted(t *testing.T) {
+	t.Parallel()
+	ctx, conn, rows := committedConn(t)
 
 	var b Batch
 	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
 	b.own(scanOneInt, `SELECT 'not an integer'`)
+	b.own(sqlStep("dividing"), `SELECT 1/0`)
+	// The cached path declared its batch committing without queuing a COMMIT.
 	b.commits = true
 
-	err = b.send(ctx, conn)
-	if !errors.Is(err, ErrRecorded) {
-		t.Fatalf("send returned %v, want ErrRecorded", err)
+	err := b.send(ctx, conn)
+	if err == nil {
+		t.Fatal("send returned nil, want an error")
 	}
-	var rows int
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM committed`).Scan(&rows); err != nil {
-		t.Fatal(err)
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v, but an implicit transaction cannot be told from a rollback", err)
 	}
-	if rows != 1 {
-		t.Fatalf("the batch's insert is %d rows, want 1: the implicit transaction did not commit", rows)
+	if n := rows(); n != 0 {
+		t.Fatalf("the batch's insert is %d rows, want 0: it was reported as recorded", n)
 	}
 }
 
@@ -98,10 +137,9 @@ func TestAnImplicitTransactionThatCommittedSaysSo(t *testing.T) {
 // when a handler fails, so the error must not claim it did.
 func TestABatchThatDidNotCommitDoesNotSayItDid(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
+	ctx, conn, _ := committedConn(t)
 
-	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+	err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
 		var b Batch
 		b.own(scanOneInt, `SELECT 'not an integer'`)
 		return b.send(ctx, tx)
@@ -111,32 +149,5 @@ func TestABatchThatDidNotCommitDoesNotSayItDid(t *testing.T) {
 	}
 	if errors.Is(err, ErrRecorded) {
 		t.Fatalf("send returned %v, but the transaction had not committed", err)
-	}
-}
-
-// A statement the database refuses aborts the transaction, so the commit did
-// not happen and the error must not say it did.
-func TestABatchRefusedByTheDatabaseDoesNotSayItCommitted(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-
-	var b Batch
-	b.own(sqlStep("beginning a transaction"), `BEGIN`)
-	b.own(scanOneInt, `SELECT 1/0`)
-	b.own(commitStep, `COMMIT`)
-	b.commits = true
-
-	err = b.send(ctx, conn)
-	if err == nil {
-		t.Fatal("send returned nil, want the database's error")
-	}
-	if errors.Is(err, ErrRecorded) {
-		t.Fatalf("send returned %v, but the transaction was aborted", err)
 	}
 }

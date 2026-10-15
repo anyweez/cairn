@@ -21,11 +21,16 @@ type Batch struct {
 	queued pgx.Batch
 	items  []batchItem
 	owner  string
-	// commits is set on a batch that ends its own transaction: one whose last
-	// statement is a COMMIT, or one a connection runs as its whole implicit
-	// transaction. The server runs every statement before the caller reads any
-	// result, so a handler can fail in Go after a commit has happened.
+	// commits is set on a batch that ends its own transaction and may have
+	// recorded a message. send can report ErrRecorded for it only when
+	// hasCommit proves the transaction committed.
 	commits bool
+	// hasCommit records that the batch queues its own COMMIT. A batch that
+	// leaves the commit to the connection runs as one implicit transaction: a
+	// later statement's server-side error rolls the whole thing back and the
+	// connection still reads idle, the same as after a commit, so send must
+	// never claim the message was recorded for it.
+	hasCommit bool
 }
 
 // batchItem is one queued statement: who queued it, empty for the ledger's
@@ -98,7 +103,7 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			// rest, and say so rather than reporting a failure that did not
 			// happen.
 			closeErr := results.Close()
-			if b.commits && committed(s, err, closeErr) {
+			if b.commits && b.hasCommit && committed(s, err, closeErr) {
 				return &recordedError{err: b.failed(i, err)}
 			}
 			return b.failed(i, err)
@@ -155,6 +160,16 @@ func senderPgConn(s batchSender) *pgconn.PgConn {
 		return s.Conn().PgConn()
 	}
 	return nil
+}
+
+// end queues the statement that ends the batch's transaction — a COMMIT — and
+// marks the batch as one whose outcome send may report. Only an explicit
+// COMMIT makes that outcome readable: the connection reads idle whether an
+// implicit transaction committed or a later statement rolled it back.
+func (b *Batch) end() {
+	b.own(commitStep, `COMMIT`)
+	b.commits = true
+	b.hasCommit = true
 }
 
 // failed blames the statement at i for err, unless err comes from preparing
