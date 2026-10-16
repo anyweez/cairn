@@ -120,6 +120,7 @@ type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 // Tx is a transaction that may write to the ledger: the streams Transact
@@ -484,24 +485,59 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 	return readStream(ctx, s.pool, stream, afterSeq)
 }
 
-// inFlightXmin is the smallest transaction ID still in flight in this
-// database, or the largest xid8 when none is. Transaction IDs are assigned by
-// the cluster, so pg_current_snapshot()'s xmin is the oldest transaction on
-// the whole server, and an idle transaction in another database would hold
-// back this one's committed entries. A transaction in another database cannot
-// write to cairn.entries here, so only this database's transactions, ordinary
-// and prepared, can leave a gap behind a reader's cursor.
-const inFlightXmin = `COALESCE(
-  (SELECT min(backend_xid::text::xid8) FROM pg_stat_activity
-    WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())),
-  (SELECT min(transaction::text::xid8) FROM pg_prepared_xacts
-    WHERE database = current_database()),
-  '18446744073709551615'::xid8)`
+// logFence measures the global log's read cutoff and stores it in the
+// transaction-local setting cairn.fence, for the read that follows it.
+//
+// Transaction IDs are assigned by the cluster, so pg_snapshot_xmin is the
+// oldest transaction on the whole server: an idle transaction in another
+// database would hold this one's committed entries back. Only a transaction
+// in this database can write to cairn.entries here, so the fence is this
+// database's smallest in-flight transaction ID, not the cluster's.
+//
+// Measuring the in-flight set in a statement of its own, before the read's
+// snapshot, is what makes the cutoff sound. A transaction that is in flight
+// when the read takes its snapshot either already existed at the measurement,
+// and is in the measured set, or was assigned its transaction ID after it,
+// and is at or above the measured pg_snapshot_xmax. LEAST of the two bounds
+// every such transaction. Measuring inside the read would be unsound: its
+// snapshot is taken before its own subqueries read pg_stat_activity, so a
+// transaction that commits in between is neither visible to the snapshot nor
+// counted in the in-flight set.
+//
+// A prepared transaction has no backend in pg_stat_activity, so pg_prepared_xacts
+// supplies it. The two minima are combined with LEAST, not COALESCE: an older
+// prepared transaction must bound the fence even while a newer ordinary one is
+// open, or its later commit would land behind a cursor that already passed it.
+//
+// pg_stat_activity.backend_xid is visible to every role in PostgreSQL 17, so a
+// deployment with several writer roles does not lose the guard. If a session
+// in this database holds a transaction but its backend_xid is hidden, the
+// reader lacks the privilege to see it; rather than silently drop that
+// transaction from the fence, fall back to the cluster-wide pg_snapshot_xmin,
+// which is conservative but sound.
+const logFence = `SELECT set_config('cairn.fence', (
+  CASE WHEN EXISTS (
+    SELECT 1 FROM pg_locks l
+    JOIN pg_stat_activity a ON a.pid = l.pid
+    WHERE l.locktype = 'transactionid' AND l.mode = 'ExclusiveLock' AND l.granted
+      AND a.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND a.backend_xid IS NULL
+  ) THEN pg_snapshot_xmin(pg_current_snapshot())
+  ELSE LEAST(
+    COALESCE((SELECT min(backend_xid::text::xid8) FROM pg_stat_activity
+              WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())),
+             '18446744073709551615'::xid8),
+    COALESCE((SELECT min(transaction::text::xid8) FROM pg_prepared_xacts
+              WHERE database = current_database()),
+             '18446744073709551615'::xid8),
+    pg_snapshot_xmax(pg_current_snapshot())
+  )
+  END)::text, true)`
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	sql := `SELECT ` + entryColumns + ` FROM cairn.entries
 WHERE (txid, position) > ($1::text::xid8, $2)
-  AND txid < ` + inFlightXmin
+  AND txid < current_setting('cairn.fence')::xid8`
 	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
 	if len(kinds) > 0 {
 		sql += ` AND kind = ANY($3)`
@@ -511,11 +547,29 @@ WHERE (txid, position) > ($1::text::xid8, $2)
 		limit = 100
 	}
 	sql += fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit)
-	rows, err := q.Query(ctx, sql, args...)
+
+	// The fence and the read go out together, in one round trip, so CatchUp
+	// stays within its budget. pgx runs a batch in an implicit transaction, so
+	// the read sees the setting the fence statement made.
+	var b pgx.Batch
+	b.Queue(logFence)
+	b.Queue(sql, args...)
+	results := q.SendBatch(ctx, &b)
+	var fence string
+	if err := results.QueryRow().Scan(&fence); err != nil {
+		_ = results.Close()
+		return nil, fmt.Errorf("cairn: measuring the log fence: %w", err)
+	}
+	rows, err := results.Query()
 	if err != nil {
+		_ = results.Close()
 		return nil, fmt.Errorf("cairn: reading the log: %w", err)
 	}
-	return scanEntries(rows)
+	entries, err := scanEntries(rows)
+	if closeErr := results.Close(); err == nil {
+		err = closeErr
+	}
+	return entries, err
 }
 
 // ReadAll returns up to limit entries after the cursor, in transaction order
