@@ -49,6 +49,11 @@ type shaper struct {
 // says whether encoding/json reaches the value addressably (behind a pointer
 // or in a slice), which decides whether pointer-receiver marshalers apply.
 func (s *shaper) shape(t types.Type, addr bool) string {
+	// An alias denotes the same type as its target, and Go models `type A = T`
+	// as a *types.Alias rather than the *types.Named that every guard below
+	// (and TypeString) understands. Resolve it first so an alias cannot slip
+	// past the recursion guard.
+	t = types.Unalias(t)
 	if s.opaque(t, addr) {
 		return types.TypeString(t, nil)
 	}
@@ -74,6 +79,15 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	case *types.Map:
 		return "map[" + s.shape(u.Key(), false) + "]" + s.shape(u.Elem(), false)
 	case *types.Struct:
+		// A named struct rendered here is flattened into an object, exactly
+		// as fields() flattens the top-level type. Mark it for the duration so
+		// an embedded pointer back to it is visited once and skipped, as
+		// encoding/json does; otherwise the outer struct's own fields are
+		// emitted again after the embedded recursion returns.
+		if named, ok := t.(*types.Named); ok && !s.embedding[named] {
+			s.embedding[named] = true
+			defer delete(s.embedding, named)
+		}
 		return "{" + strings.Join(s.structFields(u, addr), ", ") + "}"
 	case *types.Interface:
 		return "any"
@@ -112,9 +126,11 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 			continue
 		}
 		if f.Embedded() && name == "" {
-			typ, inner := f.Type(), addr
+			// Resolve an alias to its target before the flattening guard
+			// below looks for a *types.Named; `type A = T` embeds T's fields.
+			typ, inner := types.Unalias(f.Type()), addr
 			if ptr, ok := typ.(*types.Pointer); ok {
-				typ, inner = ptr.Elem(), true
+				typ, inner = types.Unalias(ptr.Elem()), true
 			}
 			if emb, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
 				named, _ := typ.(*types.Named)
