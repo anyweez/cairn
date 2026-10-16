@@ -215,8 +215,12 @@ var errUnchecked = errors.New("cairn: the message needs its idempotency key look
 // key in a round trip of its own first.
 //
 // An error is the transaction's, and nothing in it was recorded when the
-// database reported it (see retryable). Each request's own result says
-// whether its message was refused, a duplicate, or failed before it was sent.
+// database reported it (see retryable), or when a caller's own handler failed
+// before anything was sent. The one exception is a handler that fails in Go
+// reading a result from the batch that ends the transaction: it may already
+// have committed, and the error then wraps ErrRecorded. Each request's own
+// result says whether its message was refused, a duplicate, or failed before
+// it was sent.
 func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream, reqs []*request[M, R], cached *Loaded[S]) (results []result[R], before, after Loaded[S], err error) {
 	conn, err := a.Store.pool.Acquire(ctx)
 	if err != nil {
@@ -231,9 +235,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		dups = make([]*pendingDuplicate, len(reqs))
 	)
 	if cached != nil {
-		// One batch, which Postgres runs as one implicit transaction: it
-		// commits as the batch ends unless a statement fails, in which case
-		// it rolls back with nothing left to end.
+		// One batch, which Postgres runs as one transaction the batch opens
+		// and commits itself.
+		b.own(sqlStep("beginning a transaction"), `BEGIN`)
 		if l, err = queueLockAt(&b, stream, cached.Seq); err != nil {
 			return nil, Loaded[S]{}, Loaded[S]{}, err
 		}
@@ -326,9 +330,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 		}
 	}
 	b.merge(&entryViews)
-	if cached == nil {
-		b.own(commitStep, `COMMIT`)
-	}
+	b.end()
 	if err := b.send(ctx, conn); err != nil {
 		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, viewAt)
 	}
@@ -402,6 +404,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 		return nil
 	}, `SELECT seq FROM cairn.streams WHERE stream = $1`, stream.String())
 	load := a.queueLoad(&b, stream)
+	// Load records nothing, so a handler failing in Go is never ErrRecorded:
+	// it queues its COMMIT with own, leaving commits and hasCommit unset.
 	b.own(commitStep, `COMMIT`)
 
 	conn, err := a.Store.pool.Acquire(ctx)

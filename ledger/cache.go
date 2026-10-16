@@ -327,6 +327,11 @@ func deliver[M, R any](r *request[M, R], res result[R]) {
 // connection lost while committing, leaves it unknown whether the commit
 // happened, and is returned to the callers instead.
 func retryable(err error) bool {
+	// A recorded message is never retried: the transaction committed, and a
+	// second attempt would record it again.
+	if errors.Is(err, ErrRecorded) {
+		return false
+	}
 	var (
 		pgErr *pgconn.PgError
 		view  *viewFailure
