@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -132,5 +133,78 @@ func TestLockRefusesATransactionThatHasWritten(t *testing.T) {
 	})
 	if !errors.Is(err, errLockAfterWrite) {
 		t.Fatalf("lock after a write: %v, want errLockAfterWrite", err)
+	}
+}
+
+// A concurrent migration is one whose statements cannot run inside a
+// transaction. CREATE INDEX CONCURRENTLY is the reason the kind exists: it
+// refuses any transaction block, so this passes only if the runner really
+// sends each statement outside one.
+func TestConcurrentMigrationRunsOutsideATransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
+		},
+	})
+	if err := store.migrate(ctx, migs); err != nil {
+		t.Fatalf("applying a concurrent migration: %v", err)
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('cairn.entries_kind_seq') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("the concurrent migration's index was not created")
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migs) {
+		t.Fatalf("schema version %d after the concurrent migration, want %d", version, len(migs))
+	}
+}
+
+// A transactional migration is still one unit: a statement that fails rolls
+// back the ones before it and leaves the version unrecorded, so the next boot
+// runs the migration again.
+func TestTransactionalMigrationRollsBackOnFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Statements: []string{
+			`CREATE TABLE cairn.migrate_probe (n int)`,
+			`SELECT 1 / 0`,
+		},
+	})
+	if err := store.migrate(ctx, migs); err == nil {
+		t.Fatal("a failing migration reported no error")
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('cairn.migrate_probe') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("a table from a rolled-back migration survived")
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migrations) {
+		t.Fatalf("schema version %d after a failed migration, want %d", version, len(migrations))
 	}
 }
