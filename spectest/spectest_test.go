@@ -74,6 +74,28 @@ func TestAllowVacuous(t *testing.T) {
 	}
 }
 
+// rapid's T.Skip rejects a draw that is not a valid input, and a generator
+// that rejects most draws makes rapid report that it generated too few valid
+// tests. That is the harness failing to generate, not a rule being violated,
+// so Fails must not report it. A mutant test written as
+//
+//	if _, failed := spectest.Fails(t, m.Check); !failed { t.Fatal("mutant survived") }
+//
+// otherwise passes without the rule ever being exercised.
+func TestFailsIgnoresAGeneratorThatRejectsMostDraws(t *testing.T) {
+	m := counter(unreachable())
+	m.AllowVacuous = []string{unreachable().ID}
+	m.Messages = func(t *rapid.T, _ int) int {
+		if rapid.IntRange(0, 99).Draw(t, "valid") != 0 {
+			t.Skip("not a valid draw")
+		}
+		return rapid.IntRange(0, 1).Draw(t, "msg")
+	}
+	if msg, failed := spectest.Fails(t, m.Check); failed {
+		t.Fatalf("a rejected draw is not a rule violation: %s", msg)
+	}
+}
+
 func TestVacuousProposedRulePasses(t *testing.T) {
 	proposed := unreachable()
 	proposed.Status = spec.Proposed
