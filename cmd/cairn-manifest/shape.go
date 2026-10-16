@@ -105,7 +105,17 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 			}
 		}
 		if !f.Exported() {
-			continue
+			// encoding/json ignores unexported fields, but keeps an anonymous
+			// field whose type is a struct; such a field reaches here only when
+			// its tag names it (an untagged embedded struct was flattened
+			// above), and encoding/json marshals it as a named object.
+			typ := f.Type()
+			if ptr, ok := typ.(*types.Pointer); ok {
+				typ = ptr.Elem()
+			}
+			if _, ok := typ.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
+				continue
+			}
 		}
 		if name == "" {
 			name = f.Name()
