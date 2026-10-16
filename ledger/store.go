@@ -504,6 +504,13 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // transaction that commits in between is neither visible to the snapshot nor
 // counted in the in-flight set.
 //
+// The fence must also be the first read of pg_stat_activity in its
+// transaction: that view is cached for the transaction's lifetime, so a
+// second readAll in the same transaction would measure the in-flight set as
+// it stood at the transaction's first read and could let the cutoff pass a
+// transaction that started since, skipping its entries. CatchUp opens one
+// transaction per batch to keep this true.
+//
 // A prepared transaction has no backend in pg_stat_activity, so pg_prepared_xacts
 // supplies it. The two minima are combined with LEAST, not COALESCE: an older
 // prepared transaction must bound the fence even while a newer ordinary one is
