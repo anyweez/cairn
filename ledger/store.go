@@ -2,8 +2,11 @@
 // stream's state, decides a message, and records the message, its decision,
 // its events and its effects in one transaction.
 //
-// Every decided message is an entry, refused ones included, so the ledger is
-// a complete record of what was asked and what was answered. That record is
+// Every decided message the ledger can store is an entry, refused ones
+// included, so the ledger is a complete record of what was asked and what was
+// answered. A message carrying text the database cannot hold (a NUL, or text
+// that is not valid UTF-8) is refused by the decider and answered without an
+// entry, since the entry could not hold it. That record is
 // what the rest of the pattern stands on: state is rebuilt by folding stored
 // events, the current code is verified by re-deciding stored messages, and
 // effects are carried out from an outbox written in the same transaction.
@@ -253,11 +256,16 @@ func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
 	return &locks{seqs: map[string]int64{stream.String(): seq}, at: recordingTime()}, nil
 }
 
-// validStream refuses a stream whose name could be another's: the name joins
-// kind and ID with a slash, so a kind may not contain one.
+// validStream refuses a stream whose name could be another's (the name joins
+// kind and ID with a slash, so a kind may not contain one) or that Postgres
+// cannot store. A NUL or invalid UTF-8 in either half would otherwise reach
+// the driver as a text parameter and fail with a raw SQLSTATE.
 func validStream(st Stream) error {
 	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
 		return fmt.Errorf("cairn: invalid stream %q", st)
+	}
+	if !cairn.StorableText(st.Kind) || !cairn.StorableText(st.ID) {
+		return fmt.Errorf("cairn: invalid stream %q: the name is not valid UTF-8 or contains a NUL", st)
 	}
 	return nil
 }
@@ -327,8 +335,16 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if e.IdempotencyKey != "" {
 		key = &e.IdempotencyKey
 	}
+	for _, text := range []string{e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID} {
+		if !cairn.StorableText(text) {
+			return fmt.Errorf("cairn: metadata for %s is not valid UTF-8 or contains a NUL", stream)
+		}
+	}
 	extra := []byte(`{}`)
 	if len(e.Meta.Extra) > 0 {
+		if err := codec.CheckStorable(e.Meta.Extra); err != nil {
+			return fmt.Errorf("cairn: encoding metadata for %s: %w", stream, err)
+		}
 		if extra, err = json.Marshal(e.Meta.Extra); err != nil {
 			return fmt.Errorf("cairn: encoding metadata for %s: %w", stream, err)
 		}

@@ -10,10 +10,13 @@ package codec
 import (
 	"bytes"
 	"cmp"
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"slices"
+
+	"github.com/anyweez/cairn"
 )
 
 // Envelope is one encoded value as the ledger stores it.
@@ -81,17 +84,117 @@ func (c *Codec[T]) Upcast(name string, from int, f Upcaster) {
 }
 
 // Encode wraps v in an envelope naming its registered type and version.
+//
+// It refuses a value carrying text the ledger cannot store rather than
+// letting json.Marshal quietly replace it with U+FFFD: a codec that silently
+// rewrites a message is one whose entries no longer say what the caller sent.
 func (c *Codec[T]) Encode(v T) (Envelope, error) {
 	typ := reflect.TypeOf(any(v))
 	e, ok := c.byType[typ]
 	if !ok {
 		return Envelope{}, fmt.Errorf("codec: %v is not registered", typ)
 	}
+	if err := CheckStorable(v); err != nil {
+		return Envelope{}, fmt.Errorf("codec: encoding %s: %w", e.name, err)
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return Envelope{}, fmt.Errorf("codec: encoding %s: %w", e.name, err)
 	}
 	return Envelope{Type: e.name, Version: e.version, Data: data}, nil
+}
+
+// NotStorableError names the field of a value that carries text the ledger
+// cannot store. It is returned by Encode and reported by CheckStorable.
+type NotStorableError struct {
+	Path string
+}
+
+func (e *NotStorableError) Error() string {
+	return fmt.Sprintf("%s is not valid UTF-8 or contains a NUL, so it cannot be stored", e.Path)
+}
+
+// maxStorableDepth bounds the walk CheckStorable does, so a value that is a
+// cycle is left for json.Marshal to reject rather than recursed forever.
+const maxStorableDepth = 1000
+
+// CheckStorable reports whether every string in v can be stored in the ledger
+// and read back unchanged. json.Marshal replaces a string that is not valid
+// UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
+// would silently store text the caller never wrote.
+//
+// It walks the same values json.Marshal does. A type with its own MarshalJSON
+// or MarshalText decides its own encoding and is not inspected.
+func CheckStorable(v any) error {
+	return checkStorable(reflect.ValueOf(v), "value", 0)
+}
+
+func checkStorable(v reflect.Value, path string, depth int) error {
+	if depth > maxStorableDepth || !v.IsValid() {
+		return nil
+	}
+	if v.CanInterface() {
+		if _, ok := v.Interface().(json.Marshaler); ok {
+			return nil
+		}
+		if _, ok := v.Interface().(encoding.TextMarshaler); ok {
+			return nil
+		}
+	}
+	switch v.Kind() {
+	case reflect.String:
+		if !cairn.StorableText(v.String()) {
+			return &NotStorableError{Path: path}
+		}
+	case reflect.Interface, reflect.Pointer:
+		if v.IsNil() {
+			return nil
+		}
+		return checkStorable(v.Elem(), path, depth+1)
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			f := t.Field(i)
+			// json.Marshal skips an unexported field, but not an unexported
+			// embedded struct's exported fields.
+			if f.PkgPath != "" && !f.Anonymous {
+				continue
+			}
+			if f.Tag.Get("json") == "-" {
+				continue
+			}
+			if err := checkStorable(v.Field(i), path+"."+f.Name, depth+1); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return nil
+		}
+		for i := 0; i < v.Len(); i++ {
+			if err := checkStorable(v.Index(i), fmt.Sprintf("%s[%d]", path, i), depth+1); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if v.IsNil() {
+			return nil
+		}
+		iter := v.MapRange()
+		for iter.Next() {
+			k := iter.Key()
+			key := k.String() // "<int Value>" for a non-string key, which is only a path
+			if k.Kind() == reflect.String {
+				if err := checkStorable(k, path+" key", depth+1); err != nil {
+					return err
+				}
+			}
+			if err := checkStorable(iter.Value(), path+"["+key+"]", depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // EncodeAll encodes a slice, preserving order.

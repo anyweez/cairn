@@ -391,6 +391,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Load(ctx context.Context, id string) (Loade
 		return Loaded[S]{}, err
 	}
 	stream := a.Stream(id)
+	if err := validStream(stream); err != nil {
+		return Loaded[S]{}, err
+	}
 	var (
 		b   Batch
 		seq int64
@@ -602,6 +605,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 
 	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
 	if entry.Message, err = a.Codecs.Messages.Encode(msg); err != nil {
+		// The message cannot be stored at all, so a refusal of it cannot be
+		// recorded either. Return the decider's refusal rather than the
+		// encoding error: the caller's message was answered, and an entry that
+		// cannot hold the message would be worse than none.
+		var notStorable *codec.NotStorableError
+		if decision.Refused() && errors.As(err, &notStorable) {
+			return nil, at, nil, nil, decision.Refusal
+		}
 		return nil, at, nil, nil, err
 	}
 	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {

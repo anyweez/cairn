@@ -275,6 +275,12 @@ var Decider = cairn.Decider[State, Msg, Result, Event, Effect]{
 }
 
 func decide(s State, m Msg) decision {
+	// The ledger stores text as UTF-8 and jsonb, so text it cannot hold must be
+	// refused before the message is recorded. Otherwise the codec would replace
+	// the offending bytes with U+FFFD and the caller would be told it succeeded.
+	if err := codec.CheckStorable(m); err != nil {
+		return refuse(Invalid, "%v", err)
+	}
 	if _, ok := m.(Create); !ok && s.Status == Uncreated {
 		return refuse(NotFound, "no such decision")
 	}

@@ -75,6 +75,37 @@ func TestDecodingRefusesWhatItCannotRead(t *testing.T) {
 	}
 }
 
+// A Marshaler decides its own encoding, so the walk must not read its fields.
+type marshalsItself struct{ Raw string }
+
+func (marshalsItself) MarshalJSON() ([]byte, error) { return []byte(`"ok"`), nil }
+
+func TestCheckStorableRejectsTextTheLedgerCannotKeep(t *testing.T) {
+	type inner struct {
+		Title string         `json:"title"`
+		Tags  map[string]any `json:"tags"`
+	}
+
+	if err := codec.CheckStorable(inner{Title: "ship it", Tags: map[string]any{"note": "fine", "rune": "\ufffd"}}); err != nil {
+		t.Fatalf("valid text was rejected: %v", err)
+	}
+	if err := codec.CheckStorable(marshalsItself{Raw: "ship\xffit"}); err != nil {
+		t.Fatalf("a Marshaler's own encoding should be trusted: %v", err)
+	}
+
+	for name, v := range map[string]any{
+		"invalid utf8":        inner{Title: "ship \xff it"},
+		"nul":                 inner{Title: "ship\x00it"},
+		"invalid utf8 in map": inner{Title: "ok", Tags: map[string]any{"note": "v\xff"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := codec.CheckStorable(v); err == nil {
+				t.Fatalf("CheckStorable accepted %#v", v)
+			}
+		})
+	}
+}
+
 func TestRegisterRejectsTypesOutsideTheSum(t *testing.T) {
 	defer func() {
 		if p := recover(); p == nil || !strings.Contains(p.(string), "does not implement") {
