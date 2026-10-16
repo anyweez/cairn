@@ -16,6 +16,13 @@ import (
 func fields(t types.Type) []string {
 	s := &shaper{active: map[types.Type]bool{}}
 	if st, ok := t.Underlying().(*types.Struct); ok && !s.opaque(t, false) {
+		// Mark the type itself active, as shape does for a named type, so an
+		// embedded pointer back to it is visited once and skipped, the way
+		// encoding/json treats a recursive type.
+		if named, ok := t.(*types.Named); ok {
+			s.active[named] = true
+			defer delete(s.active, named)
+		}
 		return s.structFields(st, false)
 	}
 	return []string{"=: " + s.shape(t, false)}
@@ -100,7 +107,17 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 				typ, inner = ptr.Elem(), true
 			}
 			if emb, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
+				named, _ := typ.(*types.Named)
+				if named != nil {
+					if s.active[named] {
+						continue // an embedded type already being rendered: json skips it
+					}
+					s.active[named] = true
+				}
 				out = append(out, s.structFields(emb, inner)...)
+				if named != nil {
+					delete(s.active, named)
+				}
 				continue
 			}
 		}
