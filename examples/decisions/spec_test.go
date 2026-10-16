@@ -47,7 +47,10 @@ func messages(t *rapid.T, s State) Msg {
 		}
 		return rapid.SampledFrom(ids).Draw(t, "option")
 	}
-	member := func() string { return rapid.SampledFrom(members).Draw(t, "by") }
+	// Mostly a member, sometimes nobody: decide refuses a message that names no
+	// sender, and the spec has to draw one to keep that refusal honest.
+	senders := append(slices.Clone(members), "")
+	member := func() string { return rapid.SampledFrom(senders).Draw(t, "by") }
 	// Mostly a member who has a position, sometimes anyone.
 	positioned := func() string {
 		candidates := slices.Clone(members)
@@ -61,6 +64,11 @@ func messages(t *rapid.T, s State) Msg {
 		return rapid.SampledFrom([]string{"", "  ", "ship it", "wait a quarter", "ship it "}).Draw(t, label)
 	}
 	at := func() time.Time {
+		// Sometimes the zero time, so a message that carries no time is refused
+		// rather than evolved into the state.
+		if rapid.IntRange(1, 4).Draw(t, "no time") == 1 {
+			return time.Time{}
+		}
 		return time.Unix(rapid.Int64Range(1_700_000_000, 1_800_000_000).Draw(t, "at"), 0).UTC()
 	}
 	status := func(label string) Status {
@@ -73,15 +81,17 @@ func messages(t *rapid.T, s State) Msg {
 	kinds := []string{"create", "edit", "add_option", "save_position", "record_outcome", "set_status", "supersede", "acknowledge"}
 	switch s.Status {
 	case Uncreated:
-		kinds = []string{"create", "create", "create", "edit"}
+		kinds = []string{"create", "create", "create", "create", "create", "create", "edit"}
 	case Open:
-		kinds = append(kinds, "add_option", "save_position", "save_position", "save_position", "record_outcome", "record_outcome")
+		kinds = append(kinds, "add_option", "save_position", "save_position", "save_position", "record_outcome", "record_outcome", "record_outcome", "record_outcome")
 	case Decided, Superseded:
 		// set_status rarely draws a particular status, so the moves the rules
 		// guard are drawn directly, often enough to be tried in every check:
 		// reopening (DR7), moving sideways to deferred or dropped (DR1), and
-		// recording again (DR6).
-		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "reopen", "supersede", "save_position",
+		// recording again (DR6). The counts carry a little slack for the
+		// empty-sender and zero-time messages decide now refuses, which
+		// otherwise starve the path to a settled decision.
+		kinds = append(kinds, "acknowledge", "acknowledge", "acknowledge", "set_status", "set_status", "reopen", "reopen", "reopen", "reopen", "supersede", "save_position",
 			"sideways", "sideways", "sideways", "record_outcome", "record_outcome", "record_outcome")
 	}
 	switch rapid.SampledFrom(kinds).Draw(t, "kind") {
@@ -262,6 +272,18 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 		"outcome rewritten": {"DR6", func(s State, m Msg) decision {
 			if r, ok := m.(RecordOutcome); ok && s.Status == Decided && s.option(r.Chosen) && r.Rationale != "" {
 				return accept(s, DecisionRecorded{Outcome: Outcome{Chosen: r.Chosen, Rationale: r.Rationale, DecidedBy: r.By, DecidedAt: r.At}})
+			}
+			return decide(s, m)
+		}},
+		// An outcome is recorded with no actor or no time. The message is
+		// otherwise well formed, so only DR2 can catch it.
+		"incomplete outcome": {"DR2", func(s State, m Msg) decision {
+			r, ok := m.(RecordOutcome)
+			rationale := strings.TrimSpace(r.Rationale)
+			if ok && s.Status == Open && s.option(r.Chosen) && rationale != "" {
+				outcome := Outcome{Chosen: r.Chosen, Rationale: rationale, DecidedBy: r.By, DecidedAt: r.At}
+				return decision{Result: Result{Status: Decided}, Events: []Event{DecisionRecorded{Outcome: outcome}},
+					Effects: []Effect{IndexReferences{Decision: s.ID, Text: s.Title + "\n" + rationale}}}
 			}
 			return decide(s, m)
 		}},

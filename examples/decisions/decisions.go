@@ -284,6 +284,14 @@ func decide(s State, m Msg) decision {
 	if _, ok := m.(Create); !ok && s.Status == Uncreated {
 		return refuse(NotFound, "no such decision")
 	}
+	// The shell stamps the entry's actor and time; it does not fill in the
+	// message the caller sent. A message that names no sender would be recorded
+	// in the log under the request's actor while the state it evolves names
+	// nobody, so it is refused here. Create and RecordOutcome check their own
+	// time where they store it.
+	if sender(m) == "" {
+		return refuse(Invalid, "a message needs a sender")
+	}
 
 	switch m := m.(type) {
 	case Create:
@@ -293,6 +301,9 @@ func decide(s State, m Msg) decision {
 		title := strings.TrimSpace(m.Title)
 		if title == "" || m.ID == "" {
 			return refuse(Invalid, "a decision needs a question")
+		}
+		if m.At.IsZero() {
+			return refuse(Invalid, "a decision needs a creation time")
 		}
 		options := []Option{}
 		for _, o := range m.Options {
@@ -351,6 +362,9 @@ func decide(s State, m Msg) decision {
 		rationale := strings.TrimSpace(m.Rationale)
 		if rationale == "" || m.Chosen == "" {
 			return refuse(Invalid, "recording a decision requires a chosen option and a rationale")
+		}
+		if m.At.IsZero() {
+			return refuse(Invalid, "recording a decision requires a time")
 		}
 		if !s.option(m.Chosen) {
 			return refuse(UnknownOption, "that option does not belong to this decision")
