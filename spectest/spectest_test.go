@@ -39,6 +39,18 @@ func counter(rule spec.Rule) spectest.Machine[int, int, int, int, struct{}] {
 	}
 }
 
+func TestEmptyFailureDetailFailsTheCheck(t *testing.T) {
+	rule := spec.Rule{ID: "C2", Kind: spec.Never, Status: spec.Established,
+		Statement: "The counter is checked with an empty failure detail."}
+	m := counter(rule)
+	m.Invariants = []spec.Invariant[int]{{Rule: rule, Check: func(int) spec.Verdict {
+		return spec.Check(false, "")
+	}}}
+	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "C2 violated") {
+		t.Fatalf("an empty failure detail must fail the check, got %q", msg)
+	}
+}
+
 func TestVacuousEstablishedRuleFails(t *testing.T) {
 	if testing.Short() {
 		t.Skip("vacuity is only enforced on a full-length check")

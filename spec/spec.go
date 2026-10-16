@@ -80,6 +80,7 @@ func (r Rule) String() string {
 // Verdict is one check's answer for one transition or state.
 type Verdict struct {
 	applies bool
+	failed  bool
 	failure string
 }
 
@@ -91,9 +92,10 @@ var (
 	NA = Verdict{}
 )
 
-// Fail reports a violation.
+// Fail reports a violation. The formatted detail may be empty and the
+// verdict still fails: whether a rule failed is a separate bit from its text.
 func Fail(format string, args ...any) Verdict {
-	return Verdict{applies: true, failure: fmt.Sprintf(format, args...)}
+	return Verdict{applies: true, failed: true, failure: fmt.Sprintf(format, args...)}
 }
 
 // Check is shorthand for Pass when ok, else a failure with the given detail.
@@ -107,8 +109,9 @@ func Check(ok bool, format string, args ...any) Verdict {
 // Applies reports whether the rule applied.
 func (v Verdict) Applies() bool { return v.applies }
 
-// Failed reports whether the rule was violated, and how.
-func (v Verdict) Failed() (string, bool) { return v.failure, v.failure != "" }
+// Failed reports whether the rule was violated, and how. The detail may be
+// empty, so callers must use the bool rather than test the string.
+func (v Verdict) Failed() (string, bool) { return v.failure, v.failed }
 
 // Transition is one decided message: the state before, the message, the
 // decision and the state after folding its events.
