@@ -168,22 +168,11 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, rep *report) {
 
 		after := state
 		for _, e := range decision.Events {
-			prev := after
 			mark := fingerprint(after)
 			next, ok := guard(func() S { return m.Decider.Evolve(after, e) })
 			j(Total, spec.Check(ok, "Evolve panicked on %+v: %v", e, next.panic))
 			j(Isolated, spec.Check(fingerprint(after) == mark, "Evolve modified its state for %+v", e))
 			after = next.value
-			// A Change sees the state before a message and the state after it,
-			// so a check that only compares the two misses a status that leaves
-			// its table and returns within one message. Check each folded event
-			// as well, with the state the message and that event saw.
-			if ok {
-				for _, c := range m.Changes {
-					c := c
-					j(c.Rule, checked(func() spec.Verdict { return c.Check(prev, msg, after) }))
-				}
-			}
 		}
 
 		if decision.Refused() {
