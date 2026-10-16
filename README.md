@@ -103,7 +103,7 @@ different kind:
 |---|---|
 | `cairn` | `Decider`, `Decision`, `Refusal`. Business logic as two pure functions: `Decide` turns a state and a message into events and effects (or a refusal), and `Evolve` folds one event into the state. |
 | `codec` | Versioned JSON for messages, results, events and effects, with upcasters for old versions. |
-| `ledger` | The Postgres shell. It takes per-stream locks, appends every decided message (refusals included) to an append-only log, queues effects in an outbox in the same transaction, runs projections over the global log, and re-decides stored history with `Verify`. |
+| `ledger` | The Postgres shell. It takes per-stream locks, appends every decided message it can store (refusals included) to an append-only log, queues effects in an outbox in the same transaction, runs projections over the global log, and re-decides stored history with `Verify`. |
 | `spec` / `spectest` | Rules (`Never` / `Can` / `Refines`, `Established` / `Proposed`), checked as laws over a transition, changes over the state alone, invariants over every state, and refinements of a reference model, by a rapid-based checker. It holds every machine to the framework's own rules (deterministic, total, refusals carry nothing, no mutation of the given state, replayable) as well as to the machine's rules, and reports how often each rule actually applied. |
 | `blocks/fsm` | A lifecycle as a table of allowed transitions. `Decide` consults it, the spec enforces it, and review renders it. |
 | `ledger/ledgertest` | A fresh, migrated database for each test. |

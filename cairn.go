@@ -13,7 +13,11 @@
 // spectest packages are where the shell and the checks live.
 package cairn
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
 
 // Decider is a stream's behaviour.
 //
@@ -60,6 +64,16 @@ func Refuse[R, Ev, Ef any](code, format string, args ...any) Decision[R, Ev, Ef]
 type Refusal struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// StorableText reports whether s can be stored in a ledger and read back
+// unchanged. Postgres stores text as UTF-8 and jsonb cannot represent a NUL,
+// so a string that is not valid UTF-8 or contains a NUL cannot be stored at
+// all; json.Marshal would otherwise quietly replace the offending bytes with
+// the replacement rune U+FFFD, and the ledger would hold text the caller never
+// wrote. A decider checks this to refuse what the ledger could not keep.
+func StorableText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }
 
 func (r *Refusal) Error() string { return r.Code + ": " + r.Message }
