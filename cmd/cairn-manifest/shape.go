@@ -5,6 +5,7 @@ import (
 	"go/types"
 	"reflect"
 	"strings"
+	"unicode"
 )
 
 // fields renders the JSON shape of a registered type, one entry per field, as
@@ -94,6 +95,12 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 		if name == "-" && !tagged {
 			continue
 		}
+		// encoding/json discards a tag name outside the tag alphabet and
+		// silently falls back to the Go field name. Mirror that here, so the
+		// manifest records the key encoding/json actually writes.
+		if !isValidTag(name) {
+			name = ""
+		}
 		if f.Embedded() && name == "" {
 			typ, inner := f.Type(), addr
 			if ptr, ok := typ.(*types.Pointer); ok {
@@ -130,6 +137,25 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 		out = append(out, name+": "+shape)
 	}
 	return out
+}
+
+// isValidTag reports whether s may name a JSON field. It mirrors
+// encoding/json's isValidTag: letters, digits and a fixed set of punctuation.
+// A name containing a quote, a backslash or a control character is rejected
+// and encoding/json falls back to the Go field name.
+func isValidTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+			// Backslash and quote are reserved; other punctuation is allowed.
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
 }
 
 func hasOption(opts, name string) bool {
