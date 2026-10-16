@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"reflect"
 )
 
@@ -166,10 +167,19 @@ func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, err
 // coversJSON reports whether now agrees with every field stored carries.
 func coversJSON(stored, now []byte) bool {
 	var x, y any
-	if json.Unmarshal(stored, &x) != nil || json.Unmarshal(now, &y) != nil {
+	if !decodeNumbers(stored, &x) || !decodeNumbers(now, &y) {
 		return bytes.Equal(stored, now)
 	}
 	return covers(x, y)
+}
+
+// decodeNumbers decodes one JSON value into v, keeping every number a
+// json.Number. A plain json.Unmarshal into any rounds a number to float64, so
+// two int64 results past 2^53 decode to the same value and compare equal.
+func decodeNumbers(data []byte, v any) bool {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v) == nil
 }
 
 // covers compares decoded JSON. A key missing from a stored object is a field
@@ -201,7 +211,24 @@ func covers(stored, now any) bool {
 			}
 		}
 		return true
+	case json.Number:
+		n, ok := now.(json.Number)
+		return ok && numbersEqual(s, n)
 	default:
 		return reflect.DeepEqual(stored, now)
 	}
+}
+
+// numbersEqual compares two JSON numbers by value, so 1 and 1.0 are the same
+// number while two integers beyond float64's exact range stay distinct.
+func numbersEqual(a, b json.Number) bool {
+	x, ok := new(big.Rat).SetString(a.String())
+	if !ok {
+		return a == b
+	}
+	y, ok := new(big.Rat).SetString(b.String())
+	if !ok {
+		return a == b
+	}
+	return x.Cmp(y) == 0
 }
