@@ -306,10 +306,17 @@ func decide(s State, m Msg) decision {
 			return refuse(Invalid, "a decision needs a creation time")
 		}
 		options := []Option{}
+		seen := map[string]bool{}
 		for _, o := range m.Options {
-			if t := strings.TrimSpace(o.Title); t != "" && o.ID != "" {
-				options = append(options, Option{ID: o.ID, Title: t})
+			title := strings.TrimSpace(o.Title)
+			if title == "" || o.ID == "" {
+				return refuse(Invalid, "an option needs a title")
 			}
+			if seen[o.ID] {
+				return refuse(Invalid, "option %s already exists", o.ID)
+			}
+			seen[o.ID] = true
+			options = append(options, Option{ID: o.ID, Title: title})
 		}
 		created := Created{ID: m.ID, Title: title, Options: options, By: m.By, At: m.At}
 		return decision{
