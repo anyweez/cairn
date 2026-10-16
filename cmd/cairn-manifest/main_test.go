@@ -80,6 +80,23 @@ func TestExtractHandlesRecursiveEmbeddedPointer(t *testing.T) {
 	}
 }
 
+// A named field that points back to its own type is not an embedded-flatten
+// recursion: encoding/json renders the field once and ends the type at its
+// name. The embedded-walk guard must leave this rendering alone.
+func TestExtractKeepsNamedSelfReference(t *testing.T) {
+	m, err := Extract("testdata/namedrecurse", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	want := []string{"v: int", "next: *{v: int, next: *example.com/namedrecurse.T}"}
+	if got := m.Codecs[0].Fields; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
 func TestExtractRefusesToGuess(t *testing.T) {
 	_, err := Extract("testdata/bad", "./...")
 	if err == nil {

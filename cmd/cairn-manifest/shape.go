@@ -14,14 +14,18 @@ import (
 // addressable, so a marshaler with a pointer receiver on that type is not
 // used and its fields are what is stored.
 func fields(t types.Type) []string {
-	s := &shaper{active: map[types.Type]bool{}}
+	s := &shaper{
+		active:    map[types.Type]bool{},
+		embedding: map[*types.Named]bool{},
+	}
 	if st, ok := t.Underlying().(*types.Struct); ok && !s.opaque(t, false) {
-		// Mark the type itself active, as shape does for a named type, so an
-		// embedded pointer back to it is visited once and skipped, the way
-		// encoding/json treats a recursive type.
+		// Seed the type itself as being flattened, so an untagged embedded
+		// pointer back to it is visited once and skipped the way
+		// encoding/json treats a recursive type. This is embedding, not
+		// active: active ends a named field at its name, embedding flattens.
 		if named, ok := t.(*types.Named); ok {
-			s.active[named] = true
-			defer delete(s.active, named)
+			s.embedding[named] = true
+			defer delete(s.embedding, named)
 		}
 		return s.structFields(st, false)
 	}
@@ -32,6 +36,12 @@ type shaper struct {
 	// active holds the named types being rendered, so a recursive type ends
 	// at its name instead of looping.
 	active map[types.Type]bool
+	// embedding holds the named types currently being flattened through
+	// untagged embedded fields. A type that embeds a pointer to itself would
+	// otherwise flatten forever; encoding/json visits it once and skips it.
+	// It is separate from active because an embedded field is flattened
+	// rather than named, so the active guard does not apply.
+	embedding map[*types.Named]bool
 }
 
 // shape renders a type as JSON sees it: a named string type is a string, a
@@ -109,14 +119,14 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 			if emb, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
 				named, _ := typ.(*types.Named)
 				if named != nil {
-					if s.active[named] {
-						continue // an embedded type already being rendered: json skips it
+					if s.embedding[named] {
+						continue // an embedded type already being flattened: json skips it
 					}
-					s.active[named] = true
+					s.embedding[named] = true
 				}
 				out = append(out, s.structFields(emb, inner)...)
 				if named != nil {
-					delete(s.active, named)
+					delete(s.embedding, named)
 				}
 				continue
 			}
