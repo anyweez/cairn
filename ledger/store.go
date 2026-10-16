@@ -484,10 +484,24 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 	return readStream(ctx, s.pool, stream, afterSeq)
 }
 
+// inFlightXmin is the smallest transaction ID still in flight in this
+// database, or the largest xid8 when none is. Transaction IDs are assigned by
+// the cluster, so pg_current_snapshot()'s xmin is the oldest transaction on
+// the whole server, and an idle transaction in another database would hold
+// back this one's committed entries. A transaction in another database cannot
+// write to cairn.entries here, so only this database's transactions, ordinary
+// and prepared, can leave a gap behind a reader's cursor.
+const inFlightXmin = `COALESCE(
+  (SELECT min(backend_xid::text::xid8) FROM pg_stat_activity
+    WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())),
+  (SELECT min(transaction::text::xid8) FROM pg_prepared_xacts
+    WHERE database = current_database()),
+  '18446744073709551615'::xid8)`
+
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	sql := `SELECT ` + entryColumns + ` FROM cairn.entries
 WHERE (txid, position) > ($1::text::xid8, $2)
-  AND txid < pg_snapshot_xmin(pg_current_snapshot())`
+  AND txid < ` + inFlightXmin
 	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
 	if len(kinds) > 0 {
 		sql += ` AND kind = ANY($3)`
@@ -505,9 +519,11 @@ WHERE (txid, position) > ($1::text::xid8, $2)
 }
 
 // ReadAll returns up to limit entries after the cursor, in transaction order
-// (each stream's entries in seq order), optionally only of the given kinds. Entries from transactions still in
-// flight are held back until every older transaction has finished, so a
-// reader that advances its cursor past what it read never misses an entry.
+// (each stream's entries in seq order), optionally only of the given kinds.
+// Entries from a transaction still in flight in this database are held back
+// until every older one here has finished, so a reader that advances its
+// cursor past what it read never misses an entry. A transaction open in
+// another database on the same server does not hold the log back.
 func (s *Store) ReadAll(ctx context.Context, after Cursor, limit int, kinds ...string) ([]Entry, Cursor, error) {
 	entries, err := readAll(ctx, s.pool, after, limit, kinds)
 	if err != nil {

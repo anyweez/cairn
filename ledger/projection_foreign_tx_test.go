@@ -5,8 +5,7 @@ import (
 )
 
 // A projection reads one database's entries, so an open transaction in a
-// different database on the same Postgres server must not stall it. readAll
-// fences on the cluster-wide xmin, so it does.
+// different database on the same Postgres server must not stall it.
 func TestAProjectionIsNotStalledByAnotherDatabasesTransaction(t *testing.T) {
 	agg := newCounter(t)
 	other := newCounter(t) // a second, unrelated database on the same server
