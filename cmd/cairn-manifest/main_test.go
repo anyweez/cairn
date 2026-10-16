@@ -47,6 +47,7 @@ func TestExtractReadsEverything(t *testing.T) {
 		"inline: {a: int}",                       // not addressable: the pointer marshaler is unused
 		"behind: *example.com/good.PtrMarshal",   // behind a pointer it marshals itself
 		"many: []example.com/good.PtrMarshal",    // slice elements are addressable
+		"nested: {n: int}",                       // embedded unexported struct, tagged, so marshaled as a named object
 	}
 	if !slices.Equal(c.Fields, wantFields) {
 		t.Errorf("fields:\n got %q\nwant %q", c.Fields, wantFields)
