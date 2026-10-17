@@ -254,7 +254,7 @@ func (x *extractor) rule(p *packages.Package, ident *ast.Ident, value ast.Expr) 
 // enum names value n of spec's Kind or Status type by its constant, as the
 // type's String method does: Never is "never".
 func (x *extractor) enum(p *packages.Package, lit *ast.CompositeLit, typeName string, n int64) string {
-	pkg := p.TypesInfo.TypeOf(lit).(*types.Named).Obj().Pkg()
+	pkg := types.Unalias(p.TypesInfo.TypeOf(lit)).(*types.Named).Obj().Pkg()
 	scope := pkg.Scope()
 	for _, name := range scope.Names() {
 		c, ok := scope.Lookup(name).(*types.Const)
@@ -388,7 +388,7 @@ func render(v constant.Value) string {
 }
 
 func isNamed(t types.Type, pkg, name string) bool {
-	n, ok := t.(*types.Named)
+	n, ok := types.Unalias(t).(*types.Named)
 	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == pkg && n.Obj().Name() == name
 }
 
