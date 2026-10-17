@@ -128,11 +128,15 @@ type Law[S, M, R, Ev, Ef any] struct {
 	Check func(Transition[S, M, R, Ev, Ef]) Verdict
 }
 
-// Change checks a rule against one state change: the state before a message,
-// the message, and the state after. It is a Law that needs nothing from the
-// decision, and most rules about a lifecycle are one. Its type parameters are
-// inferred from the check, which a Law's cannot be, so a helper such as
-// fsm.Law needs none spelled out.
+// Change checks a rule against one state change: the message, the state before
+// it, and the state after. It is checked once per folded event — before is the
+// state that event saw and after the state it produced — and once on the net
+// state the whole message produced, so a rule written as a Change must hold for
+// every intermediate step. A rule about only the net state is a Law over
+// Transition instead. It is a Law that needs nothing from the decision, and
+// most rules about a lifecycle are one. Its type parameters are inferred from
+// the check, which a Law's cannot be, so a helper such as fsm.Law needs none
+// spelled out.
 type Change[S, M any] struct {
 	Rule  Rule
 	Check func(before S, msg M, after S) Verdict

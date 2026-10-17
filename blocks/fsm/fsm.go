@@ -3,7 +3,9 @@
 // The table is plain Go data rather than code, so it does three jobs at once:
 // Decide asks it whether a transition is allowed, the spec checks that no
 // state change ever happens outside it, and review tooling renders it as a
-// diagram. Adding an edge is a loosening and shows up as one.
+// diagram. Adding an edge is a loosening and shows up as one. The spec checks
+// each event's step against the message's trigger, not only the net change, so
+// an intermediate state the table does not allow is caught.
 package fsm
 
 import (
