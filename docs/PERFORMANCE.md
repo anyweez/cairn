@@ -158,12 +158,13 @@ Ordered by payoff.
    (restarting the lease, then recording the outcome). That's off the path a
    caller waits on, but it limits how fast effects are carried out over a
    slow link.
-2. **Refusals stay durable.** A refused message costs a write transaction and
-   a flush, but it is an entry like any other: `Verify` replays it and an
-   idempotent retry is answered from it (docs/REFUSALS.md). `SET LOCAL
-   synchronous_commit = off` for transactions that record only refusals would
-   save the flush but not a round trip, so over a network it is worth little
-   and trades away part of that record.
+2. **Decide whether refusals need a durable write.** A refused message costs a
+   write transaction and a flush. `SET LOCAL synchronous_commit = off` for
+   transactions that record only refusals would save the flush, but not a
+   round trip, so over a network it is worth little. If a crash loses a
+   refusal, an idempotent retry is decided again instead of being answered
+   from the stored refusal. No state can be lost, because refusals carry no
+   events. This is a product decision more than a performance one.
 
 ## Storage
 

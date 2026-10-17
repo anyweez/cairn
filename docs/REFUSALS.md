@@ -24,15 +24,20 @@ exceeded.
 
 ## Why not a rate limit in the shell
 
-Whether a refusal is recorded would depend on a per-stream counter and the
-moment the message arrived. The same messages, replayed against the same
-code, would be recorded differently on a faster instance or a later day,
-and `Verify` could no longer re-decide exactly what was stored. The log is
-ordered by transaction ID, never by time, and its value is that it does not
-depend on when or where it was written; a clock in the record path takes
-that away. Deciding whether to record is a decision, and decisions do not
-see time. A limit also caps the *rate* a stream grows, not its size: a
-patient caller still grows it without limit.
+A limiter is about a caller, and the shell cannot tell who the caller is.
+It is handed a stream and a message, and `Meta.Actor` is a claim the message
+carries, not an identity the ledger has verified. A quota can only be keyed
+on an identity the application has authenticated, at the request edge. That
+is the objection: limiting belongs in the application because the shell has
+no caller it can trust.
+
+Replay is not the objection. A limiter that refuses before `Handle` records
+nothing, so it leaves no entry whose re-decision could differ — the refusal
+never reaches the log at all.
+
+A limit at the edge also caps the *rate* a stream grows, not its size: a
+patient caller still grows it without limit, which is why keeping the
+record matters.
 
 ## Why not a separate table
 
