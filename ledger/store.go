@@ -270,6 +270,27 @@ func validStream(st Stream) error {
 	return nil
 }
 
+// validKind refuses a kind that could be another's or that Postgres cannot
+// store, for the paths that filter by kind alone.
+func validKind(kind string) error {
+	if kind == "" || strings.Contains(kind, "/") {
+		return fmt.Errorf("cairn: invalid stream kind %q", kind)
+	}
+	if !cairn.StorableText(kind) {
+		return fmt.Errorf("cairn: invalid stream kind %q: the name is not valid UTF-8 or contains a NUL", kind)
+	}
+	return nil
+}
+
+// minTimestamptz and maxTimestamptz bound what Postgres's timestamptz can
+// hold: 4713 BC to 294276 AD. A producer-supplied OccurredAt outside them
+// reaches the server as a parameter and comes back as a raw SQLSTATE, so
+// queueAppend refuses it before it is sent.
+var (
+	minTimestamptz = time.Date(-4712, time.January, 1, 0, 0, 0, 0, time.UTC)
+	maxTimestamptz = time.Date(294276, time.December, 31, 23, 59, 59, 999999000, time.UTC)
+)
+
 func lockError(err error) error {
 	var pgErr *pgconn.PgError
 	switch {
@@ -351,6 +372,9 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	}
 	var occurred *time.Time
 	if !e.Meta.OccurredAt.IsZero() {
+		if e.Meta.OccurredAt.Before(minTimestamptz) || e.Meta.OccurredAt.After(maxTimestamptz) {
+			return fmt.Errorf("cairn: occurred_at for %s is outside the range Postgres can store", stream)
+		}
 		occurred = &e.Meta.OccurredAt
 	}
 	outbox := make([]string, len(e.Effects))
@@ -487,6 +511,9 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 }
 
 func readStream(ctx context.Context, q querier, stream Stream, afterSeq int64) ([]Entry, error) {
+	if err := validStream(stream); err != nil {
+		return nil, err
+	}
 	rows, err := q.Query(ctx, `SELECT `+entryColumns+` FROM cairn.entries
 WHERE stream = $1 AND seq > $2 ORDER BY seq`, stream.String(), afterSeq)
 	if err != nil {
@@ -501,6 +528,11 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 }
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
+	for _, kind := range kinds {
+		if err := validKind(kind); err != nil {
+			return nil, err
+		}
+	}
 	sql := `SELECT ` + entryColumns + ` FROM cairn.entries
 WHERE (txid, position) > ($1::text::xid8, $2)
   AND txid < pg_snapshot_xmin(pg_current_snapshot())`
@@ -537,6 +569,9 @@ func (s *Store) ReadAll(ctx context.Context, after Cursor, limit int, kinds ...s
 
 // Streams lists the IDs of every stream of a kind.
 func (s *Store) Streams(ctx context.Context, kind string) ([]Stream, error) {
+	if err := validKind(kind); err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `SELECT stream FROM cairn.streams WHERE kind = $1 ORDER BY stream`, kind)
 	if err != nil {
 		return nil, err
