@@ -621,7 +621,23 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	if entry.Effects, err = a.Codecs.Effects.EncodeAll(decision.Effects); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if !decision.Refused() {
+	if decision.Refused() {
+		// A refusal is not carried by a codec, so its text is checked here,
+		// the way Encode checks a message's. A code that is not valid UTF-8
+		// would no longer be what Verify compares and errors.Is matches, and a
+		// NUL cannot be represented in jsonb at all; either answers the
+		// decider's refusal without an entry, rather than recording text that
+		// no longer says what it said. The refusal's message may be invalid
+		// UTF-8: it is stored as the U+FFFD json.Marshal substitutes, and the
+		// refusal returned is that stored text rather than the text before the
+		// rewrite.
+		if !cairn.StorableText(entry.Refusal.Code) || strings.ContainsRune(entry.Refusal.Message, 0) {
+			return nil, at, nil, nil, decision.Refusal
+		}
+		if entry.Refusal, err = storableRefusal(entry.Refusal); err != nil {
+			return nil, at, nil, nil, err
+		}
+	} else {
 		result, err := a.Codecs.Results.Encode(decision.Result)
 		if err != nil {
 			return nil, at, nil, nil, err
@@ -637,8 +653,26 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	next.Seq = entry.Seq
 
 	return func() Handled[R] {
-		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: decision.Refusal}
+		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: entry.Refusal}
 	}, next, entry, decision.Events, nil
+}
+
+// storableRefusal returns r as the ledger will read it back. json.Marshal
+// rewrites a string that is not valid UTF-8 to U+FFFD, so a round trip through
+// it makes the refusal Handle returns the same text a later read or an
+// idempotent retry sees. It is not a storable-text check: that is the caller's,
+// since a refusal carrying a NUL or an unstorable code must not be recorded at
+// all.
+func storableRefusal(r *cairn.Refusal) (*cairn.Refusal, error) {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	out := &cairn.Refusal{}
+	if err := json.Unmarshal(data, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // pendingDuplicate is the entry an idempotency key names, if any, as read by
