@@ -9,7 +9,9 @@ package main
 
 import (
 	"encoding/json"
+	"go/token"
 	"go/types"
+	"slices"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -57,5 +59,58 @@ func TestAShadowedEmbeddedFieldIsNotAStoredField(t *testing.T) {
 	got := fields(typ)
 	if len(got) != len(wire) {
 		t.Fatalf("manifest lists %d fields %v, but encoding/json writes %d key(s) %s", len(got), got, len(wire), raw)
+	}
+}
+
+// Two more of encoding/json's dominance rules. A name reached at the same
+// depth from two fields is ambiguous and dropped, unless exactly one of them
+// is tagged, in which case the tagged one wins. The types are built with
+// go/types rather than declared in source, because two fields repeating a
+// JSON tag is itself a vet error; encoding/json writes {} for the tied shape
+// and {"Name":0} for the tagged one.
+func TestFieldDominanceDropsATieAndPrefersATag(t *testing.T) {
+	withField := func(name string, typ types.Type, tag string) *types.Struct {
+		return types.NewStruct(
+			[]*types.Var{types.NewField(token.NoPos, nil, name, typ, false)},
+			[]string{tag},
+		)
+	}
+	embedding := func(a, b *types.Struct) *types.Struct {
+		return types.NewStruct(
+			[]*types.Var{
+				types.NewField(token.NoPos, nil, "A", a, true),
+				types.NewField(token.NoPos, nil, "B", b, true),
+			},
+			[]string{"", ""},
+		)
+	}
+
+	for _, tc := range []struct {
+		name string
+		typ  types.Type
+		want []string
+	}{
+		{
+			// Same JSON name at the same depth, neither tagged: the name is
+			// ambiguous, so encoding/json writes no key for it.
+			"tie",
+			embedding(withField("Name", types.Typ[types.String], `json:"name"`),
+				withField("Name", types.Typ[types.String], `json:"name"`)),
+			nil,
+		},
+		{
+			// Same JSON name at the same depth, one tagged: the tagged field
+			// wins, and its int shape is what the manifest must record.
+			"tag wins",
+			embedding(withField("Name", types.Typ[types.String], ""),
+				withField("Name", types.Typ[types.Int], `json:"Name"`)),
+			[]string{"Name: int"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fields(tc.typ); !slices.Equal(got, tc.want) {
+				t.Fatalf("fields() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
