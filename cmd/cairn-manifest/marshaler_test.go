@@ -10,22 +10,25 @@ import (
 	"testing"
 )
 
-// wrongMarshaler has a method named MarshalJSON that does not satisfy
-// json.Marshaler (it takes an argument). It is not a json.Marshaler, so
-// encoding/json writes its field.
+// wrongMarshaler has a method named MarshalText that does not satisfy
+// encoding.TextMarshaler (it takes an argument), so encoding/json ignores it
+// and writes the field. It exercises the same fallback as the wrongly-signed
+// MarshalJSON below; go vet's stdmethods check rejects a wrongly-signed
+// MarshalJSON in compiled code, so the runtime reference uses MarshalText.
 type wrongMarshaler struct {
 	A int `json:"a"`
 }
 
-func (wrongMarshaler) MarshalJSON(extra int) ([]byte, error) { return nil, nil }
+func (wrongMarshaler) MarshalText(extra int) ([]byte, error) { return nil, nil }
 
-// opaque() in shape.go recognises a marshaler by method name alone. A method
-// named MarshalJSON whose signature does not satisfy json.Marshaler makes
-// encoding/json fall back to the type's fields, so the manifest must not call
-// the type opaque: doing so hides a field-shape change from the -base check.
+// opaque() must decide a marshaler from its signature, not its name alone. A
+// method named MarshalJSON whose signature does not satisfy json.Marshaler
+// makes encoding/json fall back to the type's fields, so the manifest must not
+// call the type opaque: doing so hides a field-shape change from the -base
+// check.
 func TestAWrongSignatureMarshalJSONDoesNotMakeATypeOpaque(t *testing.T) {
-	// Reference: encoding/json writes the field because the method is not
-	// json.Marshaler.
+	// Reference: encoding/json writes the field because a wrongly-signed
+	// marshaler method is not the interface it is named for.
 	b, err := json.Marshal(wrongMarshaler{A: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -56,5 +59,49 @@ func (T) MarshalJSON(extra int) ([]byte, error) { return nil, nil }
 	want := []string{"a: int"}
 	if !slices.Equal(got, want) {
 		t.Errorf("fields() = %q; encoding/json writes the field, so want %q", got, want)
+	}
+}
+
+// fields() decides a type is opaque from the marshaler method's signature, so
+// only the exact func() ([]byte, error) shape counts. json.RawMessage is a
+// named []byte and does not satisfy json.Marshaler, and encoding/json writes
+// the fields for it too.
+func TestOnlyAMarshalerSignatureMakesATypeOpaque(t *testing.T) {
+	cases := []struct {
+		name string
+		meth string
+		want []string
+	}{
+		{"correct MarshalJSON is opaque", "func (T) MarshalJSON() ([]byte, error) { return nil, nil }", []string{"=: p.T"}},
+		{"correct MarshalText is opaque", "func (T) MarshalText() ([]byte, error) { return nil, nil }", []string{"=: p.T"}},
+		{"json.RawMessage result is not opaque", "func (T) MarshalJSON() (RawMessage, error) { return nil, nil }", []string{"a: int"}},
+		{"single result is not opaque", "func (T) MarshalJSON() []byte { return nil }", []string{"a: int"}},
+		{"argument is not opaque", "func (T) MarshalJSON(extra int) ([]byte, error) { return nil, nil }", []string{"a: int"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `package p
+
+type RawMessage []byte
+
+type T struct {
+	A int ` + "`json:\"a\"`" + `
+}
+
+` + tc.meth + "\n"
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "p.go", src, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkg, err := (&types.Config{}).Check("p", fset, []*ast.File{f}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := fields(pkg.Scope().Lookup("T").Type())
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("fields() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
