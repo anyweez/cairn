@@ -3,6 +3,8 @@ package ledger
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,6 +20,13 @@ import (
 // and the version is recorded after the last. Its statements must be
 // idempotent (IF NOT EXISTS) and safe to run again, because a failure partway
 // through leaves the earlier ones applied with the version unrecorded.
+//
+// A failed or cancelled CREATE INDEX CONCURRENTLY leaves an INVALID index in
+// place, and IF NOT EXISTS then treats it as done on the next attempt. Before
+// recording a concurrent migration's version the runner fails if any index in
+// the cairn schema is invalid, so a retry cannot record a version over a
+// broken index: drop the invalid index with DROP INDEX CONCURRENTLY and
+// migrate again.
 type migration struct {
 	Statements []string
 	Concurrent bool
@@ -199,8 +208,8 @@ func (s *Store) migrate(ctx context.Context, migs []migration) error {
 		return fmt.Errorf("cairn: acquiring a connection to migrate: %w", err)
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('cairn.migrate'))`); err != nil {
-		return fmt.Errorf("cairn: locking for migration: %w", err)
+	if err := lockForMigration(ctx, conn); err != nil {
+		return err
 	}
 	// Unlock before the connection goes back to the pool, even when the
 	// caller's context ended: a session lock outlives the query otherwise.
@@ -227,6 +236,34 @@ CREATE TABLE IF NOT EXISTS cairn.schema_version (
 	return nil
 }
 
+// migrationLockPoll is how long migrate waits between attempts to take the
+// session-level advisory lock that serializes migrations.
+const migrationLockPoll = 50 * time.Millisecond
+
+// lockForMigration takes the session-level advisory lock that serializes
+// migrations, polling pg_try_advisory_lock rather than blocking in
+// pg_advisory_lock. A statement blocked in pg_advisory_lock holds a snapshot
+// for as long as it waits, and a concurrent migration's CREATE INDEX
+// CONCURRENTLY waits for older snapshots to end, so a process blocked on the
+// lock would deadlock against the build it is waiting for. Each attempt here
+// is its own statement, so a waiter holds no snapshot between them.
+func lockForMigration(ctx context.Context, conn *pgxpool.Conn) error {
+	for {
+		var locked bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('cairn.migrate'))`).Scan(&locked); err != nil {
+			return fmt.Errorf("cairn: locking for migration: %w", err)
+		}
+		if locked {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("cairn: waiting for the migration lock: %w", ctx.Err())
+		case <-time.After(migrationLockPoll):
+		}
+	}
+}
+
 // applyMigration runs one migration and records the version it reached.
 func applyMigration(ctx context.Context, conn *pgxpool.Conn, version int, m migration) error {
 	if m.Concurrent {
@@ -234,6 +271,13 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, version int, m migr
 			if _, err := conn.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("cairn: applying migration %d statement %d: %w", version, i+1, err)
 			}
+		}
+		invalid, err := invalidIndexes(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("cairn: checking migration %d for invalid indexes: %w", version, err)
+		}
+		if len(invalid) > 0 {
+			return fmt.Errorf("cairn: migration %d left invalid indexes %s; drop each with DROP INDEX CONCURRENTLY and migrate again", version, strings.Join(invalid, ", "))
 		}
 		if _, err := conn.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, version); err != nil {
 			return fmt.Errorf("cairn: recording migration %d: %w", version, err)
@@ -251,4 +295,36 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, version int, m migr
 		}
 		return nil
 	})
+}
+
+// invalidIndexes names every index in the cairn schema that is not valid. A
+// failed or cancelled CREATE INDEX CONCURRENTLY leaves one behind, and IF NOT
+// EXISTS treats it as done on the next attempt, so the runner refuses to
+// record a version while one exists. cairn owns the whole schema and a
+// migration never creates an index outside it, so any invalid index here is
+// one a concurrent migration left.
+func invalidIndexes(ctx context.Context, conn *pgxpool.Conn) ([]string, error) {
+	rows, err := conn.Query(ctx, `
+SELECT c.relname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT i.indisvalid AND n.nspname = 'cairn'
+ORDER BY c.relname`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }
