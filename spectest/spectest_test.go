@@ -96,6 +96,28 @@ func TestFailsIgnoresAGeneratorThatRejectsMostDraws(t *testing.T) {
 	}
 }
 
+// The harness message must not swallow a real violation: a generator that
+// rejects most draws is exactly when a mutant test is most likely to pass for
+// the wrong reason, so a rule that does fire must still be reported.
+func TestFailsStillCatchesARuleViolationWhenTheGeneratorRejectsMostDraws(t *testing.T) {
+	rule := spec.Rule{ID: "C3", Kind: spec.Never, Status: spec.Established,
+		Statement: "The counter moved off zero."}
+	m := counter(rule)
+	m.Invariants = []spec.Invariant[int]{{Rule: rule, Check: func(n int) spec.Verdict {
+		return spec.Check(n == 0, "counter moved to %d", n)
+	}}}
+	m.Messages = func(t *rapid.T, _ int) int {
+		if rapid.IntRange(0, 99).Draw(t, "valid") != 0 {
+			t.Skip("not a valid draw")
+		}
+		return 1
+	}
+	msg, failed := spectest.Fails(t, m.Check)
+	if !failed || !strings.Contains(msg, "C3 violated") {
+		t.Fatalf("a violated rule must fail even when the generator rejects most draws, got %q", msg)
+	}
+}
+
 func TestVacuousProposedRulePasses(t *testing.T) {
 	proposed := unreachable()
 	proposed.Status = spec.Proposed
