@@ -25,22 +25,37 @@ func TestTwoDispatchersDeliverEachEffectOnce(t *testing.T) {
 
 	var mu sync.Mutex
 	delivered := map[string]int{}
-	handle := func(_ context.Context, d ledger.Delivery[effect]) error {
-		time.Sleep(time.Millisecond) // leave the other dispatcher time to claim
-		mu.Lock()
-		delivered[d.Key()]++
-		mu.Unlock()
-		return nil
+	counts := make([]int, 2)
+	// Neither dispatcher may finish the effect it first claims until both have
+	// claimed one, so the two are known to have overlapped rather than one
+	// draining the outbox before the other ran.
+	var claimed sync.WaitGroup
+	claimed.Add(len(counts))
+	release := make(chan struct{})
+	handle := func(id int) func(context.Context, ledger.Delivery[effect]) error {
+		var first sync.Once
+		return func(_ context.Context, d ledger.Delivery[effect]) error {
+			mu.Lock()
+			delivered[d.Key()]++
+			counts[id]++
+			mu.Unlock()
+			first.Do(func() {
+				claimed.Done()
+				<-release
+			})
+			return nil
+		}
 	}
-	dispatcher := func() *ledger.Dispatcher[effect] {
+	dispatcher := func(id int) *ledger.Dispatcher[effect] {
 		return &ledger.Dispatcher[effect]{
 			Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
-			BatchSize: 5, Lease: time.Minute, Handle: handle,
+			BatchSize: 5, Lease: time.Minute, Handle: handle(id),
 		}
 	}
 
 	var wg sync.WaitGroup
-	for _, d := range []*ledger.Dispatcher[effect]{dispatcher(), dispatcher()} {
+	for id := range counts {
+		d := dispatcher(id)
 		wg.Go(func() {
 			for {
 				n, err := d.DrainOnce(ctx)
@@ -54,10 +69,24 @@ func TestTwoDispatchersDeliverEachEffectOnce(t *testing.T) {
 			}
 		})
 	}
+	// Release the two once both have claimed; the timeout keeps a claim that
+	// failed outright from hanging the test.
+	both := make(chan struct{})
+	go func() { claimed.Wait(); close(both) }()
+	select {
+	case <-both:
+	case <-time.After(10 * time.Second):
+	}
+	close(release)
 	wg.Wait()
 
 	if len(delivered) != effects {
 		t.Fatalf("delivered %d of %d effects", len(delivered), effects)
+	}
+	for id, n := range counts {
+		if n == 0 {
+			t.Fatalf("dispatcher %d delivered nothing; the two did not overlap", id)
+		}
 	}
 	for key, n := range delivered {
 		if n != 1 {

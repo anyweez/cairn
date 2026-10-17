@@ -20,7 +20,7 @@ type counterAgg = *ledger.Aggregate[counter, msg, int, event, effect]
 func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 	t.Parallel()
 
-	record := func(agg counterAgg, msgs ...add) {
+	record := func(t *testing.T, agg counterAgg, msgs ...add) {
 		t.Helper()
 		for _, m := range msgs {
 			// A refusal is recorded like any other decision, so it is expected
@@ -44,42 +44,42 @@ func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 		name   string
 		aspect ledger.Aspect
 		seq    int64
-		setup  func(counterAgg)
+		setup  func(*testing.T, counterAgg)
 		mutate func(counterAgg)
 	}{
 		{
 			name: "an accepted message is now refused", aspect: ledger.Refused, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{3, 100}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: always(cairn.Refuse[int, event, effect]("over_cap", "no")),
 		},
 		{
 			name: "a refused message is now accepted", aspect: ledger.Refused, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{9, 4}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{9, 4}) },
 			mutate: always(cairn.Accept[int, event, effect](1, []event{added{1}}, announce{1})),
 		},
 		{
 			name: "both refuse with different codes", aspect: ledger.Refused, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{9, 4}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{9, 4}) },
 			mutate: always(cairn.Refuse[int, event, effect]("other", "different")),
 		},
 		{
 			name: "the result differs", aspect: ledger.Returned, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{3, 100}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: always(cairn.Accept[int, event, effect](4, []event{added{3}}, announce{3})),
 		},
 		{
 			name: "the events differ", aspect: ledger.Emitted, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{3, 100}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: always(cairn.Accept[int, event, effect](3, []event{added{99}}, announce{3})),
 		},
 		{
 			name: "the effects differ", aspect: ledger.Effected, seq: 1,
-			setup:  func(agg counterAgg) { record(agg, add{3, 100}) },
+			setup:  func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: always(cairn.Accept[int, event, effect](3, []event{added{3}}, announce{99})),
 		},
 		{
 			name: "the message no longer decodes", aspect: ledger.Undecodable, seq: 1,
-			setup: func(agg counterAgg) { record(agg, add{3, 100}) },
+			setup: func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: func(agg counterAgg) {
 				// "add" is at version 2 today with no upcaster from version 1,
 				// so the stored envelope cannot reach the current shape.
@@ -92,7 +92,7 @@ func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 			// A divergent first message must not change the state the second is
 			// decided against: entry 1's events disagree, entry 2's do not.
 			name: "a divergence does not cascade", aspect: ledger.Emitted, seq: 1,
-			setup: func(agg counterAgg) { record(agg, add{3, 100}, add{4, 100}) },
+			setup: func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}, add{4, 100}) },
 			mutate: func(agg counterAgg) {
 				agg.Decider.Decide = func(s counter, m msg) cairn.Decision[int, event, effect] {
 					d := decide(s, m)
@@ -109,7 +109,7 @@ func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			agg := newCounter(t)
-			tc.setup(agg)
+			tc.setup(t, agg)
 			tc.mutate(agg)
 			divergences, err := agg.Verify(ctx, "a")
 			if err != nil {
