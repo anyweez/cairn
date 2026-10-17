@@ -3,9 +3,34 @@ package ledger
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// A migration is one step of the cairn schema. Statements run in order, and a
+// released migration is never edited (see the comment on migrations below).
+//
+// A transactional migration, the usual kind, runs every statement and its
+// version row in one transaction, so a failure leaves nothing behind. A
+// concurrent migration cannot: DDL such as CREATE INDEX CONCURRENTLY refuses
+// to run inside a transaction, so each of its statements is sent on its own
+// and the version is recorded after the last. Its statements must be
+// idempotent (IF NOT EXISTS) and safe to run again, because a failure partway
+// through leaves the earlier ones applied with the version unrecorded.
+//
+// A failed or cancelled CREATE INDEX CONCURRENTLY leaves an INVALID index in
+// place, and IF NOT EXISTS then treats it as done on the next attempt. Before
+// recording a concurrent migration's version the runner fails if any index in
+// the cairn schema is invalid, so a retry cannot record a version over a
+// broken index: drop the invalid index with DROP INDEX CONCURRENTLY and
+// migrate again.
+type migration struct {
+	Statements []string
+	Concurrent bool
+}
 
 // The library owns everything in the cairn schema. Applications read it
 // through this package and never write to it directly: the guarantees below
@@ -20,10 +45,10 @@ import (
 // release reads; it adds alongside, and drops only once no supported release
 // reads it. TestEveryReleasesStatementsRunOnTheNewestSchema holds the
 // statements earlier releases send.
-var migrations = []string{
+var migrations = []migration{
 	// 1: streams, the log, snapshots, the outbox, projection checkpoints and
 	// the lock functions.
-	`
+	{Statements: []string{`
 CREATE TABLE cairn.streams (
     stream     text PRIMARY KEY,
     kind       text NOT NULL,
@@ -161,7 +186,7 @@ BEGIN
             USING ERRCODE = 'CN002';
     END IF;
 END $$;
-`,
+`}},
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every
@@ -171,30 +196,135 @@ END $$;
 // earlier build still starts after a rollback: migrations only add, and never
 // change what an earlier release reads.
 func (s *Store) Migrate(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cairn.migrate'))`); err != nil {
-			return fmt.Errorf("cairn: locking for migration: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
+	return s.migrate(ctx, migrations)
+}
+
+// migrate applies migs, the released migrations in order. It holds a
+// session-level advisory lock rather than a transaction one, because a
+// concurrent migration's statements run outside any transaction.
+func (s *Store) migrate(ctx context.Context, migs []migration) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("cairn: acquiring a connection to migrate: %w", err)
+	}
+	defer conn.Release()
+	if err := lockForMigration(ctx, conn); err != nil {
+		return err
+	}
+	// Unlock before the connection goes back to the pool, even when the
+	// caller's context ended: a session lock outlives the query otherwise.
+	defer func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext('cairn.migrate'))`)
+	}()
+	if _, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS cairn;
 CREATE TABLE IF NOT EXISTS cairn.schema_version (
     version    int PRIMARY KEY,
     applied_at timestamptz NOT NULL DEFAULT now()
 )`); err != nil {
-			return fmt.Errorf("cairn: creating schema: %w", err)
+		return fmt.Errorf("cairn: creating schema: %w", err)
+	}
+	var current int
+	if err := conn.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM cairn.schema_version`).Scan(&current); err != nil {
+		return fmt.Errorf("cairn: reading schema version: %w", err)
+	}
+	for v := current + 1; v <= len(migs); v++ {
+		if err := applyMigration(ctx, conn, v, migs[v-1]); err != nil {
+			return err
 		}
-		var current int
-		if err := tx.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM cairn.schema_version`).Scan(&current); err != nil {
-			return fmt.Errorf("cairn: reading schema version: %w", err)
+	}
+	return nil
+}
+
+// migrationLockPoll is how long migrate waits between attempts to take the
+// session-level advisory lock that serializes migrations.
+const migrationLockPoll = 50 * time.Millisecond
+
+// lockForMigration takes the session-level advisory lock that serializes
+// migrations, polling pg_try_advisory_lock rather than blocking in
+// pg_advisory_lock. A statement blocked in pg_advisory_lock holds a snapshot
+// for as long as it waits, and a concurrent migration's CREATE INDEX
+// CONCURRENTLY waits for older snapshots to end, so a process blocked on the
+// lock would deadlock against the build it is waiting for. Each attempt here
+// is its own statement, so a waiter holds no snapshot between them.
+func lockForMigration(ctx context.Context, conn *pgxpool.Conn) error {
+	for {
+		var locked bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('cairn.migrate'))`).Scan(&locked); err != nil {
+			return fmt.Errorf("cairn: locking for migration: %w", err)
 		}
-		for v := current + 1; v <= len(migrations); v++ {
-			if _, err := tx.Exec(ctx, migrations[v-1]); err != nil {
-				return fmt.Errorf("cairn: applying migration %d: %w", v, err)
+		if locked {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("cairn: waiting for the migration lock: %w", ctx.Err())
+		case <-time.After(migrationLockPoll):
+		}
+	}
+}
+
+// applyMigration runs one migration and records the version it reached.
+func applyMigration(ctx context.Context, conn *pgxpool.Conn, version int, m migration) error {
+	if m.Concurrent {
+		for i, stmt := range m.Statements {
+			if _, err := conn.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("cairn: applying migration %d statement %d: %w", version, i+1, err)
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, v); err != nil {
-				return fmt.Errorf("cairn: recording migration %d: %w", v, err)
+		}
+		invalid, err := invalidIndexes(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("cairn: checking migration %d for invalid indexes: %w", version, err)
+		}
+		if len(invalid) > 0 {
+			return fmt.Errorf("cairn: migration %d left invalid indexes %s; drop each with DROP INDEX CONCURRENTLY and migrate again", version, strings.Join(invalid, ", "))
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, version); err != nil {
+			return fmt.Errorf("cairn: recording migration %d: %w", version, err)
+		}
+		return nil
+	}
+	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		for i, stmt := range m.Statements {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("cairn: applying migration %d statement %d: %w", version, i+1, err)
 			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, version); err != nil {
+			return fmt.Errorf("cairn: recording migration %d: %w", version, err)
 		}
 		return nil
 	})
+}
+
+// invalidIndexes names every index in the cairn schema that is not valid. A
+// failed or cancelled CREATE INDEX CONCURRENTLY leaves one behind, and IF NOT
+// EXISTS treats it as done on the next attempt, so the runner refuses to
+// record a version while one exists. cairn owns the whole schema and a
+// migration never creates an index outside it, so any invalid index here is
+// one a concurrent migration left.
+func invalidIndexes(ctx context.Context, conn *pgxpool.Conn) ([]string, error) {
+	rows, err := conn.Query(ctx, `
+SELECT c.relname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT i.indisvalid AND n.nspname = 'cairn'
+ORDER BY c.relname`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }

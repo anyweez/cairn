@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -132,5 +134,206 @@ func TestLockRefusesATransactionThatHasWritten(t *testing.T) {
 	})
 	if !errors.Is(err, errLockAfterWrite) {
 		t.Fatalf("lock after a write: %v, want errLockAfterWrite", err)
+	}
+}
+
+// A concurrent migration is one whose statements cannot run inside a
+// transaction. CREATE INDEX CONCURRENTLY is the reason the kind exists: it
+// refuses any transaction block, so this passes only if the runner really
+// sends each statement outside one.
+func TestConcurrentMigrationRunsOutsideATransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
+		},
+	})
+	if err := store.migrate(ctx, migs); err != nil {
+		t.Fatalf("applying a concurrent migration: %v", err)
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('cairn.entries_kind_seq') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("the concurrent migration's index was not created")
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migs) {
+		t.Fatalf("schema version %d after the concurrent migration, want %d", version, len(migs))
+	}
+}
+
+// A transactional migration is still one unit: a statement that fails rolls
+// back the ones before it and leaves the version unrecorded, so the next boot
+// runs the migration again.
+func TestTransactionalMigrationRollsBackOnFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Statements: []string{
+			`CREATE TABLE cairn.migrate_probe (n int)`,
+			`SELECT 1 / 0`,
+		},
+	})
+	if err := store.migrate(ctx, migs); err == nil {
+		t.Fatal("a failing migration reported no error")
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('cairn.migrate_probe') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("a table from a rolled-back migration survived")
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migrations) {
+		t.Fatalf("schema version %d after a failed migration, want %d", version, len(migrations))
+	}
+}
+
+// A failed CREATE INDEX CONCURRENTLY leaves an INVALID index in place, and
+// IF NOT EXISTS then treats it as done. Recording the version would tell the
+// next boot that a broken index was built, so the runner must refuse.
+func TestConcurrentMigrationDoesNotRecordOverAnInvalidIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Two streams of one kind, so a unique index over kind cannot build.
+	if _, err := pool.Exec(ctx, `INSERT INTO cairn.streams (stream, kind) VALUES ('a', 'counter'), ('b', 'counter')`); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS streams_kind_unique ON cairn.streams (kind)`,
+		},
+	})
+	if err := store.migrate(ctx, migs); err == nil {
+		t.Fatal("a concurrent migration over duplicate rows reported no error")
+	}
+	var valid bool
+	if err := pool.QueryRow(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid = 'cairn.streams_kind_unique'::regclass`).Scan(&valid); err != nil {
+		t.Fatal(err)
+	}
+	if valid {
+		t.Fatal("the failed build left a valid index; the trap was not exercised")
+	}
+	// The retry finds the index present and would record the version over it
+	// if the runner did not check indisvalid first.
+	if err := store.migrate(ctx, migs); err == nil {
+		t.Fatal("a retry recorded a version over an invalid index")
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migrations) {
+		t.Fatalf("schema version %d after a retry over an invalid index, want %d", version, len(migrations))
+	}
+}
+
+// A process waiting for the migration lock must not hold a snapshot while it
+// waits. CREATE INDEX CONCURRENTLY waits for older snapshots to end, so a
+// waiter that held one would deadlock against the build it is waiting for:
+// the build waits on the waiter's snapshot, and the waiter waits on the
+// build's session lock. Both callers must return nil.
+func TestConcurrentBootsDoNotDeadlockOnTheMigrationLock(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
+		},
+	})
+
+	// Hold the version table so the first migrate stops after it takes the
+	// migration lock and before it reaches the index build. The second
+	// caller's lock attempt then happens before the build takes its snapshot,
+	// so the waiter's snapshot is older than the build's: the deadlock.
+	gate, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Release()
+	gateTx, err := gate.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = gateTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := gateTx.Exec(ctx, `LOCK TABLE cairn.schema_version IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- store.migrate(ctx, migs) }()
+	waitForMigrationLock(t, ctx, pool)
+
+	second := make(chan error, 1)
+	go func() { second <- store.migrate(ctx, migs) }()
+	// Let the second caller reach the lock and, with a blocking lock, take its
+	// snapshot. With the polling lock it holds none, so the build never waits.
+	time.Sleep(300 * time.Millisecond)
+
+	if err := gateTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range []<-chan error{first, second} {
+		if err := <-ch; err != nil {
+			t.Errorf("a concurrent migrate returned %v", err)
+		}
+	}
+}
+
+// waitForMigrationLock waits until a migrate call holds the session-level
+// migration lock. pg_locks is scoped to this test's database, where only
+// migrate takes an advisory lock.
+func waitForMigrationLock(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var held int
+		if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM pg_locks
+WHERE locktype = 'advisory' AND granted
+  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&held); err != nil {
+			t.Fatal(err)
+		}
+		if held > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no migrate call took the migration lock")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
