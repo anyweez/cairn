@@ -44,10 +44,5 @@
 
 ## Open questions
 
-- **Refusals advance the stream sequence.** Recording them is the point (they
-  are the evidence for "this change would refuse N real requests"). A refused
-  message to a stream that doesn't exist also creates that stream. But a
-  client spamming refused messages grows the stream. Rate-limit in the shell,
-  or store refusals in a separate table?
 - **Effect ordering.** The outbox guarantees at-least-once delivery but not
   ordering. Is per-stream ordering worth the cost of a per-stream cursor?
