@@ -21,24 +21,21 @@ import (
 func TestAFailedEffectsErrorTextIsNotLostToARawDriverError(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
-	if _, err := agg.Handle(ctx, "a", add{1, 9}); err != nil {
-		t.Fatal(err)
-	}
 
 	for name, failure := range map[string]error{
 		"NUL":          errors.New("downstream rejected it: \x00"),
 		"invalid utf8": errors.New("downstream rejected it: \xff"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			// A fresh effect for each case.
-			h, err := agg.Handle(ctx, "b", add{1, 9})
-			if err != nil {
+			// A fresh effect for each case. The long backoff keeps an earlier
+			// case's failed effect out of this claim, so the effect checked below
+			// is the one that was just delivered.
+			if _, err := agg.Handle(ctx, "b", add{1, 9}); err != nil {
 				t.Fatal(err)
 			}
-			_ = h
 			d := &ledger.Dispatcher[effect]{
 				Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects, BatchSize: 1,
-				Backoff: func(int) time.Duration { return 0 },
+				Backoff: func(int) time.Duration { return time.Hour },
 				Handle:  func(context.Context, ledger.Delivery[effect]) error { return failure },
 			}
 			if _, err := d.DrainOnce(ctx); err != nil {
@@ -51,7 +48,7 @@ func TestAFailedEffectsErrorTextIsNotLostToARawDriverError(t *testing.T) {
 			}
 			var lastError *string
 			if err := agg.Store.Pool().QueryRow(ctx,
-				`SELECT last_error FROM cairn.outbox WHERE stream = 'counter/b'`).Scan(&lastError); err != nil {
+				`SELECT last_error FROM cairn.outbox WHERE stream = 'counter/b' ORDER BY id DESC LIMIT 1`).Scan(&lastError); err != nil {
 				t.Fatal(err)
 			}
 			if lastError == nil {
