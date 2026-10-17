@@ -267,6 +267,17 @@ func accept(s State, events ...Event) decision {
 	return cairn.Accept[Result, Event, Effect](Result{Status: s.Status}, events)
 }
 
+// indexText is the text the reference index holds for a decision: its title,
+// and its rationale once an outcome is recorded. Every message that changes
+// that text derives the effect's Text from the state it produces, so the index
+// and the decision cannot drift apart.
+func indexText(s State) string {
+	if s.Outcome == nil {
+		return s.Title
+	}
+	return s.Title + "\n" + s.Outcome.Rationale
+}
+
 // Decider is the register.
 var Decider = cairn.Decider[State, Msg, Result, Event, Effect]{
 	Initial: func() State { return State{} },
@@ -315,7 +326,7 @@ func decide(s State, m Msg) decision {
 		return decision{
 			Result:  Result{Status: Open},
 			Events:  []Event{created},
-			Effects: []Effect{IndexReferences{Decision: m.ID, Text: title}},
+			Effects: []Effect{IndexReferences{Decision: m.ID, Text: indexText(evolve(s, created))}},
 		}
 
 	case Edit:
@@ -326,10 +337,11 @@ func decide(s State, m Msg) decision {
 		if title == s.Title {
 			return accept(s)
 		}
+		edited := Edited{Title: title}
 		return decision{
 			Result:  Result{Status: s.Status},
-			Events:  []Event{Edited{Title: title}},
-			Effects: []Effect{IndexReferences{Decision: s.ID, Text: title}},
+			Events:  []Event{edited},
+			Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, edited))}},
 		}
 
 	case AddOption:
@@ -373,10 +385,11 @@ func decide(s State, m Msg) decision {
 			return refuse(NotAllowed, "this decision is no longer open")
 		}
 		outcome := Outcome{Chosen: m.Chosen, Rationale: rationale, DecidedBy: m.By, DecidedAt: m.At}
+		recorded := DecisionRecorded{Outcome: outcome}
 		return decision{
 			Result:  Result{Status: Decided},
-			Events:  []Event{DecisionRecorded{Outcome: outcome}},
-			Effects: []Effect{IndexReferences{Decision: s.ID, Text: s.Title + "\n" + rationale}},
+			Events:  []Event{recorded},
+			Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, recorded))}},
 		}
 
 	case SetStatus:
@@ -391,9 +404,9 @@ func decide(s State, m Msg) decision {
 			return refuse(NotAllowed, "a %s decision cannot be moved to %s; reopen it first", s.Status, m.To)
 		}
 		if s.Status.Settled() {
-			return decision{Result: Result{Status: to}, Events: []Event{
-				Reopened{From: s.Status, ClearedOutcome: s.Outcome, ClearedSupersededBy: s.SupersededBy},
-			}}
+			reopened := Reopened{From: s.Status, ClearedOutcome: s.Outcome, ClearedSupersededBy: s.SupersededBy}
+			return decision{Result: Result{Status: to}, Events: []Event{reopened},
+				Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, reopened))}}}
 		}
 		return decision{Result: Result{Status: to}, Events: []Event{StatusChanged{From: s.Status, To: to}}}
 
