@@ -99,7 +99,20 @@ func messages(t *rapid.T, s State) Msg {
 		n := rapid.IntRange(0, 3).Draw(t, "options")
 		options := make([]Option, n)
 		for i := range options {
-			options[i] = Option{ID: fmt.Sprintf("o%d", i+1), Title: text("option title")}
+			// Create now refuses a blank title or a repeated ID, so most
+			// generated options are valid and distinct: otherwise nearly
+			// every Create is refused and runs rarely reach the settled
+			// states the mutants need. A small share stays blank or repeats
+			// o1, so the new refusals are still exercised.
+			title := fmt.Sprintf("option %d", i+1)
+			if rapid.IntRange(1, 8).Draw(t, "blank option title") == 1 {
+				title = rapid.SampledFrom([]string{"", "  "}).Draw(t, "option title")
+			}
+			id := fmt.Sprintf("o%d", i+1)
+			if i > 0 && rapid.IntRange(1, 8).Draw(t, "repeated option id") == 1 {
+				id = "o1"
+			}
+			options[i] = Option{ID: id, Title: title}
 		}
 		return Create{ID: "d-1", By: member(), At: at(), Title: text("title"), Options: options}
 	case "edit":
