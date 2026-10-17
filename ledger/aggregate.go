@@ -204,6 +204,15 @@ type result[R any] struct {
 // which is answered from its first entry.
 var errUnchecked = errors.New("cairn: the message needs its idempotency key looked up")
 
+// answeredFromFirstEntry reports whether a metadata error leaves a message
+// eligible for the answer its idempotency key already holds. Only a missing
+// actor does: the retry lost the request's context, and the message was
+// attributed when it was recorded. Metadata that names a different actor is a
+// contradiction, and the request is refused rather than answered.
+func answeredFromFirstEntry(metaErr error) bool {
+	return metaErr == nil || errors.Is(metaErr, ErrNoActor)
+}
+
 // runGroup records reqs on one stream, in order, in one transaction, and
 // returns each one's result and the stream's state before and after them.
 //
@@ -276,13 +285,22 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	)
 	for i, r := range reqs {
 		switch {
+		// A request whose metadata names a different actor is refused even
+		// when its idempotency key matches: the entry it names is another
+		// actor's answer.
+		case !answeredFromFirstEntry(r.metaErr):
+			results[i].err = r.metaErr
+			continue
+		// A retry that lost its metadata may still be answered from its first
+		// entry, so its key is looked up before it is decided. Without the
+		// cache that lookup has already happened, in dups.
+		case r.metaErr != nil && r.o.key != "" && cached != nil:
+			results[i].err = errUnchecked
+			continue
 		// A retry gets its first answer even when it lost the request's
 		// metadata: the message was attributed when it was recorded.
 		case dups[i] != nil && dups[i].found:
 			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
-			continue
-		case r.metaErr != nil && r.o.key != "" && cached != nil:
-			results[i].err = errUnchecked
 			continue
 		case r.metaErr != nil:
 			results[i].err = r.metaErr
@@ -544,6 +562,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		return Handled[R]{}, err
 	}
 	o := collect(opts)
+	// Resolve the metadata before the key is looked up, so a request that
+	// names an actor its metadata contradicts is refused rather than answered
+	// from that actor's entry.
+	meta, metaErr := a.meta(ctx, msg, o)
 	// A retry gets its first answer even when it lost the request's metadata:
 	// the message was attributed when it was recorded.
 	if o.key != "" {
@@ -553,12 +575,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 			return Handled[R]{}, err
 		}
 		if dup.found {
-			return a.duplicateOf(dup.entry)
+			if answeredFromFirstEntry(metaErr) {
+				return a.duplicateOf(dup.entry)
+			}
+			return Handled[R]{}, metaErr
 		}
 	}
-	meta, err := a.meta(ctx, msg, o)
-	if err != nil {
-		return Handled[R]{}, err
+	if metaErr != nil {
+		return Handled[R]{}, metaErr
 	}
 
 	var b Batch
