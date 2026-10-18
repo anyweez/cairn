@@ -12,9 +12,9 @@ import (
 
 // The reference index holds absolute text for a decision and the outbox
 // delivers effects at least once but not in order. When an earlier
-// IndexReferences effect is retried after a later one has been delivered, the
-// index goes back to text the decision no longer has. indexText's comment
-// promises the index and the decision "cannot drift apart".
+// IndexReferences effect is retried after a later one has been delivered, a
+// consumer that just stores the text it is handed goes back to text the
+// decision no longer has. The index must drop the older delivery.
 func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 	ctx := context.Background()
 	svc := NewService(ledgertest.NewStore(t, ledger.RequireActor(true)))
@@ -29,7 +29,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	index := map[string]string{}
+	index := NewReferenceIndex()
 	deliveries := 0
 	d := &ledger.Dispatcher[Effect]{
 		Store:   svc.Register.Store,
@@ -37,12 +37,14 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 		Effects: svc.Register.Codecs.Effects,
 		Backoff: func(int) time.Duration { return time.Millisecond },
 		Handle: func(_ context.Context, dl ledger.Delivery[Effect]) error {
-			ir := dl.Effect.(IndexReferences)
 			deliveries++
 			if deliveries == 1 {
 				return errors.New("index unavailable")
 			}
-			index[ir.Decision] = ir.Text
+			// The retried create effect arrives after the edit's. The index
+			// drops it because its entry is older, not because of the order it
+			// is handed.
+			index.Apply(dl.Seq, dl.Effect.(IndexReferences))
 			return nil
 		},
 	}
@@ -62,7 +64,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := indexText(state)
-	if got := index[id]; got != want {
+	if got := index.Text(id); got != want {
 		t.Fatalf("the index holds %q, but the decision's text is %q", got, want)
 	}
 }
