@@ -71,7 +71,11 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	case *types.Pointer:
 		return "*" + s.shape(u.Elem(), true)
 	case *types.Slice:
-		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.Byte {
+		// encoding/json applies the byte-slice base64 special case only when
+		// the element type does not choose its own encoding. A named byte
+		// type with MarshalJSON or MarshalText is written as its marshaled
+		// value, so a slice of it is an array, not base64.
+		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.Byte && !s.opaque(u.Elem(), true) {
 			return "bytes" // base64
 		}
 		return "[]" + s.shape(u.Elem(), true)
