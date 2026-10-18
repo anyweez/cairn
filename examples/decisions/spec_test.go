@@ -99,7 +99,20 @@ func messages(t *rapid.T, s State) Msg {
 		n := rapid.IntRange(0, 3).Draw(t, "options")
 		options := make([]Option, n)
 		for i := range options {
-			options[i] = Option{ID: fmt.Sprintf("o%d", i+1), Title: text("option title")}
+			// Create now refuses a blank title or a repeated ID, so most
+			// generated options are valid and distinct: otherwise nearly
+			// every Create is refused and runs rarely reach the settled
+			// states the mutants need. A small share stays blank or repeats
+			// o1, so the new refusals are still exercised.
+			title := fmt.Sprintf("option %d", i+1)
+			if rapid.IntRange(1, 8).Draw(t, "blank option title") == 1 {
+				title = rapid.SampledFrom([]string{"", "  "}).Draw(t, "option title")
+			}
+			id := fmt.Sprintf("o%d", i+1)
+			if i > 0 && rapid.IntRange(1, 8).Draw(t, "repeated option id") == 1 {
+				id = "o1"
+			}
+			options[i] = Option{ID: id, Title: title}
 		}
 		return Create{ID: "d-1", By: member(), At: at(), Title: text("title"), Options: options}
 	case "edit":
@@ -169,7 +182,14 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 		Changes: []spec.Change[State, Msg]{
 			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, Trigger),
 			{Rule: FreezeOnSettle, Check: func(before State, m Msg, after State) spec.Verdict {
-				if before.Status == Open || before.Status == Uncreated {
+				// Options and positions are free only while the decision stays
+				// open; creation is the one message that fills them on its way
+				// out of Uncreated. Every other transition — including one that
+				// leaves open — must leave them untouched.
+				if before.Status == Open && after.Status == Open {
+					return spec.NA
+				}
+				if before.Status == Uncreated && after.Status == Open {
 					return spec.NA
 				}
 				stances := func(s State) map[string]Position {
@@ -181,7 +201,7 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 				}
 				return spec.Check(slices.Equal(before.Options, after.Options) &&
 					maps.Equal(stances(before), stances(after)),
-					"%T changed options or positions on a %s decision", m, before.Status)
+					"%T changed options or positions on a %s→%s decision", m, before.Status, after.Status)
 			}},
 			{Rule: OutcomeNotRewritten, Check: func(before State, _ Msg, after State) spec.Verdict {
 				if before.Outcome == nil || after.Outcome == nil {
