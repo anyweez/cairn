@@ -55,7 +55,13 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 			b.WriteString("<cycle>")
 			return
 		}
-		b.WriteByte('&')
+		// A pointer's identity is part of the value, not just its pointee: two
+		// keys pointing at equal values are still different keys, and a map
+		// that swaps their values is a different map. Without the address the
+		// two keys render alike, the swap is invisible, and a D4 mutation
+		// survives. A fingerprint is only ever compared for one object graph
+		// within a run, so the address is stable across the comparison.
+		fmt.Fprintf(b, "&%x", v.Pointer())
 		walk(b, v.Elem(), seen)
 		delete(seen, k)
 	case reflect.Interface:
