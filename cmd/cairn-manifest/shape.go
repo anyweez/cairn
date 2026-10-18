@@ -133,7 +133,9 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 	}
 
 	current := []queued{}
-	next := []queued{{typ: t}}
+	// The root of the walk carries the caller's addressability, so a direct
+	// field of an addressable struct is shaped as encoding/json reaches it.
+	next := []queued{{typ: t, addr: addr}}
 	// count is how many times a type was queued at the current depth. A type
 	// reachable twice contributes its fields twice, which is what makes
 	// encoding/json drop an ambiguous name rather than pick one.
