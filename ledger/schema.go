@@ -2,11 +2,15 @@ package ledger
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -190,7 +194,10 @@ END $$;
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every
-// process at startup: concurrent callers serialize on an advisory lock.
+// process at startup: concurrent callers serialize on a lease row in the
+// cairn schema, which every step of the protocol reads or writes with one
+// committed statement, so it excludes other callers through a transaction-
+// mode connection pooler as well as on a direct connection.
 //
 // A database a later release has already migrated is left as it is, so an
 // earlier build still starts after a rollback: migrations only add, and never
@@ -199,23 +206,61 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return s.migrate(ctx, migrations)
 }
 
-// migrate applies migs, the released migrations in order. It holds a
-// session-level advisory lock rather than a transaction one, because a
-// concurrent migration's statements run outside any transaction.
+// migrationLeaseTTL is how long a migrate caller's lease lasts if it is never
+// released. A caller whose process dies leaves its row behind, and once the
+// row expires the next caller takes it over; a caller that returns, fails or
+// is cancelled deletes its own row first, so the lease normally never reaches
+// its expiry.
+const migrationLeaseTTL = 5 * time.Minute
+
+// migrationLockPoll is how long migrate waits between attempts to take the
+// migration lease.
+const migrationLockPoll = 50 * time.Millisecond
+
+// migrate applies migs, the released migrations in order. The whole call is
+// serialized by a committed lease row rather than a session-level advisory
+// lock: a transaction-mode pooler may put each statement of a call on a
+// different server connection, where a session lock taken on one connection
+// excludes nobody, and a poll that lands on the connection already holding it
+// succeeds because session advisory locks are re-entrant. Every step here is
+// one autocommitted statement, so the committed lease is visible to every
+// caller through the pooler, and a waiter holds no snapshot while it polls.
 func (s *Store) migrate(ctx context.Context, migs []migration) error {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("cairn: acquiring a connection to migrate: %w", err)
 	}
-	defer conn.Release()
-	if err := lockForMigration(ctx, conn); err != nil {
+	if err := ensureMigrationLock(ctx, conn); err != nil {
+		conn.Release()
 		return err
 	}
-	// Unlock before the connection goes back to the pool, even when the
-	// caller's context ended: a session lock outlives the query otherwise.
-	defer func() {
-		_, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext('cairn.migrate'))`)
-	}()
+	holder, err := acquireMigrationLease(ctx, conn)
+	if err != nil {
+		conn.Release()
+		return err
+	}
+	err = applyMigrations(ctx, conn, migs)
+	// Release the lease on a context that outlives the caller's, even when the
+	// caller was cancelled: a lease left behind is only reclaimable when it
+	// expires. A cancellation often closes the connection the statement was
+	// sent on, so a failed DELETE is retried on a fresh one.
+	releaseCtx := context.WithoutCancel(ctx)
+	_, relErr := conn.Exec(releaseCtx,
+		`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder)
+	conn.Release()
+	if relErr != nil {
+		if fresh, aerr := s.pool.Acquire(releaseCtx); aerr == nil {
+			_, _ = fresh.Exec(releaseCtx,
+				`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder)
+			fresh.Release()
+		}
+	}
+	return err
+}
+
+// applyMigrations creates the version table and runs every migration after the
+// recorded version. The caller holds the migration lease.
+func applyMigrations(ctx context.Context, conn *pgxpool.Conn, migs []migration) error {
 	if _, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS cairn;
 CREATE TABLE IF NOT EXISTS cairn.schema_version (
@@ -236,32 +281,92 @@ CREATE TABLE IF NOT EXISTS cairn.schema_version (
 	return nil
 }
 
-// migrationLockPoll is how long migrate waits between attempts to take the
-// session-level advisory lock that serializes migrations.
-const migrationLockPoll = 50 * time.Millisecond
-
-// lockForMigration takes the session-level advisory lock that serializes
-// migrations, polling pg_try_advisory_lock rather than blocking in
-// pg_advisory_lock. A statement blocked in pg_advisory_lock holds a snapshot
-// for as long as it waits, and a concurrent migration's CREATE INDEX
-// CONCURRENTLY waits for older snapshots to end, so a process blocked on the
-// lock would deadlock against the build it is waiting for. Each attempt here
-// is its own statement, so a waiter holds no snapshot between them.
-func lockForMigration(ctx context.Context, conn *pgxpool.Conn) error {
+// ensureMigrationLock creates the cairn schema and the migration lease's
+// table if they do not exist. Callers run it concurrently on a fresh
+// database, and CREATE ... IF NOT EXISTS races: each caller checks the catalog
+// before the other has committed, both insert the name, and the loser gets a
+// unique violation instead of the no-op IF NOT EXISTS promises. The statement
+// is idempotent, so the loser retries until it observes what the winner
+// committed. Retrying rather than serializing keeps the wait to its own
+// statement, so no caller holds a snapshot while another bootstraps.
+func ensureMigrationLock(ctx context.Context, conn *pgxpool.Conn) error {
 	for {
-		var locked bool
-		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('cairn.migrate'))`).Scan(&locked); err != nil {
-			return fmt.Errorf("cairn: locking for migration: %w", err)
-		}
-		if locked {
+		_, err := conn.Exec(ctx, `
+CREATE SCHEMA IF NOT EXISTS cairn;
+CREATE TABLE IF NOT EXISTS cairn.migration_lock (
+    id         int PRIMARY KEY,
+    holder     text NOT NULL,
+    expires_at timestamptz NOT NULL
+)`)
+		if err == nil {
 			return nil
+		}
+		if !isConcurrentCreate(err) {
+			return fmt.Errorf("cairn: creating the migration lock: %w", err)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("cairn: waiting for the migration lock: %w", ctx.Err())
+			return fmt.Errorf("cairn: creating the migration lock: %w", ctx.Err())
 		case <-time.After(migrationLockPoll):
 		}
 	}
+}
+
+// isConcurrentCreate reports whether err is the unique violation two callers
+// racing to CREATE the same schema or table produce. Only that race is
+// retried: any other error, a duplicate table over a relation that is not a
+// table included, would fail the same way again.
+func isConcurrentCreate(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "23505" // unique_violation on pg_namespace or pg_type
+}
+
+// acquireMigrationLease takes the migration lease and returns this caller's
+// holder id. Each attempt is one autocommitted statement, so a transaction-
+// mode pooler can send it on any connection and the committed row still
+// excludes every other caller. An unexpired lease is left alone and the
+// attempt returns no row; a caller whose context ends while waiting returns an
+// error, and the lease it never took is untouched.
+func acquireMigrationLease(ctx context.Context, conn *pgxpool.Conn) (string, error) {
+	holder, err := newMigrationHolder()
+	if err != nil {
+		return "", err
+	}
+	for {
+		var taken string
+		err := conn.QueryRow(ctx, `
+INSERT INTO cairn.migration_lock (id, holder, expires_at)
+VALUES (1, $1, now() + make_interval(secs => $2))
+ON CONFLICT (id) DO UPDATE
+    SET holder = excluded.holder, expires_at = excluded.expires_at
+    WHERE cairn.migration_lock.expires_at <= now()
+RETURNING holder`, holder, migrationLeaseTTL.Seconds()).Scan(&taken)
+		switch {
+		case err == nil:
+			return taken, nil
+		case errors.Is(err, pgx.ErrNoRows):
+			// Another caller holds a lease that has not expired.
+		default:
+			return "", fmt.Errorf("cairn: taking the migration lease: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("cairn: waiting for the migration lease: %w", ctx.Err())
+		case <-time.After(migrationLockPoll):
+		}
+	}
+}
+
+// newMigrationHolder returns an id that identifies one migrate caller's lease.
+func newMigrationHolder() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("cairn: generating a migration holder id: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // applyMigration runs one migration and records the version it reached.
@@ -285,6 +390,13 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, version int, m migr
 		return nil
 	}
 	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		// A transaction pins its server connection, so the transaction-level
+		// lock works through a pooler too. It is held for this migration's
+		// whole transaction, so a caller whose lease expired mid-migration
+		// still cannot run the same statements alongside it.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cairn.migrate'))`); err != nil {
+			return fmt.Errorf("cairn: locking for migration %d: %w", version, err)
+		}
 		for i, stmt := range m.Statements {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("cairn: applying migration %d statement %d: %w", version, i+1, err)

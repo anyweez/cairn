@@ -296,12 +296,12 @@ func TestConcurrentBootsDoNotDeadlockOnTheMigrationLock(t *testing.T) {
 
 	first := make(chan error, 1)
 	go func() { first <- store.migrate(ctx, migs) }()
-	waitForMigrationLock(t, ctx, pool)
+	waitForMigrationLease(t, ctx, pool)
 
 	second := make(chan error, 1)
 	go func() { second <- store.migrate(ctx, migs) }()
-	// Let the second caller reach the lock and, with a blocking lock, take its
-	// snapshot. With the polling lock it holds none, so the build never waits.
+	// Let the second caller reach the lease and, with a blocking lock, take its
+	// snapshot. With the polling lease it holds none, so the build never waits.
 	time.Sleep(300 * time.Millisecond)
 
 	if err := gateTx.Rollback(ctx); err != nil {
@@ -314,25 +314,107 @@ func TestConcurrentBootsDoNotDeadlockOnTheMigrationLock(t *testing.T) {
 	}
 }
 
-// waitForMigrationLock waits until a migrate call holds the session-level
-// migration lock. pg_locks is scoped to this test's database, where only
-// migrate takes an advisory lock.
-func waitForMigrationLock(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+// A caller that is cancelled while it holds the migration lease still
+// releases it: the release runs on a context that outlives the cancellation,
+// because the cancelled context can no longer send the DELETE. The next boot
+// then takes the lease instead of waiting out its expiry.
+func TestCancelledMigrateReleasesTheMigrationLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
+		},
+	})
+
+	// Hold the version table so the caller stops after it takes the lease and
+	// before it applies anything.
+	gate, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Release()
+	gateTx, err := gate.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateTx.Exec(ctx, `LOCK TABLE cairn.schema_version IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	callerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- store.migrate(callerCtx, migs) }()
+	waitForMigrationLease(t, ctx, pool)
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled migrate returned nil")
+	}
+	if err := gateTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var held int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cairn.migration_lock WHERE id = 1`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 0 {
+		t.Fatalf("a cancelled caller left %d lease rows behind", held)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrating after a cancelled caller: %v", err)
+	}
+}
+
+// A caller that dies holding the lease leaves a row nothing deletes, so the
+// lease must be reclaimable once it expires; otherwise every later boot would
+// wait for a process that is gone.
+func TestExpiredMigrationLeaseIsReclaimable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.migration_lock (id, holder, expires_at)
+VALUES (1, 'dead-process', now() - interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migrating over an expired lease: %v", err)
+	}
+	var held int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cairn.migration_lock WHERE id = 1`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 0 {
+		t.Fatalf("the reclaimed lease was not released: %d rows", held)
+	}
+}
+
+// waitForMigrationLease waits until a migrate call holds the migration lease.
+// The lease is a committed row, so this pool sees the holder's row even
+// though the holder is a different connection.
+func waitForMigrationLease(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var held int
-		if err := pool.QueryRow(ctx, `
-SELECT count(*) FROM pg_locks
-WHERE locktype = 'advisory' AND granted
-  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&held); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM cairn.migration_lock WHERE id = 1`).Scan(&held); err != nil {
 			t.Fatal(err)
 		}
 		if held > 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no migrate call took the migration lock")
+			t.Fatal("no migrate call took the migration lease")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
