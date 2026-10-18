@@ -399,7 +399,7 @@ func render(v constant.Value) string {
 }
 
 func isNamed(t types.Type, pkg, name string) bool {
-	n, ok := t.(*types.Named)
+	n, ok := types.Unalias(t).(*types.Named)
 	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == pkg && n.Obj().Name() == name
 }
 
