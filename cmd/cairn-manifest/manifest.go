@@ -354,9 +354,12 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		x.codecAt[c.key()] = at
 		x.codecs[c.key()] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
-		recv := info.Selections[call.Fun.(*ast.SelectorExpr)].Recv()
+		// The codec can be named through an alias of *codec.Codec[T], which
+		// go/types keeps as an *types.Alias until it is resolved; unalias before
+		// and after the pointer test so the receiver is *codec.Codec[T].
+		recv := types.Unalias(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv())
 		if ptr, ok := recv.(*types.Pointer); ok {
-			recv = ptr.Elem()
+			recv = types.Unalias(ptr.Elem())
 		}
 		sum := recv.(*types.Named).TypeArgs().At(0)
 		name, okName := x.constant(p, call.Args[0])
@@ -443,9 +446,12 @@ func isMethod(info *types.Info, call *ast.CallExpr, pkg, recv, name string) bool
 		return false
 	}
 	fn := s.Obj().(*types.Func)
-	r := s.Recv()
+	// The receiver can be named through an alias of *codec.Codec[T], which
+	// go/types keeps as an *types.Alias; unalias before and after the pointer
+	// test, or the pointer never matches and isNamed sees the alias.
+	r := types.Unalias(s.Recv())
 	if ptr, ok := r.(*types.Pointer); ok {
-		r = ptr.Elem()
+		r = types.Unalias(ptr.Elem())
 	}
 	return fn.Pkg() != nil && fn.Pkg().Path() == pkg && fn.Name() == name && isNamed(r, pkg, recv)
 }
