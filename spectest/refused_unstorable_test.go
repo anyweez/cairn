@@ -61,3 +61,17 @@ func TestRefusedUnstorableMessagePassesD6(t *testing.T) {
 		t.Fatalf("the machine failed for some other reason:\n%s", msg)
 	}
 }
+
+// The other half of the rule: a message the decider accepts is recorded, so
+// it must be storable. D6 still fails an accepted message the codec rejects.
+func TestAcceptedUnstorableMessageFailsD6(t *testing.T) {
+	m := noteMachine()
+	m.Decider.Decide = func(n int, _ noteMsg) cairn.Decision[int, int, struct{}] {
+		return cairn.Accept[int, int, struct{}](n+1, []int{1})
+	}
+	msg, failed := spectest.Fails(t, m.Check)
+	if !failed || !strings.Contains(msg, spectest.Encodable.ID) {
+		t.Fatalf("an accepted unstorable message should fail %s, got failed=%v:\n%s",
+			spectest.Encodable.ID, failed, msg)
+	}
+}
