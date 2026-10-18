@@ -112,8 +112,8 @@ func TestRegisterOnTheLedger(t *testing.T) {
 			break
 		}
 	}
-	// Two creates and two recorded outcomes.
-	if len(indexed) != 4 {
+	// Two creates, two recorded outcomes, and one reopen.
+	if len(indexed) != 5 {
 		t.Fatalf("indexed %v", indexed)
 	}
 }

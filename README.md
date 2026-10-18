@@ -66,6 +66,13 @@ given and can never delete it. The decision *about* the data belongs in
 cairn; the data itself stays in your own mutable tables, where ordinary
 deletion works. See [docs/REDACTION.md](docs/REDACTION.md).
 
+**Refusals.** A refused message is an entry like any other, so `Verify` can
+replay it and a retried refusal gets the same answer. That means a caller
+free to send without limit can grow a stream without limit. The library does
+not rate-limit refusals or keep them in a separate table; bound abusive
+traffic at the request edge, per actor or per stream. See
+[docs/REFUSALS.md](docs/REFUSALS.md).
+
 ## When not to use cairn
 
 - **CRUD with no rules:** profile fields, content bodies, settings.

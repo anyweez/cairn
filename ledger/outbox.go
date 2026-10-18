@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/anyweez/cairn/codec"
@@ -172,17 +173,25 @@ SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id
 				`UPDATE cairn.outbox SET done_at = now(), last_error = NULL WHERE id = $1`+fenced, c.id, c.attempts)
 		case d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts:
 			_, err = d.Store.pool.Exec(record,
-				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, c.attempts, err.Error())
+				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, c.attempts, storableError(err))
 		default:
 			_, err = d.Store.pool.Exec(record, `UPDATE cairn.outbox
 SET available_at = now() + make_interval(secs => $3), last_error = $4 WHERE id = $1`+fenced,
-				c.id, c.attempts, cfg.backoff(c.attempts).Seconds(), err.Error())
+				c.id, c.attempts, cfg.backoff(c.attempts).Seconds(), storableError(err))
 		}
 		if err != nil {
 			return len(batch), err
 		}
 	}
 	return len(batch), nil
+}
+
+// storableError returns err's text with anything the ledger cannot store
+// replaced by the Unicode replacement rune. A handler's error comes from
+// another system, so it may carry a NUL or invalid UTF-8; recording why an
+// effect failed must not lose the cause to a raw driver error.
+func storableError(err error) string {
+	return strings.ToValidUTF8(strings.ReplaceAll(err.Error(), "\x00", "\uFFFD"), "\uFFFD")
 }
 
 func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byte) (err error) {

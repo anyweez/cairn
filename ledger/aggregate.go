@@ -204,6 +204,15 @@ type result[R any] struct {
 // which is answered from its first entry.
 var errUnchecked = errors.New("cairn: the message needs its idempotency key looked up")
 
+// answeredFromFirstEntry reports whether a metadata error leaves a message
+// eligible for the answer its idempotency key already holds. Only a missing
+// actor does: the retry lost the request's context, and the message was
+// attributed when it was recorded. Metadata that names a different actor is a
+// contradiction, and the request is refused rather than answered.
+func answeredFromFirstEntry(metaErr error) bool {
+	return metaErr == nil || errors.Is(metaErr, ErrNoActor)
+}
+
 // runGroup records reqs on one stream, in order, in one transaction, and
 // returns each one's result and the stream's state before and after them.
 //
@@ -276,13 +285,22 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	)
 	for i, r := range reqs {
 		switch {
+		// A request whose metadata names a different actor is refused even
+		// when its idempotency key matches: the entry it names is another
+		// actor's answer.
+		case !answeredFromFirstEntry(r.metaErr):
+			results[i].err = r.metaErr
+			continue
+		// A retry that lost its metadata may still be answered from its first
+		// entry, so its key is looked up before it is decided. Without the
+		// cache that lookup has already happened, in dups.
+		case r.metaErr != nil && r.o.key != "" && cached != nil:
+			results[i].err = errUnchecked
+			continue
 		// A retry gets its first answer even when it lost the request's
 		// metadata: the message was attributed when it was recorded.
 		case dups[i] != nil && dups[i].found:
 			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
-			continue
-		case r.metaErr != nil && r.o.key != "" && cached != nil:
-			results[i].err = errUnchecked
 			continue
 		case r.metaErr != nil:
 			results[i].err = r.metaErr
@@ -544,6 +562,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		return Handled[R]{}, err
 	}
 	o := collect(opts)
+	// Resolve the metadata before the key is looked up, so a request that
+	// names an actor its metadata contradicts is refused rather than answered
+	// from that actor's entry.
+	meta, metaErr := a.meta(ctx, msg, o)
 	// A retry gets its first answer even when it lost the request's metadata:
 	// the message was attributed when it was recorded.
 	if o.key != "" {
@@ -553,12 +575,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 			return Handled[R]{}, err
 		}
 		if dup.found {
-			return a.duplicateOf(dup.entry)
+			if answeredFromFirstEntry(metaErr) {
+				return a.duplicateOf(dup.entry)
+			}
+			return Handled[R]{}, metaErr
 		}
 	}
-	meta, err := a.meta(ctx, msg, o)
-	if err != nil {
-		return Handled[R]{}, err
+	if metaErr != nil {
+		return Handled[R]{}, metaErr
 	}
 
 	var b Batch
@@ -621,7 +645,23 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	if entry.Effects, err = a.Codecs.Effects.EncodeAll(decision.Effects); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if !decision.Refused() {
+	if decision.Refused() {
+		// A refusal is not carried by a codec, so its text is checked here,
+		// the way Encode checks a message's. A code that is not valid UTF-8
+		// would no longer be what Verify compares and errors.Is matches, and a
+		// NUL cannot be represented in jsonb at all; either answers the
+		// decider's refusal without an entry, rather than recording text that
+		// no longer says what it said. The refusal's message may be invalid
+		// UTF-8: it is stored as the U+FFFD json.Marshal substitutes, and the
+		// refusal returned is that stored text rather than the text before the
+		// rewrite.
+		if !cairn.StorableText(entry.Refusal.Code) || strings.ContainsRune(entry.Refusal.Message, 0) {
+			return nil, at, nil, nil, decision.Refusal
+		}
+		if entry.Refusal, err = storableRefusal(entry.Refusal); err != nil {
+			return nil, at, nil, nil, err
+		}
+	} else {
 		result, err := a.Codecs.Results.Encode(decision.Result)
 		if err != nil {
 			return nil, at, nil, nil, err
@@ -637,8 +677,26 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	next.Seq = entry.Seq
 
 	return func() Handled[R] {
-		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: decision.Refusal}
+		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: entry.Refusal}
 	}, next, entry, decision.Events, nil
+}
+
+// storableRefusal returns r as the ledger will read it back. json.Marshal
+// rewrites a string that is not valid UTF-8 to U+FFFD, so a round trip through
+// it makes the refusal Handle returns the same text a later read or an
+// idempotent retry sees. It is not a storable-text check: that is the caller's,
+// since a refusal carrying a NUL or an unstorable code must not be recorded at
+// all.
+func storableRefusal(r *cairn.Refusal) (*cairn.Refusal, error) {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	out := &cairn.Refusal{}
+	if err := json.Unmarshal(data, out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // pendingDuplicate is the entry an idempotency key names, if any, as read by

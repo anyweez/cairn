@@ -114,10 +114,6 @@ func (e *NotStorableError) Error() string {
 	return fmt.Sprintf("%s is not valid UTF-8 or contains a NUL, so it cannot be stored", e.Path)
 }
 
-// maxStorableDepth bounds the walk CheckStorable does, so a value that is a
-// cycle is left for json.Marshal to reject rather than recursed forever.
-const maxStorableDepth = 1000
-
 // CheckStorable reports whether every string in v can be stored in the ledger
 // and read back unchanged. json.Marshal replaces a string that is not valid
 // UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
@@ -126,11 +122,34 @@ const maxStorableDepth = 1000
 // It walks the same values json.Marshal does. A type with its own MarshalJSON
 // or MarshalText decides its own encoding and is not inspected.
 func CheckStorable(v any) error {
-	return checkStorable(reflect.ValueOf(v), "value", 0)
+	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
 
-func checkStorable(v reflect.Value, path string, depth int) error {
-	if depth > maxStorableDepth || !v.IsValid() {
+// visit identifies a pointer, map or slice on the walk's current path, so a
+// value that contains itself is not followed forever. json.Marshal rejects a
+// cycle when it encodes the value, so the walk may treat one as storable and
+// leave the error to Encode's marshal.
+type visit struct {
+	ptr  uintptr
+	kind reflect.Kind
+	len  int
+}
+
+// enter marks v as on the path, or reports that it already is.
+func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
+	k := visit{ptr: v.Pointer(), kind: v.Kind()}
+	if v.Kind() == reflect.Slice {
+		k.len = v.Len()
+	}
+	if seen[k] {
+		return k, false
+	}
+	seen[k] = true
+	return k, true
+}
+
+func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
+	if !v.IsValid() {
 		return nil
 	}
 	if v.CanInterface() {
@@ -146,11 +165,21 @@ func checkStorable(v reflect.Value, path string, depth int) error {
 		if !cairn.StorableText(v.String()) {
 			return &NotStorableError{Path: path}
 		}
-	case reflect.Interface, reflect.Pointer:
+	case reflect.Interface:
 		if v.IsNil() {
 			return nil
 		}
-		return checkStorable(v.Elem(), path, depth+1)
+		return checkStorable(v.Elem(), path, seen)
+	case reflect.Pointer:
+		if v.IsNil() {
+			return nil
+		}
+		k, ok := enter(seen, v)
+		if !ok {
+			return nil
+		}
+		defer delete(seen, k)
+		return checkStorable(v.Elem(), path, seen)
 	case reflect.Struct:
 		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
@@ -163,16 +192,27 @@ func checkStorable(v reflect.Value, path string, depth int) error {
 			if f.Tag.Get("json") == "-" {
 				continue
 			}
-			if err := checkStorable(v.Field(i), path+"."+f.Name, depth+1); err != nil {
+			if err := checkStorable(v.Field(i), path+"."+f.Name, seen); err != nil {
 				return err
 			}
 		}
-	case reflect.Slice, reflect.Array:
-		if v.Kind() == reflect.Slice && v.IsNil() {
+	case reflect.Slice:
+		if v.IsNil() {
 			return nil
 		}
+		k, ok := enter(seen, v)
+		if !ok {
+			return nil
+		}
+		defer delete(seen, k)
 		for i := 0; i < v.Len(); i++ {
-			if err := checkStorable(v.Index(i), fmt.Sprintf("%s[%d]", path, i), depth+1); err != nil {
+			if err := checkStorable(v.Index(i), fmt.Sprintf("%s[%d]", path, i), seen); err != nil {
+				return err
+			}
+		}
+	case reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := checkStorable(v.Index(i), fmt.Sprintf("%s[%d]", path, i), seen); err != nil {
 				return err
 			}
 		}
@@ -180,16 +220,21 @@ func checkStorable(v reflect.Value, path string, depth int) error {
 		if v.IsNil() {
 			return nil
 		}
+		k, ok := enter(seen, v)
+		if !ok {
+			return nil
+		}
+		defer delete(seen, k)
 		iter := v.MapRange()
 		for iter.Next() {
-			k := iter.Key()
-			key := k.String() // "<int Value>" for a non-string key, which is only a path
-			if k.Kind() == reflect.String {
-				if err := checkStorable(k, path+" key", depth+1); err != nil {
+			keyVal := iter.Key()
+			key := keyVal.String() // "<int Value>" for a non-string key, which is only a path
+			if keyVal.Kind() == reflect.String {
+				if err := checkStorable(keyVal, path+" key", seen); err != nil {
 					return err
 				}
 			}
-			if err := checkStorable(iter.Value(), path+"["+key+"]", depth+1); err != nil {
+			if err := checkStorable(iter.Value(), path+"["+key+"]", seen); err != nil {
 				return err
 			}
 		}
