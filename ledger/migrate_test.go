@@ -155,7 +155,7 @@ func TestConcurrentMigrationRunsOutsideATransaction(t *testing.T) {
 			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
 		},
 	})
-	if err := store.migrate(ctx, migs); err != nil {
+	if err := store.migrate(ctx, migs, migrationLeaseTTL); err != nil {
 		t.Fatalf("applying a concurrent migration: %v", err)
 	}
 	var exists bool
@@ -191,7 +191,7 @@ func TestTransactionalMigrationRollsBackOnFailure(t *testing.T) {
 			`SELECT 1 / 0`,
 		},
 	})
-	if err := store.migrate(ctx, migs); err == nil {
+	if err := store.migrate(ctx, migs, migrationLeaseTTL); err == nil {
 		t.Fatal("a failing migration reported no error")
 	}
 	var exists bool
@@ -231,7 +231,7 @@ func TestConcurrentMigrationDoesNotRecordOverAnInvalidIndex(t *testing.T) {
 			`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS streams_kind_unique ON cairn.streams (kind)`,
 		},
 	})
-	if err := store.migrate(ctx, migs); err == nil {
+	if err := store.migrate(ctx, migs, migrationLeaseTTL); err == nil {
 		t.Fatal("a concurrent migration over duplicate rows reported no error")
 	}
 	var valid bool
@@ -243,7 +243,7 @@ func TestConcurrentMigrationDoesNotRecordOverAnInvalidIndex(t *testing.T) {
 	}
 	// The retry finds the index present and would record the version over it
 	// if the runner did not check indisvalid first.
-	if err := store.migrate(ctx, migs); err == nil {
+	if err := store.migrate(ctx, migs, migrationLeaseTTL); err == nil {
 		t.Fatal("a retry recorded a version over an invalid index")
 	}
 	var version int
@@ -295,11 +295,11 @@ func TestConcurrentBootsDoNotDeadlockOnTheMigrationLock(t *testing.T) {
 	}
 
 	first := make(chan error, 1)
-	go func() { first <- store.migrate(ctx, migs) }()
+	go func() { first <- store.migrate(ctx, migs, migrationLeaseTTL) }()
 	waitForMigrationLease(t, ctx, pool)
 
 	second := make(chan error, 1)
-	go func() { second <- store.migrate(ctx, migs) }()
+	go func() { second <- store.migrate(ctx, migs, migrationLeaseTTL) }()
 	// Let the second caller reach the lease and, with a blocking lock, take its
 	// snapshot. With the polling lease it holds none, so the build never waits.
 	time.Sleep(300 * time.Millisecond)
@@ -350,7 +350,7 @@ func TestCancelledMigrateReleasesTheMigrationLease(t *testing.T) {
 
 	callerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- store.migrate(callerCtx, migs) }()
+	go func() { done <- store.migrate(callerCtx, migs, migrationLeaseTTL) }()
 	waitForMigrationLease(t, ctx, pool)
 	cancel()
 	if err := <-done; err == nil {
@@ -396,6 +396,243 @@ VALUES (1, 'dead-process', now() - interval '1 minute')`); err != nil {
 	}
 	if held != 0 {
 		t.Fatalf("the reclaimed lease was not released: %d rows", held)
+	}
+}
+
+// A migration can run far longer than the lease TTL: CREATE INDEX
+// CONCURRENTLY over a large table is the routine case. The holder must renew
+// its lease while it runs, or a second caller takes the lease from a live
+// holder and reruns the same statements beside it.
+func TestMigrationLeaseIsRenewedWhileHeld(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Concurrent: true,
+		Statements: []string{
+			`CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_kind_seq ON cairn.entries (kind, seq)`,
+		},
+	})
+	const ttl = 500 * time.Millisecond
+
+	// Hold the version table so the first caller stops after it takes the
+	// lease and before it applies anything. It stays there for several TTLs.
+	gate, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Release()
+	gateTx, err := gate.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = gateTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := gateTx.Exec(ctx, `LOCK TABLE cairn.schema_version IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- store.migrate(ctx, migs, ttl) }()
+	waitForMigrationLease(t, ctx, pool)
+	holder, err := migrationLeaseHolder(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := make(chan error, 1)
+	go func() { second <- store.migrate(ctx, migs, ttl) }()
+
+	// Let several TTLs pass. Without the heartbeat the lease would expire,
+	// the second caller would reclaim it, and the holder row would change
+	// under the still-running first caller.
+	time.Sleep(4 * ttl)
+	if got, err := migrationLeaseHolder(ctx, pool); err != nil {
+		t.Fatal(err)
+	} else if got != holder {
+		t.Fatalf("the lease moved from %s to %s after several TTLs; the heartbeat did not renew it", holder, got)
+	}
+
+	if err := gateTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range []<-chan error{first, second} {
+		if err := <-ch; err != nil {
+			t.Errorf("a concurrent migrate returned %v", err)
+		}
+	}
+}
+
+// A caller whose lease is deleted or taken while it migrates no longer owns
+// the schema. It must stop and must not record the version, or it would
+// record a migration some other caller is applying.
+func TestLostMigrationLeaseStopsTheMigration(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Statements: []string{`CREATE TABLE cairn.migrate_probe (n int)`},
+	})
+	const ttl = 500 * time.Millisecond
+
+	// Hold the version table so the caller stops after it takes the lease and
+	// before it applies the migration.
+	gate, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Release()
+	gateTx, err := gate.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = gateTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := gateTx.Exec(ctx, `LOCK TABLE cairn.schema_version IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- store.migrate(ctx, migs, ttl) }()
+	waitForMigrationLease(t, ctx, pool)
+
+	// The lease disappears under the holder, so the next beat updates no row
+	// and the holder must cancel rather than record a version it lost.
+	if _, err := pool.Exec(ctx, `DELETE FROM cairn.migration_lock WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a migrate whose lease was lost returned nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a migrate whose lease was lost did not return")
+	}
+	if err := gateTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM cairn.schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migrations) {
+		t.Fatalf("schema version %d after a lost lease, want %d", version, len(migrations))
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('cairn.migrate_probe') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("a migration whose lease was lost still applied")
+	}
+}
+
+// A caller reads the schema version before it blocks on the migration's
+// advisory lock. An earlier release's Migrate, or one whose lease expired
+// mid-migration, can commit the same migration while it waits, so the caller
+// must re-read the version under the lock and skip what is already applied
+// instead of re-running it and failing on the second CREATE.
+func TestBlockedCallerSkipsAnAlreadyAppliedMigration(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migs := append(slices.Clone(migrations), migration{
+		Statements: []string{`CREATE TABLE cairn.migrate_probe (n int)`},
+	})
+	version := len(migs)
+
+	// The earlier caller holds only the advisory lock; it has not recorded
+	// the version yet, so the caller under test reads the schema as it was
+	// and then blocks behind the lock.
+	older, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer older.Release()
+	olderTx, err := older.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = olderTx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := olderTx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('cairn.migrate'))`); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- store.migrate(ctx, migs, migrationLeaseTTL) }()
+	waitForWaiterOnAdvisoryLock(t, ctx, pool)
+
+	// The earlier caller now applies and commits the same migration while the
+	// caller under test waits.
+	if _, err := olderTx.Exec(ctx, `CREATE TABLE cairn.migrate_probe (n int)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := olderTx.Exec(ctx, `INSERT INTO cairn.schema_version (version) VALUES ($1)`, version); err != nil {
+		t.Fatal(err)
+	}
+	if err := olderTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a caller re-applied a migration that was already committed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a blocked migrate did not return")
+	}
+	var versions int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM cairn.schema_version WHERE version = $1`, version).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions != 1 {
+		t.Fatalf("migration %d recorded %d times, want 1", version, versions)
+	}
+}
+
+// migrationLeaseHolder returns the holder id of the current migration lease.
+func migrationLeaseHolder(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	var holder string
+	err := pool.QueryRow(ctx, `SELECT holder FROM cairn.migration_lock WHERE id = 1`).Scan(&holder)
+	return holder, err
+}
+
+// waitForWaiterOnAdvisoryLock waits until a caller in this database is
+// blocked on the migration's transaction-level advisory lock.
+func waitForWaiterOnAdvisoryLock(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := pool.QueryRow(ctx, `
+SELECT count(*) FROM pg_locks
+WHERE locktype = 'advisory' AND NOT granted
+  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no migrate call blocked on the migration advisory lock")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
