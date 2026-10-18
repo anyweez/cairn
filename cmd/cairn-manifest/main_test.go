@@ -89,6 +89,19 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	}
 }
 
+// A rule whose literal names an alias of spec.Rule is legal Go. It must be
+// read like any other rule rather than crashing the extractor on a type
+// assertion that assumes the literal's type is a *types.Named.
+func TestExtractReadsARuleWrittenWithAnAliasedLiteral(t *testing.T) {
+	m, err := Extract("testdata/alias", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Rules) != 1 || m.Rules[0].ID != "A1" || m.Rules[0].Kind != "never" {
+		t.Fatalf("rules: %+v", m.Rules)
+	}
+}
+
 // The committed manifest is what cairn's own code says.
 func TestCairnManifestIsCurrent(t *testing.T) {
 	m, err := Extract("../..", "./...")
