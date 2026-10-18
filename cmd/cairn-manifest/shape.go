@@ -229,10 +229,13 @@ func hasOption(opts, name string) bool {
 }
 
 // quotable reports whether the json ",string" option applies to a field of
-// type t: a string, number or bool, or an unnamed pointer to one.
+// type t: a string, number or bool, or an unnamed pointer to one. Aliases are
+// resolved first, because `type P = *int` is a *types.Alias whose underlying
+// type is a pointer, not the *types.Pointer that reflect erases it to.
 func quotable(t types.Type) bool {
+	t = types.Unalias(t)
 	if ptr, ok := t.(*types.Pointer); ok {
-		t = ptr.Elem()
+		t = types.Unalias(ptr.Elem())
 	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Info()&(types.IsBoolean|types.IsNumeric|types.IsString) != 0
