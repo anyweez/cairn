@@ -70,21 +70,44 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 // opaque reports whether t chooses its own JSON (time.Time, json.RawMessage),
 // so its fields say nothing about what is stored. A marshaler with a pointer
 // receiver counts only where the value is addressable.
+//
+// A method is only a marshaler if it has the signature encoding/json requires:
+// no arguments and ([]byte, error) results. A method of the right name but the
+// wrong signature is not used by encoding/json, which writes the fields
+// instead, so calling the type opaque would hide a field-shape change from the
+// -base comparison.
 func (s *shaper) opaque(t types.Type, addr bool) bool {
 	candidates := []types.Type{t}
 	if addr {
 		candidates = append(candidates, types.NewPointer(t))
 	}
-	for _, name := range []string{"MarshalJSON", "MarshalText"} {
-		for _, typ := range candidates {
-			if obj, _, _ := types.LookupFieldOrMethod(typ, false, nil, name); obj != nil {
-				if _, isFunc := obj.(*types.Func); isFunc {
-					return true
-				}
+	for _, typ := range candidates {
+		for _, name := range []string{"MarshalJSON", "MarshalText"} {
+			obj, _, _ := types.LookupFieldOrMethod(typ, false, nil, name)
+			fn, isFunc := obj.(*types.Func)
+			if !isFunc {
+				continue
+			}
+			if sig, ok := fn.Type().(*types.Signature); ok && isMarshalerSignature(sig) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// isMarshalerSignature reports whether sig satisfies json.Marshaler or
+// encoding.TextMarshaler: no parameters and exactly ([]byte, error) results.
+// The byte slice must be []byte itself; a named slice such as json.RawMessage
+// does not satisfy the interface, and encoding/json writes the fields instead.
+func isMarshalerSignature(sig *types.Signature) bool {
+	if sig.Params().Len() != 0 || sig.Results().Len() != 2 {
+		return false
+	}
+	if !types.Identical(sig.Results().At(0).Type(), types.NewSlice(types.Typ[types.Byte])) {
+		return false
+	}
+	return types.Identical(sig.Results().At(1).Type(), types.Universe.Lookup("error").Type())
 }
 
 // jsonField is one field encoding/json may write, before name dominance
