@@ -115,7 +115,7 @@ func (m Machine[S, M, R, Ev, Ef]) rules() []spec.Rule {
 
 // judge records a verdict. An established failure stops the run so rapid can
 // shrink it; a proposed one is noted and the run goes on.
-func judge(rt *rapid.T, rep *report, trace *[]string, rule spec.Rule, v spec.Verdict) {
+func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.Rule, v spec.Verdict) {
 	rep.count(rule, v)
 	detail, failed := v.Failed()
 	if !failed {
@@ -125,13 +125,14 @@ func judge(rt *rapid.T, rep *report, trace *[]string, rule spec.Rule, v spec.Ver
 		rep.proposed(rule, detail, *trace)
 		return
 	}
+	markViolation(outer)
 	rt.Fatalf("%s violated: %s\n  rule: %s", rule.ID, detail, rule.Statement)
 }
 
-func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, rep *report) {
+func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) {
 	rep.ran()
 	var trace []string
-	j := func(rule spec.Rule, v spec.Verdict) { judge(rt, rep, &trace, rule, v) }
+	j := func(rule spec.Rule, v spec.Verdict) { judge(rt, outer, rep, &trace, rule, v) }
 
 	initial, ok := guard(func() S { return m.Decider.Initial() })
 	j(Total, spec.Check(ok, "Initial panicked: %v", initial.panic))
@@ -492,6 +493,7 @@ func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
 	ok := true
 	notRefines := func(r spec.Rule, how string) {
 		if r.Kind == spec.Refines {
+			markViolation(t)
 			t.Errorf("%s is checked by %s, not a model, so its Kind cannot be Refines", r.ID, how)
 			ok = false
 		}
@@ -507,6 +509,7 @@ func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
 	}
 	for _, r := range m.Models {
 		if r.rule().Kind != spec.Refines {
+			markViolation(t)
 			t.Errorf("%s is checked by a model, so its Kind must be Refines", r.rule().ID)
 			ok = false
 		}
@@ -520,6 +523,7 @@ func (r *report) gateVacuity(t rapid.TB, allowed []string) {
 	t.Helper()
 	for _, id := range allowed {
 		if _, ok := r.rules[id]; !ok {
+			markViolation(t)
 			t.Errorf("AllowVacuous names %s, which is not one of the machine's rules", id)
 		}
 	}
@@ -538,6 +542,7 @@ func (r *report) gateVacuity(t rapid.TB, allowed []string) {
 		return
 	}
 	for _, tl := range vacuous {
+		markViolation(t)
 		t.Errorf("%s is vacuous: it never applied in %d runs, so the generator never reaches it (list it in AllowVacuous if that is expected)\n  rule: %s",
 			tl.rule.ID, r.runs, tl.rule.Statement)
 	}
@@ -567,7 +572,7 @@ func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	for _, r := range m.rules() {
 		rep.declare(r)
 	}
-	rapid.Check(t, func(rt *rapid.T) { m.run(rt, rep) })
+	rapid.Check(t, func(rt *rapid.T) { m.run(rt, t, rep) })
 	rep.log(t)
 	rep.gateVacuity(t, m.AllowVacuous)
 
