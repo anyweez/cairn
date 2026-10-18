@@ -55,6 +55,13 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	// (and TypeString) understands. Resolve it first so an alias cannot slip
 	// past the recursion guard.
 	t = types.Unalias(t)
+	// encoding/json special-cases json.Number, writing it as a bare number
+	// rather than the quoted string its underlying kind would suggest. It is
+	// the only basic kind it rewrites this way, so a change between
+	// json.Number and string is a wire change the manifest must show.
+	if isNamed(t, "encoding/json", "Number") {
+		return "number"
+	}
 	if s.opaque(t, addr) {
 		return types.TypeString(t, nil)
 	}
