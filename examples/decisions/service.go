@@ -120,6 +120,17 @@ func (s *Service) Supersede(ctx context.Context, id, with, by string) error {
 			if err != nil {
 				return err
 			}
+			// The decider refuses a decision that supersedes itself by
+			// comparing With to the decision's own ID, so With carries the
+			// replacement's ID rather than the stream it was read from. A
+			// caller allowed to record a Create whose ID is not its stream
+			// otherwise makes those two differ, and the self-check misses
+			// while the supersede goes through. A stream holding no decision
+			// keeps With as the stream, so the decider refuses it as
+			// not-decided rather than as the empty replacement.
+			if replacement.State.ID != "" {
+				msg.With = replacement.State.ID
+			}
 			msg.WithStatus, msg.WithSupersededBy = replacement.State.Status, replacement.State.SupersededBy
 		}
 		h, err := s.Register.Apply(ctx, tx, &target, msg)
