@@ -227,12 +227,9 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		defer delete(seen, k)
 		iter := v.MapRange()
 		for iter.Next() {
-			keyVal := iter.Key()
-			key := keyVal.String() // "<int Value>" for a non-string key, which is only a path
-			if keyVal.Kind() == reflect.String {
-				if err := checkStorable(keyVal, path+" key", seen); err != nil {
-					return err
-				}
+			key, err := checkMapKey(iter.Key(), path+" key")
+			if err != nil {
+				return err
 			}
 			if err := checkStorable(iter.Value(), path+"["+key+"]", seen); err != nil {
 				return err
@@ -240,6 +237,45 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		}
 	}
 	return nil
+}
+
+// checkMapKey checks a map key the way json.Marshal will render it, and returns
+// the text that becomes the JSON object key.
+//
+// json renders a string-kind key from the string itself, and any other key
+// type through MarshalText when it implements encoding.TextMarshaler; an
+// integer key becomes its decimal form. The first two can carry text the
+// ledger cannot keep: json.Marshal escapes a NUL in the key as \u0000 and
+// replaces bytes that are not valid UTF-8 with U+FFFD, exactly as it does for
+// a string value, so the key text needs the same check. A string-kind key is
+// checked as its string, because json ignores a MarshalText on such a type.
+func checkMapKey(k reflect.Value, path string) (string, error) {
+	if k.Kind() == reflect.String {
+		if !cairn.StorableText(k.String()) {
+			return "", &NotStorableError{Path: path}
+		}
+		return k.String(), nil
+	}
+	if k.CanInterface() {
+		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+			// json.Marshal renders a nil pointer key as the empty string and
+			// never calls its MarshalText.
+			if k.Kind() == reflect.Pointer && k.IsNil() {
+				return "", nil
+			}
+			text, err := tm.MarshalText()
+			if err != nil {
+				return "", err
+			}
+			if !cairn.StorableText(string(text)) {
+				return "", &NotStorableError{Path: path}
+			}
+			return string(text), nil
+		}
+	}
+	// An integer key becomes its decimal form, which is always storable. The
+	// value is only a path for anything else, which json.Marshal will reject.
+	return k.String(), nil
 }
 
 // EncodeAll encodes a slice, preserving order.
