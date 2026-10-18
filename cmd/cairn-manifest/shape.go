@@ -59,6 +59,13 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	// (and TypeString) understands. Resolve it first so an alias cannot slip
 	// past the recursion guard.
 	t = types.Unalias(t)
+	// encoding/json special-cases json.Number, writing it as a bare number
+	// rather than the quoted string its underlying kind would suggest. It is
+	// the only basic kind it rewrites this way, so a change between
+	// json.Number and string is a wire change the manifest must show.
+	if isNamed(t, "encoding/json", "Number") {
+		return "number"
+	}
 	if s.opaque(t, addr) {
 		return types.TypeString(t, nil)
 	}
@@ -86,7 +93,16 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	case *types.Array:
 		return fmt.Sprintf("[%d]%s", u.Len(), s.shape(u.Elem(), addr))
 	case *types.Map:
-		return "map[" + s.shape(u.Key(), false) + "]" + s.shape(u.Elem(), false)
+		// encoding/json writes every string-kind map key as a quoted JSON
+		// string, json.Number included, so a number key and a string key are
+		// the same on the wire even though the same type in a value position
+		// is a bare number. Render the key as a string rather than letting
+		// the json.Number check above reach it.
+		key := s.shape(u.Key(), false)
+		if isNamed(types.Unalias(u.Key()), "encoding/json", "Number") {
+			key = "string"
+		}
+		return "map[" + key + "]" + s.shape(u.Elem(), false)
 	case *types.Struct:
 		// A named struct rendered here is flattened into an object, exactly
 		// as fields() flattens the top-level type. Mark it for the duration so
