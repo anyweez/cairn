@@ -30,10 +30,10 @@ func (c *captureTB) FailNow()              { c.failed.Store(true) }
 func (c *captureTB) Fail()                 { c.failed.Store(true) }
 func (c *captureTB) Failed() bool          { return c.failed.Load() }
 
-// A mutant check via Fails takes failsMu, but an ordinary Check takes no lock
-// at all, and both read the same process-wide rapid flags that Fails sets.
-// The two run in parallel tests in any real suite; under -race this is a data
-// race on rapid.shrinktime / rapid.nofailfile.
+// A Fails and an ordinary Check run in parallel tests in any real suite.
+// Fails used to change rapid's process-wide nofailfile and shrinktime flags
+// while the Check read them, which -race reports as a data race. It now
+// records a violation without failing rapid, so this must stay race-free.
 func TestFailsRacesAConcurrentCheck(t *testing.T) {
 	rule := spec.Rule{ID: "C9", Kind: spec.Never, Status: spec.Established,
 		Statement: "The counter has a value it can never hold."}
