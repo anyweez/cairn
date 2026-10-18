@@ -405,6 +405,7 @@ type tally struct {
 	rule              spec.Rule
 	judged, applied   int
 	failures          int
+	haveFailure       bool
 	firstFailure      string
 	firstFailureTrace []string
 }
@@ -447,7 +448,8 @@ func (r *report) proposed(rule spec.Rule, detail string, trace []string) {
 	defer r.mu.Unlock()
 	t := r.rules[rule.ID]
 	t.failures++
-	if t.firstFailure == "" || len(trace) < len(t.firstFailureTrace) {
+	if !t.haveFailure || len(trace) < len(t.firstFailureTrace) {
+		t.haveFailure = true
 		t.firstFailure = detail
 		t.firstFailureTrace = append([]string(nil), trace...)
 	}
