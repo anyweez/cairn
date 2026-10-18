@@ -13,6 +13,10 @@ import (
 // fields renders the JSON shape of a registered type, one entry per field, as
 // encoding/json writes it. A type that isn't a struct is one entry, "=".
 //
+// An omitempty or omitzero field is marked with "?" after its name. A name
+// that itself contains "?" is escaped by doubling it, so a literal "?" is
+// never mistaken for the marker.
+//
 // codec.Encode marshals the registered value itself, which is not
 // addressable, so a marshaler with a pointer receiver on that type is not
 // used and its fields are what is stored.
@@ -35,6 +39,18 @@ type shaper struct {
 // says whether encoding/json reaches the value addressably (behind a pointer
 // or in a slice), which decides whether pointer-receiver marshalers apply.
 func (s *shaper) shape(t types.Type, addr bool) string {
+	// An alias denotes the same type as its target, and Go models `type A = T`
+	// as a *types.Alias rather than the *types.Named that every guard below
+	// (and TypeString) understands. Resolve it first so an alias cannot slip
+	// past the recursion guard.
+	t = types.Unalias(t)
+	// encoding/json special-cases json.Number, writing it as a bare number
+	// rather than the quoted string its underlying kind would suggest. It is
+	// the only basic kind it rewrites this way, so a change between
+	// json.Number and string is a wire change the manifest must show.
+	if isNamed(t, "encoding/json", "Number") {
+		return "number"
+	}
 	if s.opaque(t, addr) {
 		return types.TypeString(t, nil)
 	}
@@ -51,15 +67,32 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	case *types.Pointer:
 		return "*" + s.shape(u.Elem(), true)
 	case *types.Slice:
-		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.Byte {
+		// encoding/json applies the byte-slice base64 special case only when
+		// the element type does not choose its own encoding. A named byte
+		// type with MarshalJSON or MarshalText is written as its marshaled
+		// value, so a slice of it is an array, not base64.
+		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.Byte && !s.opaque(u.Elem(), true) {
 			return "bytes" // base64
 		}
 		return "[]" + s.shape(u.Elem(), true)
 	case *types.Array:
 		return fmt.Sprintf("[%d]%s", u.Len(), s.shape(u.Elem(), addr))
 	case *types.Map:
-		return "map[" + s.shape(u.Key(), false) + "]" + s.shape(u.Elem(), false)
+		// encoding/json writes every string-kind map key as a quoted JSON
+		// string, json.Number included, so a number key and a string key are
+		// the same on the wire even though the same type in a value position
+		// is a bare number. Render the key as a string rather than letting
+		// the json.Number check above reach it.
+		key := s.shape(u.Key(), false)
+		if isNamed(types.Unalias(u.Key()), "encoding/json", "Number") {
+			key = "string"
+		}
+		return "map[" + key + "]" + s.shape(u.Elem(), false)
 	case *types.Struct:
+		// The walk below keys its visited set on the named type, so pass t
+		// rather than the bare struct: a recursive embedded pointer back to
+		// this type must be recognised as one type and skipped, the way
+		// encoding/json visits it once.
 		return "{" + strings.Join(s.structFields(t, addr), ", ") + "}"
 	case *types.Interface:
 		return "any"
@@ -125,6 +158,10 @@ type jsonField struct {
 // resolves it: the shallowest field wins, a tagged field beats an untagged one
 // at the same depth, and a remaining tie drops the name. It is a breadth-first
 // walk so each field's depth is known, mirroring encoding/json's typeFields.
+//
+// The visited set is what ends the walk on a type that embeds a pointer to
+// itself: encoding/json visits such a type once and skips the embedded field on
+// every later visit, and keying the set on the resolved type does the same.
 func (s *shaper) structFields(t types.Type, addr bool) []string {
 	type queued struct {
 		typ   types.Type // a struct reachable by embedding
@@ -157,25 +194,10 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 			}
 			for i := range st.NumFields() {
 				f := st.Field(i)
-				if f.Embedded() && !f.Exported() {
-					// encoding/json ignores an embedded field of unexported
-					// non-struct type, but keeps the fields an unexported
-					// embedded struct promotes.
-					et := f.Type()
-					if ptr, ok := et.Underlying().(*types.Pointer); ok {
-						et = ptr.Elem()
-					}
-					if _, ok := et.Underlying().(*types.Struct); !ok {
-						continue
-					}
-				} else if !f.Exported() {
+				name, opts, hasOpts := strings.Cut(reflect.StructTag(st.Tag(i)).Get("json"), ",")
+				if name == "-" && !hasOpts {
 					continue
 				}
-				tag := reflect.StructTag(st.Tag(i)).Get("json")
-				if tag == "-" {
-					continue
-				}
-				name, opts, _ := strings.Cut(tag, ",")
 				// encoding/json discards a tag name outside the tag alphabet and
 				// silently falls back to the Go field name. Mirror that here, so
 				// the manifest records the key encoding/json actually writes.
@@ -188,9 +210,14 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 				copy(index, q.index)
 				index[len(q.index)] = i
 
-				typ, inner := f.Type(), q.addr
+				// Resolve an alias to its target before the flattening guard
+				// below looks for a struct, tests the opaque marshaler, or keys
+				// the walk by type: `type A = T` embeds T's fields, and an alias
+				// and its target must be one type or a recursive alias expands
+				// forever as two.
+				typ, inner := types.Unalias(f.Type()), q.addr
 				if ptr, ok := typ.(*types.Pointer); ok {
-					typ, inner = ptr.Elem(), true
+					typ, inner = types.Unalias(ptr.Elem()), true
 				}
 				if f.Embedded() && name == "" {
 					if _, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
@@ -201,11 +228,31 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 						continue
 					}
 				}
+				if !f.Exported() {
+					// encoding/json ignores unexported fields, but keeps an
+					// anonymous field whose type is a struct; such a field
+					// reaches here only when its tag names it (an untagged
+					// embedded struct was flattened above), and encoding/json
+					// marshals it as a named object.
+					innerType := f.Type()
+					if ptr, ok := innerType.(*types.Pointer); ok {
+						innerType = ptr.Elem()
+					}
+					if _, ok := innerType.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
+						continue
+					}
+				}
 				display := name
 				if display == "" {
 					display = f.Name()
 				}
-				entry := display
+				// "?" after the name marks omitempty/omitzero, but "?" is also
+				// a legal JSON key character, so a field tagged `json:"a?"`
+				// would render exactly like `json:"a,omitempty"`: different
+				// wire formats, one manifest entry. Double a literal "?" in
+				// the rendered entry so the marker is the only single "?"; the
+				// dominance key stays the raw JSON name encoding/json compares.
+				entry := strings.ReplaceAll(display, "?", "??")
 				if hasOption(opts, "omitempty") || hasOption(opts, "omitzero") {
 					entry += "?"
 				}
@@ -298,10 +345,13 @@ func hasOption(opts, name string) bool {
 }
 
 // quotable reports whether the json ",string" option applies to a field of
-// type t: a string, number or bool, or an unnamed pointer to one.
+// type t: a string, number or bool, or an unnamed pointer to one. Aliases are
+// resolved first, because `type P = *int` is a *types.Alias whose underlying
+// type is a pointer, not the *types.Pointer that reflect erases it to.
 func quotable(t types.Type) bool {
+	t = types.Unalias(t)
 	if ptr, ok := t.(*types.Pointer); ok {
-		t = ptr.Elem()
+		t = types.Unalias(ptr.Elem())
 	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Info()&(types.IsBoolean|types.IsNumeric|types.IsString) != 0

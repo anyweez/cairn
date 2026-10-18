@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -59,6 +60,107 @@ func TestExtractReadsEverything(t *testing.T) {
 	edges := m.Tables[0].Edges
 	if len(edges) != 2 || edges[0] != (Edge{From: "draft", On: "publish", To: "published"}) {
 		t.Errorf("edges are sorted and use constant values: %+v", edges)
+	}
+}
+
+// A type that embeds a pointer to itself is legal Go and encoding/json
+// marshals it, but the shape walk recurses through the embedded field without
+// the guard shape() keeps for named fields, so the tool loops until the stack
+// overflows.
+func TestExtractHandlesRecursiveEmbeddedPointer(t *testing.T) {
+	m, err := Extract("testdata/recurse", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	// encoding/json visits the type once and skips the recursive embedded
+	// pointer, so the stored shape is just v.
+	if got, want := m.Codecs[0].Fields, []string{"v: int"}; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
+// A named field that points back to its own type is not an embedded-flatten
+// recursion: encoding/json renders the field once and ends the type at its
+// name. The embedded-walk guard must leave this rendering alone.
+func TestExtractKeepsNamedSelfReference(t *testing.T) {
+	m, err := Extract("testdata/namedrecurse", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	want := []string{"v: int", "next: *{v: int, next: *example.com/namedrecurse.T}"}
+	if got := m.Codecs[0].Fields; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
+// Go models `type A = T` as a *types.Alias, which is not a *types.Named, so a
+// self-reference through an alias used to slip past the recursion guard and
+// overflow the stack. The alias denotes T, so the shape is T's.
+func TestExtractHandlesAliasedSelfReference(t *testing.T) {
+	m, err := Extract("testdata/aliasrecurse", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	want := []string{"v: int", "next: *{v: int, next: *example.com/aliasrecurse.Node}"}
+	if got := m.Codecs[0].Fields; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
+// The same alias in an untagged embedded field: `type Node struct { *A; V
+// int }` with `A = Node`. encoding/json flattens the embedded pointer once and
+// skips it thereafter, so the shape is just v.
+func TestExtractHandlesEmbeddedAlias(t *testing.T) {
+	m, err := Extract("testdata/embedalias", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	if got, want := m.Codecs[0].Fields, []string{"v: int"}; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+}
+
+// A self-embedding type reached as an ordinary field flattens its embedded
+// pointer once, not once per enclosing struct. encoding/json writes the field
+// as {"v":...}, so the shape is {v: int}, not {v: int, v: int}.
+func TestExtractHandlesNestedSelfEmbedding(t *testing.T) {
+	m, err := Extract("testdata/nestedembed", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	if got, want := m.Codecs[0].Fields, []string{"n: {v: int}"}; !slices.Equal(got, want) {
+		t.Errorf("fields: got %q, want %q", got, want)
+	}
+
+	// The reported shape is the one encoding/json writes for the same type.
+	type node struct {
+		*node
+		V int `json:"v"`
+	}
+	type outer struct {
+		N node `json:"n"`
+	}
+	got, err := json.Marshal(outer{N: node{V: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"n":{"v":1}}`; string(got) != want {
+		t.Errorf("encoding/json: got %s, want %s", got, want)
 	}
 }
 

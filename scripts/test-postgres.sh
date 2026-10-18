@@ -10,8 +10,12 @@ port=${CAIRN_TEST_PORT:-55871}
 
 if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
   docker rm -f "$name" >/dev/null 2>&1 || true
+  # max_prepared_transactions defaults to 0, which makes PREPARE TRANSACTION
+  # fail and the ledger's prepared-transaction test skip. The LEAST fence that
+  # test proves only shows itself when a prepared transaction can be in flight.
   docker run -d --name "$name" -p "127.0.0.1:${port}:5432" \
-    -e POSTGRES_PASSWORD=cairn -e POSTGRES_USER=cairn postgres:17-alpine >/dev/null
+    -e POSTGRES_PASSWORD=cairn -e POSTGRES_USER=cairn postgres:17-alpine \
+    -c max_prepared_transactions=16 >/dev/null
 fi
 # Over TCP: during init the image runs a socket-only server that the unix
 # socket check would mistake for the real one.

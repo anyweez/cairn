@@ -43,19 +43,46 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: skip disk syncs in the test database
-        # Every test creates and drops a database, and each waits on the
-        # runner's slow disk. Nothing here tests crash durability.
+      - name: configure the test database
+        # max_prepared_transactions is a postmaster setting, so it needs a
+        # restart rather than the reload the disk settings take. A service
+        # container cannot be given a command, so ALTER SYSTEM then restart is
+        # how it is set. Without it the ledger's prepared-transaction test
+        # skips. Every test creates and drops a database, and each waits on
+        # the runner's slow disk, so the disk settings are turned off too;
+        # nothing here tests crash durability.
         run: |
           psql "$CAIRN_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET fsync = off" \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "ALTER SYSTEM SET full_page_writes = off" \
-            -c "SELECT pg_reload_conf()"
+            -c "ALTER SYSTEM SET max_prepared_transactions = 16"
+          docker restart "${{ job.services.postgres.id }}"
+          for _ in $(seq 1 60); do
+            if psql "$CAIRN_TEST_DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::postgres did not accept connections after the restart"
+          exit 1
       - name: check
         # gofmt, vet, every test, the manifest tool and manifest freshness. The
         # same script is the factory's gate and the local pre-push check.
         run: scripts/check.sh
+      - name: the prepared-transaction test runs, not skips
+        # The test skips when max_prepared_transactions is 0, which would hide
+        # the LEAST fence it proves. Fail unless it ran and passed.
+        run: |
+          status=0
+          go test -race -v -run '^TestAnOlderPreparedTransactionIsNotSkipped$' ./ledger/ \
+            > "$RUNNER_TEMP/prepared-transactions.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/prepared-transactions.log"
+          if ! grep -q -- '--- PASS: TestAnOlderPreparedTransactionIsNotSkipped' "$RUNNER_TEMP/prepared-transactions.log"; then
+            echo "::error::TestAnOlderPreparedTransactionIsNotSkipped did not run and pass"
+            status=1
+          fi
+          exit $status
       - name: stored types stay readable
         if: github.event_name == 'pull_request'
         run: |
@@ -113,13 +140,25 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: skip disk syncs in the test database
+      - name: configure the test database
+        # As in the test job: a postmaster setting applied with ALTER SYSTEM
+        # and a restart, so the prepared-transaction test runs rather than
+        # skips, plus the disk settings this runner is slow about.
         run: |
           psql "postgres://cairn:cairn@127.0.0.1:5432/postgres?sslmode=disable" -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET fsync = off" \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "ALTER SYSTEM SET full_page_writes = off" \
-            -c "SELECT pg_reload_conf()"
+            -c "ALTER SYSTEM SET max_prepared_transactions = 16"
+          docker restart "${{ job.services.postgres.id }}"
+          for _ in $(seq 1 60); do
+            if psql "postgres://cairn:cairn@127.0.0.1:5432/postgres?sslmode=disable" -c "SELECT 1" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::postgres did not accept connections after the restart"
+          exit 1
       - name: wait for pgbouncer
         run: |
           for _ in $(seq 1 60); do

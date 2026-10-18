@@ -125,14 +125,41 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 		rep.proposed(rule, detail, *trace)
 		return
 	}
+	// Under Fails, record the first violation instead of failing rapid: a rapid
+	// failure would shrink it and save a fail file, both of which read the
+	// process-wide rapid flags Fails would have to change — a data race with a
+	// concurrent Check. See recorder.recordViolation.
+	if c, ok := outer.(interface {
+		recordViolation(rule spec.Rule, detail string) bool
+	}); ok {
+		c.recordViolation(rule, detail)
+		return
+	}
 	markViolation(outer)
 	rt.Fatalf("%s violated: %s\n  rule: %s", rule.ID, detail, rule.Statement)
 }
 
+// collectorStopped reports that Fails has already recorded a rule violation,
+// so the rest of the check proves nothing and can be skipped.
+func collectorStopped(t rapid.TB) bool {
+	if s, ok := t.(interface{ stopping() bool }); ok {
+		return s.stopping()
+	}
+	return false
+}
+
 func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) {
+	if collectorStopped(outer) {
+		return
+	}
 	rep.ran()
 	var trace []string
-	j := func(rule spec.Rule, v spec.Verdict) { judge(rt, outer, rep, &trace, rule, v) }
+	j := func(rule spec.Rule, v spec.Verdict) {
+		if collectorStopped(outer) {
+			return
+		}
+		judge(rt, outer, rep, &trace, rule, v)
+	}
 
 	initial, ok := guard(func() S { return m.Decider.Initial() })
 	j(Total, spec.Check(ok, "Initial panicked: %v", initial.panic))
@@ -144,10 +171,14 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		j(r.rule(), models[i].agrees(state))
 	}
 	m.checkState(j, state)
+	m.checkSnapshot(j, state)
 
 	var events []Ev
 	steps := rapid.IntRange(1, m.Steps).Draw(rt, "steps")
 	for step := 1; step <= steps; step++ {
+		if collectorStopped(outer) {
+			return
+		}
 		msg := m.Messages(rt, state)
 		trace = append(trace, fmt.Sprintf("%d. %s", step, describe(msg)))
 
@@ -168,12 +199,18 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 			"refused %s but carried %d events and %d effects", decision.Refusal, len(decision.Events), len(decision.Effects)))
 
 		after := state
+		// The states the message's events pass through. Folding a stream's
+		// events from a snapshot passes through them one at a time too, so each
+		// is reached, and each is checked against the invariants — not only the
+		// state the whole message nets to.
+		var folded []S
 		for _, e := range decision.Events {
 			mark := fingerprint(after)
 			next, ok := guard(func() S { return m.Decider.Evolve(after, e) })
 			j(Total, spec.Check(ok, "Evolve panicked on %+v: %v", e, next.panic))
 			j(Isolated, spec.Check(fingerprint(after) == mark, "Evolve modified its state for %+v", e))
 			after = next.value
+			folded = append(folded, after)
 		}
 
 		if decision.Refused() {
@@ -200,25 +237,47 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 
 		events = append(events, decision.Events...)
 		state = after
-		m.checkState(j, state)
+		// Checked where they always were, after the laws and changes, so a
+		// transition a law already rejects stays attributed to that law. A
+		// message with no events adds the state it leaves unchanged, so each
+		// state a message reaches is judged once, not a second time at the
+		// boundary when the last event already reached it.
+		if len(folded) == 0 {
+			folded = []S{state}
+		}
+		for _, s := range folded {
+			m.checkState(j, s)
+		}
+		// The ledger snapshots the state after the whole message, not the
+		// states the fold passed through, so the round trip is checked here.
+		m.checkSnapshot(j, state)
 	}
 
 	replayed := m.Decider.Fold(m.Decider.Initial(), events)
 	j(Replayable, spec.Check(m.Equal(replayed, state), "folded %+v, ran to %+v", replayed, state))
 }
 
+// checkState checks every invariant against one state.
 func (m Machine[S, M, R, Ev, Ef]) checkState(j func(spec.Rule, spec.Verdict), state S) {
 	for _, inv := range m.Invariants {
 		j(inv.Rule, checked(func() spec.Verdict { return inv.Check(state) }))
 	}
-	if m.Snapshots {
-		data, err := json.Marshal(state)
-		var back S
-		if err == nil {
-			err = json.Unmarshal(data, &back)
-		}
-		j(Snapshottable, spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err))
+}
+
+// checkSnapshot checks D7 against one state: it must survive the JSON round
+// trip the ledger stores snapshots through. The ledger snapshots the state
+// after a whole message, so this is a message-boundary guarantee rather than
+// one about every state a fold passes through.
+func (m Machine[S, M, R, Ev, Ef]) checkSnapshot(j func(spec.Rule, spec.Verdict), state S) {
+	if !m.Snapshots {
+		return
 	}
+	data, err := json.Marshal(state)
+	var back S
+	if err == nil {
+		err = json.Unmarshal(data, &back)
+	}
+	j(Snapshottable, spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err))
 }
 
 func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), msg M, d cairn.Decision[R, Ev, Ef]) {

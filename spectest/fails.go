@@ -1,13 +1,13 @@
 package spectest
 
 import (
-	"flag"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"pgregory.net/rapid"
+
+	"github.com/anyweez/cairn/spec"
 )
 
 // Fails runs check against a recorder instead of the real test and returns the
@@ -23,26 +23,15 @@ import (
 // generated N valid tests", and counting that would let the mutant test pass
 // without the rule ever being exercised.
 //
-// Fails changes process-wide rapid flags while it runs, so calls are
-// serialized; a parallel test running an ordinary Check at the same time only
-// loses its fail file and the shrinking of its counterexample.
+// A mutant's failure is the expected outcome, not one to reproduce later, so
+// Fails does not let rapid see it: a saved fail file would be replayed against
+// the next mutant of the same test name instead of letting it search, and
+// shrinking costs seconds per mutant (tens of seconds under -race). Instead the
+// first violation is recorded and the check winds down without failing rapid.
+// No process-wide rapid flag is changed, so a Fails may run beside a parallel
+// Check.
 func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	t.Helper()
-	failsMu.Lock()
-	defer failsMu.Unlock()
-	// A mutant's failure is the expected outcome, not one to reproduce later:
-	// a saved fail file would be replayed against the next mutant of the same
-	// test name instead of letting it search.
-	// Nor is it shrunk: callers ask whether and by which rule the check
-	// fails, which the first failing run already answers, and shrinking it
-	// costs seconds per mutant (tens of seconds under -race).
-	for name, value := range map[string]string{"rapid.nofailfile": "true", "rapid.shrinktime": "0s"} {
-		if f := flag.Lookup(name); f != nil {
-			previous := f.Value.String()
-			_ = f.Value.Set(value)
-			defer func() { _ = f.Value.Set(previous) }()
-		}
-	}
 	r := &recorder{TB: t}
 	func() {
 		defer func() {
@@ -54,8 +43,6 @@ func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 	}()
 	return r.message.String(), r.violated
 }
-
-var failsMu sync.Mutex
 
 var errStop = &struct{ string }{"spectest: recorded failure"}
 
@@ -71,6 +58,23 @@ type recorder struct {
 	violated bool
 	message  strings.Builder
 }
+
+// recordViolation is how judge reports an established rule violation while
+// Fails is running. Recording it instead of failing rapid keeps rapid out of
+// its fail-file and shrinking paths, which read the process-wide flags a
+// concurrent Check also reads. It returns whether this was the first violation.
+func (r *recorder) recordViolation(rule spec.Rule, detail string) bool {
+	if r.violated {
+		return false
+	}
+	r.violated = true
+	fmt.Fprintf(&r.message, "%s violated: %s\n  rule: %s\n", rule.ID, detail, rule.Statement)
+	return true
+}
+
+// stopping reports that a violation has already been recorded, so the rest of
+// the check can be skipped.
+func (r *recorder) stopping() bool { return r.violated }
 
 // markViolation records that spectest reported a failure, as opposed to rapid's
 // harness reporting one. It is how Fails distinguishes the two.

@@ -47,7 +47,8 @@ type Codec struct {
 	// Upcasts lists the versions that have an upcaster to the next one.
 	Upcasts []int `yaml:"upcasts,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
-	// "?" after the name of an omitempty field.
+	// "?" after the name of an omitempty field. A literal "?" in the name is
+	// doubled so it can't be read as that marker.
 	Fields []string `yaml:"fields"`
 }
 
@@ -336,7 +337,10 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		}
 		n, _ := constant.Int64Val(version)
 		c := &Codec{
-			Sum:     types.TypeString(sum, nil),
+			// reflect resolves an alias, so the runtime names the aliased type;
+			// resolve it here or a registration through an alias is recorded
+			// under a name the running program does not have.
+			Sum:     types.TypeString(types.Unalias(sum), nil),
 			Name:    constant.StringVal(name),
 			Version: int(n),
 			Type:    types.TypeString(v, nil),
@@ -363,7 +367,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		}
 		n, _ := constant.Int64Val(from)
 		x.upcasts = append(x.upcasts, upcast{
-			sum:  types.TypeString(sum, nil),
+			sum:  types.TypeString(types.Unalias(sum), nil),
 			name: constant.StringVal(name),
 			from: int(n),
 			pos:  x.position(p.Fset, call.Pos()),
@@ -395,7 +399,7 @@ func render(v constant.Value) string {
 }
 
 func isNamed(t types.Type, pkg, name string) bool {
-	n, ok := t.(*types.Named)
+	n, ok := types.Unalias(t).(*types.Named)
 	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == pkg && n.Obj().Name() == name
 }
 

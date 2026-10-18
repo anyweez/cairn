@@ -119,7 +119,10 @@ type Loaded[S any] struct {
 // it is not returned: what a caller needs from a decision belongs in R, and
 // Load reads the state.
 type Handled[R any] struct {
-	Entry   Entry
+	Entry Entry
+	// Result is the accepted decision's result. It is the zero R for a refusal:
+	// a refusal is stored without a result, and a retry is answered from that
+	// entry, so the first call must answer with it too.
 	Result  R
 	Refusal *cairn.Refusal
 	// Duplicate is true when the idempotency key matched an earlier entry:
@@ -677,7 +680,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	next.Seq = entry.Seq
 
 	return func() Handled[R] {
-		return Handled[R]{Entry: *entry, Result: decision.Result, Refusal: entry.Refusal}
+		// A refusal stores no result (Entry.Result is nil when the message was
+		// refused), so return the zero R rather than the decider's. A retry is
+		// answered from the stored entry, and the two answers must agree.
+		var result R
+		if !decision.Refused() {
+			result = decision.Result
+		}
+		return Handled[R]{Entry: *entry, Result: result, Refusal: entry.Refusal}
 	}, next, entry, decision.Events, nil
 }
 

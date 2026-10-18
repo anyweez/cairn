@@ -151,8 +151,6 @@ func TestConcurrentHandlesOnOneStreamSerialize(t *testing.T) {
 // The global log must still hand out each stream's entries in seq order, or a
 // projection would fold a stream's history out of order.
 func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	ids := []string{"s0", "s1", "s2", "s3"}
 	var wg sync.WaitGroup
@@ -188,9 +186,9 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The cutoff is the oldest transaction running anywhere on the server, so
-	// another database's transaction can hold entries back for a while: keep
-	// reading until every entry has arrived.
+	// The cutoff is the oldest transaction still in flight in this database, so
+	// concurrent writers here can hold entries back for a while: keep reading
+	// until every entry has arrived.
 	last := map[ledger.Stream]int64{}
 	deadline := time.Now().Add(10 * time.Second)
 	for cursor, total := (ledger.Cursor{}), 0; total < written; {
@@ -219,8 +217,6 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 // Transaction IDs order the log as numbers, including across a change in their
 // number of digits.
 func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	pool := agg.Store.Pool()
 	if _, err := agg.Handle(ctx, "first", add{1, 10}); err != nil {
@@ -266,8 +262,6 @@ func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 // An entry that commits after a later one must not be skipped by a reader that
 // has already moved its cursor past the later one.
 func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	appended, release, done := make(chan struct{}), make(chan struct{}), make(chan error)
 	go func() {
@@ -301,8 +295,8 @@ func TestTheGlobalLogHoldsBackEntriesBehindAnOpenTransaction(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	// The cutoff is the oldest transaction running anywhere on the server, so
-	// another database's transaction can hold entries back a little longer.
+	// The slow transaction has committed, so the fast entry is no longer held
+	// back behind it.
 	entries = nil
 	for deadline := time.Now().Add(10 * time.Second); len(entries) < 2 && time.Now().Before(deadline); {
 		more, next, err := agg.Store.ReadAll(ctx, cursor, 10)
@@ -455,8 +449,6 @@ func TestSnapshotsOfDifferentVersionsCoexist(t *testing.T) {
 }
 
 func TestProjectionSeesEachEntryOnceInCommitOrder(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	pool := agg.Store.Pool()
 	if _, err := pool.Exec(ctx, `CREATE TABLE totals (stream text PRIMARY KEY, total int NOT NULL, entries int NOT NULL)`); err != nil {
@@ -533,8 +525,6 @@ func countSeen(t *testing.T, agg *ledger.Aggregate[counter, msg, int, event, eff
 // A statement that fails rolls back the whole batch of entries with the
 // checkpoint's advance, so the next catch-up starts from the same place.
 func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	projection := seenProjection(t, agg)
 	for _, id := range []string{"a", "a", "b"} {
@@ -571,8 +561,6 @@ func TestAFailingProjectionStatementLeavesTheCheckpoint(t *testing.T) {
 // checkpoint. The loser's writes, sent in the same round trip as its claim,
 // roll back with it, so every entry is applied once.
 func TestConcurrentRunnersApplyEachEntryOnce(t *testing.T) {
-	// Not parallel: the global log waits on open transactions in every database
-	// on the server, so other tests would hold it back.
 	agg := newCounter(t)
 	projection := seenProjection(t, agg)
 	for _, id := range []string{"a", "b", "a", "c", "b"} {
