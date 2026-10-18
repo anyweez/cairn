@@ -206,7 +206,10 @@ During a rolling deploy:
   already migrated, so old code keeps starting during the rollout and after
   a rollback. Migrations only add; none changes what an earlier release reads.
 - **Snapshots:** they are kept per `StateVersion`, so old and new code don't
-  evict each other's.
+  evict each other's. A release that changes what `Evolve` computes must
+  change `StateVersion` too: otherwise new code reuses old code's snapshot as
+  its base, and a stream that has one keeps the old fold while a stream
+  without one rebuilds from events.
 - **New versions:** a new message or event version that new code writes
   can't be read by old code until the rollout finishes. Ship decoding first,
   and start writing the new version in a later release.
