@@ -11,6 +11,10 @@ import (
 // fields renders the JSON shape of a registered type, one entry per field, as
 // encoding/json writes it. A type that isn't a struct is one entry, "=".
 //
+// An omitempty or omitzero field is marked with "?" after its name. A name
+// that itself contains "?" is escaped by doubling it, so a literal "?" is
+// never mistaken for the marker.
+//
 // codec.Encode marshals the registered value itself, which is not
 // addressable, so a marshaler with a pointer receiver on that type is not
 // used and its fields are what is stored.
@@ -197,6 +201,12 @@ func (s *shaper) structFields(st *types.Struct, addr bool) []string {
 		if name == "" {
 			name = f.Name()
 		}
+		// "?" after the name marks omitempty/omitzero, but "?" is also a legal
+		// JSON key character, so a field tagged `json:"a?"` would render
+		// exactly like `json:"a,omitempty"`: different wire formats, one
+		// manifest entry. Double a literal "?" in the name so the marker is
+		// the only single "?" and the -base check can tell them apart.
+		name = strings.ReplaceAll(name, "?", "??")
 		if hasOption(opts, "omitempty") || hasOption(opts, "omitzero") {
 			name += "?"
 		}
