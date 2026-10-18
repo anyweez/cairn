@@ -125,14 +125,41 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 		rep.proposed(rule, detail, *trace)
 		return
 	}
+	// Under Fails, record the first violation instead of failing rapid: a rapid
+	// failure would shrink it and save a fail file, both of which read the
+	// process-wide rapid flags Fails would have to change — a data race with a
+	// concurrent Check. See recorder.recordViolation.
+	if c, ok := outer.(interface {
+		recordViolation(rule spec.Rule, detail string) bool
+	}); ok {
+		c.recordViolation(rule, detail)
+		return
+	}
 	markViolation(outer)
 	rt.Fatalf("%s violated: %s\n  rule: %s", rule.ID, detail, rule.Statement)
 }
 
+// collectorStopped reports that Fails has already recorded a rule violation,
+// so the rest of the check proves nothing and can be skipped.
+func collectorStopped(t rapid.TB) bool {
+	if s, ok := t.(interface{ stopping() bool }); ok {
+		return s.stopping()
+	}
+	return false
+}
+
 func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) {
+	if collectorStopped(outer) {
+		return
+	}
 	rep.ran()
 	var trace []string
-	j := func(rule spec.Rule, v spec.Verdict) { judge(rt, outer, rep, &trace, rule, v) }
+	j := func(rule spec.Rule, v spec.Verdict) {
+		if collectorStopped(outer) {
+			return
+		}
+		judge(rt, outer, rep, &trace, rule, v)
+	}
 
 	initial, ok := guard(func() S { return m.Decider.Initial() })
 	j(Total, spec.Check(ok, "Initial panicked: %v", initial.panic))
@@ -148,6 +175,9 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 	var events []Ev
 	steps := rapid.IntRange(1, m.Steps).Draw(rt, "steps")
 	for step := 1; step <= steps; step++ {
+		if collectorStopped(outer) {
+			return
+		}
 		msg := m.Messages(rt, state)
 		trace = append(trace, fmt.Sprintf("%d. %s", step, describe(msg)))
 
