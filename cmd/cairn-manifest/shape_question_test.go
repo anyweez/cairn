@@ -41,6 +41,51 @@ func TestAFieldNamedWithATrailingQuestionMarkIsNotTheOmitemptyMarker(t *testing.
 	}
 }
 
+// questionZeroKey's field is omitted when zero, like questionKey but with
+// omitzero, so the same collision applies to that marker.
+type questionZeroKey struct {
+	A int `json:"a,omitzero"`
+}
+
+// nestedQuestionKey and nestedOmittedKey put the collision one level down:
+// the old rendering of both was chain: {next?: int}.
+type nestedQuestionKey struct {
+	Chain struct {
+		Next int `json:"next?"`
+	} `json:"chain"`
+}
+
+type nestedOmittedKey struct {
+	Chain struct {
+		Next int `json:"next,omitempty"`
+	} `json:"chain"`
+}
+
+func TestAQuestionMarkIsNotTheOmitzeroMarkerEither(t *testing.T) {
+	if got, _ := json.Marshal(questionZeroKey{}); string(got) != `{}` {
+		t.Fatalf("questionZeroKey marshaled to %s, want {}", got)
+	}
+	q := declaredType(t, "questionKey")
+	z := declaredType(t, "questionZeroKey")
+	if slices.Equal(fields(q), fields(z)) {
+		t.Fatalf("the manifest renders json:%q and json:%q the same: %v", "a?", "a,omitzero", fields(q))
+	}
+}
+
+func TestAQuestionMarkInANestedKeyIsNotTheOmitemptyMarker(t *testing.T) {
+	if got, _ := json.Marshal(nestedQuestionKey{}); string(got) != `{"chain":{"next?":0}}` {
+		t.Fatalf("nestedQuestionKey marshaled to %s, want {\"chain\":{\"next?\":0}}", got)
+	}
+	if got, _ := json.Marshal(nestedOmittedKey{}); string(got) != `{"chain":{}}` {
+		t.Fatalf("nestedOmittedKey marshaled to %s, want {\"chain\":{}}", got)
+	}
+	q := declaredType(t, "nestedQuestionKey")
+	o := declaredType(t, "nestedOmittedKey")
+	if slices.Equal(fields(q), fields(o)) {
+		t.Fatalf("the manifest renders the nested json:%q and json:%q the same: %v", "next?", "next,omitempty", fields(q))
+	}
+}
+
 // declaredType loads the named type from this package, the way the other
 // shape tests reach the real declaration.
 func declaredType(t *testing.T, name string) types.Type {

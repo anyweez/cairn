@@ -47,7 +47,8 @@ type Codec struct {
 	// Upcasts lists the versions that have an upcaster to the next one.
 	Upcasts []int `yaml:"upcasts,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
-	// "?" after the name of an omitempty field.
+	// "?" after the name of an omitempty field. A literal "?" in the name is
+	// doubled so it can't be read as that marker.
 	Fields []string `yaml:"fields"`
 }
 
