@@ -120,7 +120,10 @@ func (e *NotStorableError) Error() string {
 // would silently store text the caller never wrote.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalJSON
-// or MarshalText decides its own encoding and is not inspected.
+// decides its own encoding and is not inspected, because those bytes are the
+// JSON. A type with its own MarshalText does not: json writes the text through
+// its own string encoder, so the bytes it returns are checked like any other
+// string.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
@@ -157,7 +160,13 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 			return nil
 		}
 		if _, ok := v.Interface().(encoding.TextMarshaler); ok {
-			return nil
+			// json.Marshal renders a nil pointer as null and never calls
+			// MarshalText.
+			if v.Kind() == reflect.Pointer && v.IsNil() {
+				return nil
+			}
+			_, err := renderStorableText(v, path)
+			return err
 		}
 	}
 	switch v.Kind() {
@@ -257,25 +266,37 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 		return k.String(), nil
 	}
 	if k.CanInterface() {
-		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+		if _, ok := k.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer key as the empty string and
 			// never calls its MarshalText.
 			if k.Kind() == reflect.Pointer && k.IsNil() {
 				return "", nil
 			}
-			text, err := tm.MarshalText()
-			if err != nil {
-				return "", err
-			}
-			if !cairn.StorableText(string(text)) {
-				return "", &NotStorableError{Path: path}
-			}
-			return string(text), nil
+			return renderStorableText(k, path)
 		}
 	}
 	// An integer key becomes its decimal form, which is always storable. The
 	// value is only a path for anything else, which json.Marshal will reject.
 	return k.String(), nil
+}
+
+// renderStorableText calls v's MarshalText and returns the text json.Marshal
+// will write for it, refusing text the ledger cannot store.
+//
+// json writes a TextMarshaler's bytes through its own string encoder, so bytes
+// that are not valid UTF-8 become U+FFFD — text the caller never sent — and a
+// NUL is escaped as \u0000, which jsonb rejects. The bytes MarshalText returns
+// are therefore not the bytes the ledger will hold. A value and a map key both
+// reach that encoder, so both are checked here.
+func renderStorableText(v reflect.Value, path string) (string, error) {
+	text, err := v.Interface().(encoding.TextMarshaler).MarshalText()
+	if err != nil {
+		return "", err
+	}
+	if !cairn.StorableText(string(text)) {
+		return "", &NotStorableError{Path: path}
+	}
+	return string(text), nil
 }
 
 // EncodeAll encodes a slice, preserving order.
