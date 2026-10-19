@@ -123,7 +123,9 @@ func (e *NotStorableError) Error() string {
 // decides its own encoding and is not inspected, because those bytes are the
 // JSON. A type with its own MarshalText does not: json writes the text through
 // its own string encoder, so the bytes it returns are checked like any other
-// string.
+// string. A MarshalText or MarshalJSON on the pointer to the value counts too
+// wherever json reaches the value addressably, which is a slice or array
+// element, or a field of a struct behind a pointer.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
@@ -154,6 +156,22 @@ func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
 func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	if !v.IsValid() {
 		return nil
+	}
+	// json.Marshal uses a pointer-receiver MarshalJSON or MarshalText whenever
+	// the value is addressable — a slice or array element, or a struct behind a
+	// pointer — and prefers it to a value-receiver method, so it is checked
+	// first. A json.Marshaler decides its own bytes and is opaque; a
+	// TextMarshaler's bytes go through json's string encoder, so they are
+	// checked like any other string.
+	if v.CanAddr() && v.Kind() != reflect.Pointer && v.Addr().CanInterface() {
+		addr := v.Addr()
+		if _, ok := addr.Interface().(json.Marshaler); ok {
+			return nil
+		}
+		if _, ok := addr.Interface().(encoding.TextMarshaler); ok {
+			_, err := renderStorableText(addr, path)
+			return err
+		}
 	}
 	if v.CanInterface() {
 		if _, ok := v.Interface().(json.Marshaler); ok {
