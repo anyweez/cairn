@@ -227,56 +227,103 @@ const migrationLockPoll = 50 * time.Millisecond
 // succeeds because session advisory locks are re-entrant. Every step here is
 // one autocommitted statement, so the committed lease is visible to every
 // caller through the pooler, and a waiter holds no snapshot while it polls.
+// A waiter gives its connection back between attempts too, so waiting for the
+// lease costs no connection and cannot starve the holder's heartbeat.
 // The holder renews the lease while it migrates, so a build that outlasts the
 // TTL does not lose it to a waiter.
 func (s *Store) migrate(ctx context.Context, migs []migration, ttl time.Duration) error {
-	conn, err := s.pool.Acquire(ctx)
+	if err := s.ensureMigrationLock(ctx); err != nil {
+		return err
+	}
+	holder, err := s.acquireMigrationLease(ctx, ttl)
 	if err != nil {
+		return err
+	}
+	// The lease is ours, and it must never be held without the means to renew
+	// it: a migration keeps one connection for as long as it runs, so its
+	// heartbeat needs a second one. Reserve both before running a statement,
+	// or a beat could wait for a connection the migration itself is holding
+	// and the lease would expire under a live holder after the TTL.
+	pooled, err := s.pool.Acquire(ctx)
+	if err != nil {
+		s.deleteMigrationLease(ctx, nil, holder)
 		return fmt.Errorf("cairn: acquiring a connection to migrate: %w", err)
 	}
-	if err := ensureMigrationLock(ctx, conn); err != nil {
-		conn.Release()
-		return err
+	conn := migrationConn(pooled)
+	releaseConn := func() { pooled.Release() }
+	// When the pool has no second connection to give — a pool of one, or every
+	// other connection busy — take the migration's connection out of the
+	// pool's accounting, so the pool can open the heartbeat's beside it. A
+	// pool of one is a legitimate configuration, and nothing inside its limit
+	// can renew a lease while its only connection is busy migrating. The
+	// hijacked connection is closed rather than released at the end, and the
+	// pool opens a replacement when it next needs one.
+	if stat := s.pool.Stat(); stat.AcquiredConns() >= stat.MaxConns() {
+		raw := pooled.Hijack()
+		conn = raw
+		releaseConn = func() { _ = raw.Close(context.WithoutCancel(ctx)) }
 	}
-	holder, err := acquireMigrationLease(ctx, conn, ttl)
+	renewOn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		conn.Release()
-		return err
+		// The lease is ours but nothing can renew it, so give it back rather
+		// than leave every later caller waiting out the TTL.
+		s.deleteMigrationLease(ctx, conn, holder)
+		releaseConn()
+		return fmt.Errorf("cairn: acquiring a connection to renew the migration lease: %w", err)
 	}
+	releaseRenewal := renewOn.Release
 	// A migration can outlast its lease, so renew it while it runs: a lease
 	// that expires under a live holder lets a second caller take it and rerun
 	// the same statements alongside. The heartbeat cancels migrateCtx when it
 	// can no longer renew, so the migration's next statement fails.
 	migrateCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	heartbeat := startMigrationHeartbeat(migrateCtx, s.pool, holder, ttl, cancel)
+	heartbeat := startMigrationHeartbeat(migrateCtx, renewOn, holder, ttl, cancel)
 	err = applyMigrations(migrateCtx, conn, holder, migs)
 	// Stop the heartbeat before releasing the lease, so no beat renews a row
 	// this caller is about to delete and a lost lease is reported.
 	if heartbeatErr := heartbeat.stop(); heartbeatErr != nil {
 		err = heartbeatErr
 	}
-	// Release the lease on a context that outlives the caller's, even when the
-	// caller was cancelled: a lease left behind is only reclaimable when it
-	// expires. A cancellation often closes the connection the statement was
-	// sent on, so a failed DELETE is retried on a fresh one.
+	releaseRenewal()
+	s.deleteMigrationLease(ctx, conn, holder)
+	releaseConn()
+	return err
+}
+
+// deleteMigrationLease deletes this caller's lease row on a context that
+// outlives a cancellation: a lease left behind is only reclaimable when it
+// expires. A cancellation often closes the connection the statement was sent
+// on, so a failed DELETE, or one with no connection to send it on, is retried
+// on a fresh one.
+func (s *Store) deleteMigrationLease(ctx context.Context, conn migrationConn, holder string) {
 	releaseCtx := context.WithoutCancel(ctx)
-	_, relErr := conn.Exec(releaseCtx,
-		`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder)
-	conn.Release()
-	if relErr != nil {
-		if fresh, aerr := s.pool.Acquire(releaseCtx); aerr == nil {
-			_, _ = fresh.Exec(releaseCtx,
-				`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder)
-			fresh.Release()
+	if conn != nil {
+		if _, err := conn.Exec(releaseCtx,
+			`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder); err == nil {
+			return
 		}
 	}
-	return err
+	if fresh, err := s.pool.Acquire(releaseCtx); err == nil {
+		_, _ = fresh.Exec(releaseCtx,
+			`DELETE FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder)
+		fresh.Release()
+	}
+}
+
+// migrationConn is the connection a migration runs on. It is the pool's,
+// except when the pool has no second connection to renew the lease on: then it
+// is taken out of the pool (see migrate) and arrives as a *pgx.Conn.
+type migrationConn interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // applyMigrations creates the version table and runs every migration after the
 // recorded version. The caller holds the migration lease.
-func applyMigrations(ctx context.Context, conn *pgxpool.Conn, holder string, migs []migration) error {
+func applyMigrations(ctx context.Context, conn migrationConn, holder string, migs []migration) error {
 	if _, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS cairn;
 CREATE TABLE IF NOT EXISTS cairn.schema_version (
@@ -304,8 +351,14 @@ CREATE TABLE IF NOT EXISTS cairn.schema_version (
 // unique violation instead of the no-op IF NOT EXISTS promises. The statement
 // is idempotent, so the loser retries until it observes what the winner
 // committed. Retrying rather than serializing keeps the wait to its own
-// statement, so no caller holds a snapshot while another bootstraps.
-func ensureMigrationLock(ctx context.Context, conn *pgxpool.Conn) error {
+// statement, so no caller holds a snapshot while another bootstraps; the
+// connection is given back before the caller goes on to wait for the lease.
+func (s *Store) ensureMigrationLock(ctx context.Context) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("cairn: acquiring a connection to create the migration lock: %w", err)
+	}
+	defer conn.Release()
 	for {
 		_, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS cairn;
@@ -345,21 +398,29 @@ func isConcurrentCreate(err error) bool {
 // mode pooler can send it on any connection and the committed row still
 // excludes every other caller. An unexpired lease is left alone and the
 // attempt returns no row; a caller whose context ends while waiting returns an
-// error, and the lease it never took is untouched.
-func acquireMigrationLease(ctx context.Context, conn *pgxpool.Conn, ttl time.Duration) (string, error) {
+// error, and the lease it never took is untouched. Each attempt takes its own
+// connection and gives it back before the sleep, so a waiter holds no
+// connection -- and no snapshot -- while it polls, and cannot starve the
+// holder's heartbeat of one.
+func (s *Store) acquireMigrationLease(ctx context.Context, ttl time.Duration) (string, error) {
 	holder, err := newMigrationHolder()
 	if err != nil {
 		return "", err
 	}
 	for {
+		conn, err := s.pool.Acquire(ctx)
+		if err != nil {
+			return "", fmt.Errorf("cairn: acquiring a connection for the migration lease: %w", err)
+		}
 		var taken string
-		err := conn.QueryRow(ctx, `
+		err = conn.QueryRow(ctx, `
 INSERT INTO cairn.migration_lock (id, holder, expires_at)
 VALUES (1, $1, now() + make_interval(secs => $2))
 ON CONFLICT (id) DO UPDATE
     SET holder = excluded.holder, expires_at = excluded.expires_at
     WHERE cairn.migration_lock.expires_at <= now()
 RETURNING holder`, holder, ttl.Seconds()).Scan(&taken)
+		conn.Release()
 		switch {
 		case err == nil:
 			return taken, nil
@@ -386,10 +447,11 @@ func newMigrationHolder() (string, error) {
 }
 
 // migrationHeartbeat renews the migration lease while its holder migrates.
-// Each beat is one autocommitted statement on its own pooled connection, so
-// it stays visible through a transaction-mode pooler, and a connection is
-// acquired only for the beat: a migration that finishes before the first tick
-// never costs a second connection.
+// Each beat is one autocommitted statement on a connection reserved for the
+// heartbeat as soon as the lease is taken, so it stays visible through a
+// transaction-mode pooler and no statement the migration runs can starve a
+// renewal. The connection is held for the whole migration: acquiring one
+// during it could wait on the migration's own statement.
 //
 // A beat that updates no row means the lease is no longer this caller's,
 // which happens when it expired and another caller reclaimed it. The
@@ -403,10 +465,11 @@ type migrationHeartbeat struct {
 	lost   error
 }
 
-// startMigrationHeartbeat starts the renewal loop for holder's lease. cancel
-// is called if the lease is lost, so the migration the heartbeat guards stops
-// before it can record anything.
-func startMigrationHeartbeat(ctx context.Context, pool *pgxpool.Pool, holder string, ttl time.Duration, cancel context.CancelFunc) *migrationHeartbeat {
+// startMigrationHeartbeat starts the renewal loop for holder's lease on
+// renewOn, the connection reserved for it. cancel is called if the lease is
+// lost, so the migration the heartbeat guards stops before it can record
+// anything.
+func startMigrationHeartbeat(ctx context.Context, renewOn *pgxpool.Conn, holder string, ttl time.Duration, cancel context.CancelFunc) *migrationHeartbeat {
 	// The heartbeat's own context is separate from the migration's, so stop
 	// can unblock a beat that is waiting on the database; losing the lease
 	// cancels the migration through cancel instead.
@@ -425,7 +488,7 @@ func startMigrationHeartbeat(ctx context.Context, pool *pgxpool.Pool, holder str
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				tag, err := pool.Exec(hbCtx, `
+				tag, err := renewOn.Exec(hbCtx, `
 UPDATE cairn.migration_lock
 SET expires_at = now() + make_interval(secs => $2)
 WHERE id = 1 AND holder = $1`, holder, ttl.Seconds())
@@ -464,7 +527,7 @@ func (h *migrationHeartbeat) stop() error {
 // returns nil without running anything when the version is already recorded,
 // which a caller that read the version before blocking for the migration lock
 // sees after it re-reads it under the lock.
-func applyMigration(ctx context.Context, conn *pgxpool.Conn, holder string, version int, m migration) error {
+func applyMigration(ctx context.Context, conn migrationConn, holder string, version int, m migration) error {
 	if m.Concurrent {
 		for i, stmt := range m.Statements {
 			if _, err := conn.Exec(ctx, stmt); err != nil {
@@ -519,7 +582,7 @@ func applyMigration(ctx context.Context, conn *pgxpool.Conn, holder string, vers
 // A concurrent migration runs its statements outside any transaction, so
 // nothing else stops a caller whose lease was taken from recording a version
 // it no longer owns.
-func requireMigrationLease(ctx context.Context, conn *pgxpool.Conn, holder string, version int) error {
+func requireMigrationLease(ctx context.Context, conn migrationConn, holder string, version int) error {
 	var held int
 	err := conn.QueryRow(ctx,
 		`SELECT 1 FROM cairn.migration_lock WHERE id = 1 AND holder = $1`, holder).Scan(&held)
@@ -538,7 +601,7 @@ func requireMigrationLease(ctx context.Context, conn *pgxpool.Conn, holder strin
 // record a version while one exists. cairn owns the whole schema and a
 // migration never creates an index outside it, so any invalid index here is
 // one a concurrent migration left.
-func invalidIndexes(ctx context.Context, conn *pgxpool.Conn) ([]string, error) {
+func invalidIndexes(ctx context.Context, conn migrationConn) ([]string, error) {
 	rows, err := conn.Query(ctx, `
 SELECT c.relname
 FROM pg_index i

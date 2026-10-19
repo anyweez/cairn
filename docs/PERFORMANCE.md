@@ -116,6 +116,13 @@ on average. Allow headroom for bursts.
 - **Count connections across instances.** Instances × `MaxConns` must stay
   under Postgres's `max_connections`, with room for everything else that
   connects.
+- **A migration holds two connections while it runs.** It keeps one for the
+  migration and one to renew the lease, so a process that is migrating has one
+  fewer connection for its own work. When the pool has no second connection to
+  give, the migration's own is taken outside `MaxConns` so the heartbeat can
+  open beside it, which makes a pool of one work: the alternative is a lease
+  that expires under a live holder and a second caller rerunning its
+  statements.
 - **Waiting for a lock holds a connection.** Without a cache, a caller queued
   behind a hot stream's lock keeps its connection idle until the lock is
   granted. Many callers on one hot stream can therefore take a whole pool and
