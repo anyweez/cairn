@@ -288,7 +288,7 @@ func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), m
 	if m.Codecs == nil {
 		return
 	}
-	j(Encodable, roundTripMessage(m.Codecs.Messages, msg, d.Refused()))
+	j(Encodable, roundTripMaybeRefused(m.Codecs.Messages, msg, d.Refused()))
 	if !d.Refused() {
 		j(Encodable, roundTrip(m.Codecs.Results, d.Result))
 	}
@@ -301,22 +301,18 @@ func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), m
 }
 
 func roundTrip[T any](c *codec.Codec[T], v T) spec.Verdict {
-	return roundTripValue(c, v, false)
+	return roundTripMaybeRefused(c, v, false)
 }
 
-// roundTripMessage is roundTrip for the generated message. When the decider
-// refused the message and the codec rejects it as not storable, the rule does
-// not apply: the ledger answers the refusal without recording an entry, so the
-// message never has to survive a codec. A message that is accepted, or a
-// refusal whose message encodes, still must round-trip, because the ledger
-// either stores it or errors. A message the codec rejects for any other reason
-// is a machine fault even when refused: the ledger answers a refusal without an
-// entry only for a NotStorableError.
-func roundTripMessage[T any](c *codec.Codec[T], v T, refused bool) spec.Verdict {
-	return roundTripValue(c, v, refused)
-}
-
-func roundTripValue[T any](c *codec.Codec[T], v T, refused bool) spec.Verdict {
+// roundTripMaybeRefused is roundTrip for the generated message. When the
+// decider refused the message and the codec rejects it as not storable, the
+// rule does not apply: the ledger answers the refusal without recording an
+// entry, so the message never has to survive a codec. A message that is
+// accepted, or a refusal whose message encodes, still must round-trip, because
+// the ledger either stores it or errors. A message the codec rejects for any
+// other reason is a machine fault even when refused: the ledger answers a
+// refusal without an entry only for a NotStorableError.
+func roundTripMaybeRefused[T any](c *codec.Codec[T], v T, refused bool) spec.Verdict {
 	if c == nil {
 		return spec.NA
 	}
