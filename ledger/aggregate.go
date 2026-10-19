@@ -213,13 +213,28 @@ type result[R any] struct {
 // which is answered from its first entry.
 var errUnchecked = errors.New("cairn: the message needs its idempotency key looked up")
 
-// answeredFromFirstEntry reports whether a metadata error leaves a message
+// answeredFromFirstEntry reports whether the request's own metadata leaves it
 // eligible for the answer its idempotency key already holds. Only a missing
 // actor does: the retry lost the request's context, and the message was
 // attributed when it was recorded. Metadata that names a different actor is a
-// contradiction, and the request is refused rather than answered.
+// contradiction, and the request is refused rather than answered. Whether an
+// eligible request names the actor the entry was recorded under is a second
+// question, asked of the entry itself by mismatchedActor.
 func answeredFromFirstEntry(metaErr error) bool {
 	return metaErr == nil || errors.Is(metaErr, ErrNoActor)
+}
+
+// mismatchedActor returns ErrActorMismatch when the request names an actor and
+// the entry its idempotency key holds was recorded under a different one. An
+// entry's answer belongs to the actor that recorded it, so only a retry that
+// carries no actor (or the same one) may be answered from it. A request that
+// names no actor is treated as a retry that lost its context, and is answered
+// from the first entry.
+func mismatchedActor(meta Meta, e Entry) error {
+	if meta.Actor != "" && meta.Actor != e.Meta.Actor {
+		return fmt.Errorf("%w: the entry was recorded by %q, the request names %q", ErrActorMismatch, e.Meta.Actor, meta.Actor)
+	}
+	return nil
 }
 
 // runGroup records reqs on one stream, in order, in one transaction, and
@@ -307,8 +322,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			results[i].err = errUnchecked
 			continue
 		// A retry gets its first answer even when it lost the request's
-		// metadata: the message was attributed when it was recorded.
+		// metadata: the message was attributed when it was recorded. A
+		// request that names a different actor than the entry was recorded
+		// under is refused instead: the entry's answer is that actor's.
 		case dups[i] != nil && dups[i].found:
+			if err := mismatchedActor(r.meta, dups[i].entry); err != nil {
+				results[i].err = err
+				continue
+			}
 			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
 			continue
 		case r.metaErr != nil:
@@ -584,10 +605,13 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 			return Handled[R]{}, err
 		}
 		if dup.found {
-			if answeredFromFirstEntry(metaErr) {
-				return a.duplicateOf(dup.entry)
+			if !answeredFromFirstEntry(metaErr) {
+				return Handled[R]{}, metaErr
 			}
-			return Handled[R]{}, metaErr
+			if err := mismatchedActor(meta, dup.entry); err != nil {
+				return Handled[R]{}, err
+			}
+			return a.duplicateOf(dup.entry)
 		}
 	}
 	if metaErr != nil {

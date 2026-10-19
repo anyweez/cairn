@@ -2,6 +2,7 @@ package ledger_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -10,16 +11,14 @@ import (
 )
 
 // A retry of an idempotency key is answered from its first entry, and the
-// exemption in answeredFromFirstEntry is written for a retry that *lost* its
-// context: "Only a missing actor does". A request that carries a present actor
-// which is self-consistent — the metadata and the message both name u_99 — but
-// replays another actor's key is answered anyway, because the duplicate
-// lookup compares the request to its own message, never to the stored entry's
-// actor. So u_99 is handed u_10's stored result, with no error.
-//
-// The identity boundary the README documents is that an entry's result belongs
-// to the actor who recorded it. A different actor that guesses or observes a
-// key must not receive it.
+// exemption is written for a retry that *lost* its context: "Only a missing
+// actor does". A request that carries a present actor which is
+// self-consistent — the metadata and the message both name u_99 — but replays
+// another actor's key must still be refused, because the duplicate lookup
+// compared the request to its own message, never to the stored entry's actor,
+// so u_99 was handed u_10's stored result with no error. The identity boundary
+// the README documents is that an entry's result belongs to the actor who
+// recorded it; a different actor must not receive it.
 func TestAnotherActorsIdempotencyKeyIsNotAnswered(t *testing.T) {
 	t.Parallel()
 	for _, cache := range []int{0, 100} {
@@ -38,16 +37,16 @@ func TestAnotherActorsIdempotencyKeyIsNotAnswered(t *testing.T) {
 			// too, and replays u_10's key.
 			as := ledger.ContextWithMeta(context.Background(), ledger.Meta{Actor: "u_99"})
 			h, err := agg.Handle(as, "a", add{7, 99}, ledger.IdempotencyKey("k"))
-			if err == nil && h.Duplicate && h.Entry.Meta.Actor == "u_10" {
-				t.Fatalf("u_99 replayed u_10's key and was handed u_10's stored result %d (entry %s#%d, actor %q)",
-					h.Result, h.Entry.Stream, h.Entry.Seq, h.Entry.Meta.Actor)
+			if !errors.Is(err, ledger.ErrActorMismatch) {
+				t.Fatalf("u_99 replayed u_10's key and got result %d (entry %s#%d, actor %q), err %v; want ErrActorMismatch",
+					h.Result, h.Entry.Stream, h.Entry.Seq, h.Entry.Meta.Actor, err)
 			}
 		})
 	}
 }
 
-// Apply has the same boundary: it answers the duplicate before it can compare
-// the request's actor to the stored entry's, so a composed transaction hands
+// Apply had the same boundary: it answered the duplicate before it could compare
+// the request's actor to the stored entry's, so a composed transaction handed
 // u_99 u_10's result.
 func TestAnotherActorsIdempotencyKeyIsNotAnsweredByApply(t *testing.T) {
 	t.Parallel()
@@ -74,8 +73,8 @@ func TestAnotherActorsIdempotencyKeyIsNotAnsweredByApply(t *testing.T) {
 
 	as := ledger.ContextWithMeta(context.Background(), ledger.Meta{Actor: "u_99"})
 	h, err := apply(as, add{7, 99}, ledger.IdempotencyKey("k"))
-	if err == nil && h.Duplicate && h.Entry.Meta.Actor == "u_10" {
-		t.Fatalf("u_99 replayed u_10's key and Apply handed it u_10's stored result %d (actor %q)",
-			h.Result, h.Entry.Meta.Actor)
+	if !errors.Is(err, ledger.ErrActorMismatch) {
+		t.Fatalf("u_99 replayed u_10's key and Apply got result %d (actor %q), err %v; want ErrActorMismatch",
+			h.Result, h.Entry.Meta.Actor, err)
 	}
 }
