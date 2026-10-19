@@ -54,8 +54,11 @@ func TestAnOlderPreparedTransactionIsNotSkipped(t *testing.T) {
 		t.Skip("max_prepared_transactions is 0, so PREPARE TRANSACTION is disabled")
 	}
 
-	// Prepare an entry, giving it the oldest transaction ID in play.
-	gid := "cairn_test_prepared"
+	// Prepare an entry, giving it the oldest transaction ID in play. Postgres
+	// names prepared transactions cluster-wide, so the name is derived from
+	// this run's database: a fixed one would collide with a run that failed
+	// after its PREPARE and left the transaction behind.
+	gid := "cairn_test_prepared_" + agg.Store.Pool().Config().ConnConfig.Database
 	conn, err := agg.Store.Pool().Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +78,12 @@ func TestAnOlderPreparedTransactionIsNotSkipped(t *testing.T) {
 	if _, err := tx.Exec(ctx, `PREPARE TRANSACTION '`+gid+`'`); err != nil {
 		t.Fatal(err)
 	}
+	// If an assertion fails before the COMMIT, release the name and the
+	// max_prepared_transactions slot it holds. Failing to release it would
+	// make the database undroppable and poison later runs.
+	t.Cleanup(func() {
+		_, _ = agg.Store.Pool().Exec(ctx, `ROLLBACK PREPARED '`+gid+`'`)
+	})
 
 	// A committed entry with a newer transaction ID, which a reader could
 	// advance its cursor past while the prepared transaction is still open.
