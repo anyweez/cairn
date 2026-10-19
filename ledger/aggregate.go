@@ -62,9 +62,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Ki
 // Validate reports the first thing wrong with how the aggregate is set up: no
 // store, a kind that is empty or contains a slash, a Decider missing a
 // function, a codec missing from Codecs, or a view or entry view whose name is
-// empty or repeats another's. Every other method runs it first, so a mistake
-// is an error rather than a nil-pointer panic on the first message; call it
-// at startup to fail before then.
+// empty or repeats another's, or whose Write is nil. Every other method runs
+// it first, so a mistake is an error rather than a nil-pointer panic on the
+// first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
 	switch {
@@ -96,6 +96,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("view " + v.Name + " has no Write")
+		}
 	}
 	for _, v := range a.EntryViews {
 		if v.Name == "" {
@@ -105,6 +108,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("entry view " + v.Name + " has no Write")
+		}
 	}
 	return nil
 }
