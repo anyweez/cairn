@@ -28,12 +28,15 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// compares only the fields the upcast stored result carries (see Verify).
 	Codecs *codec.Set[M, R, Ev, Ef]
 
-	// StateVersion names the shape of S as stored in snapshots. Change it
-	// whenever S changes shape; snapshots of any other version are ignored and
-	// state is rebuilt from events. Each version keeps its own snapshot, so
-	// processes running different versions side by side don't evict each
-	// other's; those of retired versions can be deleted. Empty disables
-	// snapshots.
+	// StateVersion names the fold a snapshot caches. Change it whenever S
+	// changes shape, and whenever Evolve changes how it computes state from
+	// events, even if S is unchanged: a snapshot is the state an earlier
+	// Evolve produced at a seq, and a different fold that reuses it leaves
+	// that stream on the old state while a stream rebuilt from events gets the
+	// new one. Snapshots of any other version are ignored and state is rebuilt
+	// from events. Each version keeps its own snapshot, so processes running
+	// different versions side by side don't evict each other's; those of
+	// retired versions can be deleted. Empty disables snapshots.
 	StateVersion string
 	// SnapshotEvery is how many entries may accumulate past the last snapshot
 	// before another is taken. Defaults to 100.

@@ -249,6 +249,12 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   snapshot and its views commit together, or none of them do. Messages that
   arrive together for one stream may share a transaction; each caller returns
   once its own message has committed.
+- **Snapshots are a fold, and the version names it.** A snapshot holds the
+  state `Evolve` produced at a seq, and it is reused only under the
+  `StateVersion` that took it. That version must change when `Evolve` changes
+  how it folds events, not only when the state type changes: otherwise a
+  stream that has a snapshot keeps the old fold, while a stream rebuilt from
+  the same events gets the new one.
 - **Read your own writes.** An aggregate's `Views` are written from the
   stream's new state inside that transaction, so a caller that writes and then
   reads a view table sees its write. A view replaces a stream's rows from its
