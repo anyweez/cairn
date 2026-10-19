@@ -212,7 +212,9 @@ type Effect interface{ isEffect() }
 
 // IndexReferences asks the reference index to re-read the decision's text.
 // It is an effect rather than a write in the transaction because the index is
-// another service; the outbox delivers it at least once.
+// another service; the outbox delivers it at least once and not in order, so a
+// consumer must ignore a delivery older than the text it holds. The delivery
+// carries the producing entry's seq for that; see ReferenceIndex.
 type IndexReferences struct {
 	Decision string `json:"decision"`
 	Text     string `json:"text"`
@@ -271,8 +273,10 @@ func accept(s State, events ...Event) decision {
 
 // indexText is the text the reference index holds for a decision: its title,
 // and its rationale once an outcome is recorded. Every message that changes
-// that text derives the effect's Text from the state it produces, so the index
-// and the decision cannot drift apart.
+// that text derives the effect's Text from the state it produces, so the text
+// the index is told is the decision's current text. Delivery order is not the
+// decider's to give: a retried effect can arrive after a newer one, so the
+// consumer drops a delivery older than the text it holds (ReferenceIndex).
 func indexText(s State) string {
 	if s.Outcome == nil {
 		return s.Title
