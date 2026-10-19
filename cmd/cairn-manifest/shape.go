@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"go/types"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -19,20 +21,9 @@ import (
 // addressable, so a marshaler with a pointer receiver on that type is not
 // used and its fields are what is stored.
 func fields(t types.Type) []string {
-	s := &shaper{
-		active:    map[types.Type]bool{},
-		embedding: map[*types.Named]bool{},
-	}
-	if st, ok := t.Underlying().(*types.Struct); ok && !s.opaque(t, false) {
-		// Seed the type itself as being flattened, so an untagged embedded
-		// pointer back to it is visited once and skipped the way
-		// encoding/json treats a recursive type. This is embedding, not
-		// active: active ends a named field at its name, embedding flattens.
-		if named, ok := t.(*types.Named); ok {
-			s.embedding[named] = true
-			defer delete(s.embedding, named)
-		}
-		return s.structFields(st, false)
+	s := &shaper{active: map[types.Type]bool{}}
+	if _, ok := t.Underlying().(*types.Struct); ok && !s.opaque(t, false) {
+		return s.structFields(t, false)
 	}
 	return []string{"=: " + s.shape(t, false)}
 }
@@ -41,12 +32,6 @@ type shaper struct {
 	// active holds the named types being rendered, so a recursive type ends
 	// at its name instead of looping.
 	active map[types.Type]bool
-	// embedding holds the named types currently being flattened through
-	// untagged embedded fields. A type that embeds a pointer to itself would
-	// otherwise flatten forever; encoding/json visits it once and skips it.
-	// It is separate from active because an embedded field is flattened
-	// rather than named, so the active guard does not apply.
-	embedding map[*types.Named]bool
 }
 
 // shape renders a type as JSON sees it: a named string type is a string, a
@@ -104,16 +89,11 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 		}
 		return "map[" + key + "]" + s.shape(u.Elem(), false)
 	case *types.Struct:
-		// A named struct rendered here is flattened into an object, exactly
-		// as fields() flattens the top-level type. Mark it for the duration so
-		// an embedded pointer back to it is visited once and skipped, as
-		// encoding/json does; otherwise the outer struct's own fields are
-		// emitted again after the embedded recursion returns.
-		if named, ok := t.(*types.Named); ok && !s.embedding[named] {
-			s.embedding[named] = true
-			defer delete(s.embedding, named)
-		}
-		return "{" + strings.Join(s.structFields(u, addr), ", ") + "}"
+		// The walk below keys its visited set on the named type, so pass t
+		// rather than the bare struct: a recursive embedded pointer back to
+		// this type must be recognised as one type and skipped, the way
+		// encoding/json visits it once.
+		return "{" + strings.Join(s.structFields(t, addr), ", ") + "}"
 	case *types.Interface:
 		return "any"
 	}
@@ -163,76 +143,182 @@ func isMarshalerSignature(sig *types.Signature) bool {
 	return types.Identical(sig.Results().At(1).Type(), types.Universe.Lookup("error").Type())
 }
 
+// jsonField is one field encoding/json may write, before name dominance
+// removes the shadowed ones.
+type jsonField struct {
+	name   string // the JSON key
+	index  []int  // path from the root struct: its depth and output order
+	tagged bool   // the JSON tag named it, which breaks a depth tie
+	entry  string // "name: shape", with "?" after an omitempty name
+}
+
 // structFields follows encoding/json: exported fields only, renamed or
-// skipped by their json tag, with untagged embedded structs flattened.
-func (s *shaper) structFields(st *types.Struct, addr bool) []string {
-	var out []string
-	for i := range st.NumFields() {
-		f := st.Field(i)
-		name, opts, tagged := strings.Cut(reflect.StructTag(st.Tag(i)).Get("json"), ",")
-		if name == "-" && !tagged {
+// skipped by their json tag, with untagged embedded structs flattened. A JSON
+// name reachable through more than one field is resolved as encoding/json
+// resolves it: the shallowest field wins, a tagged field beats an untagged one
+// at the same depth, and a remaining tie drops the name. It is a breadth-first
+// walk so each field's depth is known, mirroring encoding/json's typeFields.
+//
+// The visited set is what ends the walk on a type that embeds a pointer to
+// itself: encoding/json visits such a type once and skips the embedded field on
+// every later visit, and keying the set on the resolved type does the same.
+func (s *shaper) structFields(t types.Type, addr bool) []string {
+	type queued struct {
+		typ   types.Type // a struct reachable by embedding
+		index []int      // path from the root struct
+		addr  bool       // whether encoding/json reaches its fields addressably
+	}
+
+	current := []queued{}
+	// The root of the walk carries the caller's addressability, so a direct
+	// field of an addressable struct is shaped as encoding/json reaches it.
+	next := []queued{{typ: t, addr: addr}}
+	// count is how many times a type was queued at the current depth. A type
+	// reachable twice contributes its fields twice, which is what makes
+	// encoding/json drop an ambiguous name rather than pick one.
+	var count, nextCount map[types.Type]int
+	visited := map[types.Type]bool{}
+	var cands []jsonField
+
+	for len(next) > 0 {
+		current, next = next, current[:0]
+		count, nextCount = nextCount, map[types.Type]int{}
+		for _, q := range current {
+			if visited[q.typ] {
+				continue
+			}
+			visited[q.typ] = true
+			st, ok := q.typ.Underlying().(*types.Struct)
+			if !ok {
+				continue
+			}
+			for i := range st.NumFields() {
+				f := st.Field(i)
+				name, opts, hasOpts := strings.Cut(reflect.StructTag(st.Tag(i)).Get("json"), ",")
+				if name == "-" && !hasOpts {
+					continue
+				}
+				// encoding/json discards a tag name outside the tag alphabet and
+				// silently falls back to the Go field name. Mirror that here, so
+				// the manifest records the key encoding/json actually writes.
+				if !isValidTag(name) {
+					name = ""
+				}
+				tagged := name != ""
+
+				index := make([]int, len(q.index)+1)
+				copy(index, q.index)
+				index[len(q.index)] = i
+
+				// Resolve an alias to its target before the flattening guard
+				// below looks for a struct, tests the opaque marshaler, or keys
+				// the walk by type: `type A = T` embeds T's fields, and an alias
+				// and its target must be one type or a recursive alias expands
+				// forever as two.
+				typ, inner := types.Unalias(f.Type()), q.addr
+				if ptr, ok := typ.(*types.Pointer); ok {
+					typ, inner = types.Unalias(ptr.Elem()), true
+				}
+				if f.Embedded() && name == "" {
+					if _, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
+						nextCount[typ]++
+						if nextCount[typ] == 1 {
+							next = append(next, queued{typ: typ, index: index, addr: inner})
+						}
+						continue
+					}
+				}
+				if !f.Exported() {
+					// encoding/json ignores unexported fields, but keeps an
+					// anonymous field whose type is a struct; such a field
+					// reaches here only when its tag names it (an untagged
+					// embedded struct was flattened above), and encoding/json
+					// marshals it as a named object.
+					innerType := f.Type()
+					if ptr, ok := innerType.(*types.Pointer); ok {
+						innerType = ptr.Elem()
+					}
+					if _, ok := innerType.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
+						continue
+					}
+				}
+				display := name
+				if display == "" {
+					display = f.Name()
+				}
+				// "?" after the name marks omitempty/omitzero, but "?" is also
+				// a legal JSON key character, so a field tagged `json:"a?"`
+				// would render exactly like `json:"a,omitempty"`: different
+				// wire formats, one manifest entry. Double a literal "?" in
+				// the rendered entry so the marker is the only single "?"; the
+				// dominance key stays the raw JSON name encoding/json compares.
+				entry := strings.ReplaceAll(display, "?", "??")
+				if hasOption(opts, "omitempty") || hasOption(opts, "omitzero") {
+					entry += "?"
+				}
+				shape := s.shape(f.Type(), q.addr)
+				if hasOption(opts, "string") && quotable(f.Type()) {
+					shape = "string(" + shape + ")" // written inside a JSON string
+				}
+				c := jsonField{name: display, index: index, tagged: tagged, entry: entry + ": " + shape}
+				cands = append(cands, c)
+				if count[q.typ] > 1 {
+					// The name is reachable twice at this depth, so give the
+					// dominance pass two entries and let it drop the tie.
+					cands = append(cands, c)
+				}
+			}
+		}
+	}
+
+	slices.SortFunc(cands, func(a, b jsonField) int {
+		if c := strings.Compare(a.name, b.name); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(len(a.index), len(b.index)); c != 0 {
+			return c
+		}
+		if a.tagged != b.tagged {
+			if a.tagged {
+				return -1
+			}
+			return 1
+		}
+		return slices.Compare(a.index, b.index)
+	})
+
+	out := cands[:0]
+	for advance, i := 0, 0; i < len(cands); i += advance {
+		name := cands[i].name
+		for advance = 1; i+advance < len(cands) && cands[i+advance].name == name; advance++ {
+		}
+		if advance == 1 {
+			out = append(out, cands[i])
 			continue
 		}
-		// encoding/json discards a tag name outside the tag alphabet and
-		// silently falls back to the Go field name. Mirror that here, so the
-		// manifest records the key encoding/json actually writes.
-		if !isValidTag(name) {
-			name = ""
+		if dominant, ok := dominantField(cands[i : i+advance]); ok {
+			out = append(out, dominant)
 		}
-		if f.Embedded() && name == "" {
-			// Resolve an alias to its target before the flattening guard
-			// below looks for a *types.Named; `type A = T` embeds T's fields.
-			typ, inner := types.Unalias(f.Type()), addr
-			if ptr, ok := typ.(*types.Pointer); ok {
-				typ, inner = types.Unalias(ptr.Elem()), true
-			}
-			if emb, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
-				named, _ := typ.(*types.Named)
-				if named != nil {
-					if s.embedding[named] {
-						continue // an embedded type already being flattened: json skips it
-					}
-					s.embedding[named] = true
-				}
-				out = append(out, s.structFields(emb, inner)...)
-				if named != nil {
-					delete(s.embedding, named)
-				}
-				continue
-			}
-		}
-		if !f.Exported() {
-			// encoding/json ignores unexported fields, but keeps an anonymous
-			// field whose type is a struct; such a field reaches here only when
-			// its tag names it (an untagged embedded struct was flattened
-			// above), and encoding/json marshals it as a named object.
-			typ := f.Type()
-			if ptr, ok := typ.(*types.Pointer); ok {
-				typ = ptr.Elem()
-			}
-			if _, ok := typ.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
-				continue
-			}
-		}
-		if name == "" {
-			name = f.Name()
-		}
-		// "?" after the name marks omitempty/omitzero, but "?" is also a legal
-		// JSON key character, so a field tagged `json:"a?"` would render
-		// exactly like `json:"a,omitempty"`: different wire formats, one
-		// manifest entry. Double a literal "?" in the name so the marker is
-		// the only single "?" and the -base check can tell them apart.
-		name = strings.ReplaceAll(name, "?", "??")
-		if hasOption(opts, "omitempty") || hasOption(opts, "omitzero") {
-			name += "?"
-		}
-		shape := s.shape(f.Type(), addr)
-		if hasOption(opts, "string") && quotable(f.Type()) {
-			shape = "string(" + shape + ")" // the value is written inside a JSON string
-		}
-		out = append(out, name+": "+shape)
 	}
-	return out
+	cands = out
+
+	slices.SortFunc(cands, func(a, b jsonField) int { return slices.Compare(a.index, b.index) })
+	fields := make([]string, len(cands))
+	for i, c := range cands {
+		fields[i] = c.entry
+	}
+	return fields
+}
+
+// dominantField picks the one field of a name that survives Go's embedding
+// rules, modified by JSON tags. The candidates are sorted by depth and then by
+// tag presence, so the first is the shallowest. Two at the same depth, both
+// tagged or both untagged, are ambiguous and none survives.
+func dominantField(fields []jsonField) (jsonField, bool) {
+	if len(fields) > 1 && len(fields[0].index) == len(fields[1].index) && fields[0].tagged == fields[1].tagged {
+		return jsonField{}, false
+	}
+	return fields[0], true
 }
 
 // isValidTag reports whether s may name a JSON field. It mirrors
