@@ -7,6 +7,25 @@ import (
 	"github.com/anyweez/cairn/ledger"
 )
 
+func TestAProjectionWithoutANameIsRefused(t *testing.T) {
+	t.Parallel()
+	p := ledger.Projection{
+		Store: ledger.New(nil),
+		Apply: func(context.Context, *ledger.Batch, ledger.Entry) error { return nil },
+	}
+	if err := p.Validate(); err == nil {
+		t.Fatal("Validate accepted a projection with no Name")
+	}
+	if _, err := p.CatchUp(context.Background()); err == nil {
+		t.Fatal("CatchUp accepted a projection with no Name")
+	}
+	// The same projection validates once it has a checkpoint of its own.
+	p.Name = "read_models"
+	if err := p.Validate(); err != nil {
+		t.Fatalf("a named projection did not validate: %v", err)
+	}
+}
+
 // A Projection's Name keys its checkpoint in cairn.checkpoints. Two
 // projections built without a Name (the zero value) share the empty-string
 // checkpoint: the first applies the log and advances it, and the second then
