@@ -267,11 +267,36 @@ func TestWinnerMayStillAnswerTheOutcome(t *testing.T) {
 	}
 }
 
+// aimed draws messages that reach the transition a mutant needs and then keeps
+// offering the trigger in that state. Reaching the state by chance is what
+// made the mutant test depend on rapid's check budget: -short divides it by
+// five, and the generator could miss the path in the runs it had, so the
+// mutant survived without a defect in the code under test. The aimed
+// generator follows the lifecycle directly, so the mutation is reached on the
+// first run whatever budget it is given.
+func aimed(target Status, trigger Msg) func(*rapid.T, State) Msg {
+	at := time.Unix(1_700_000_000, 0).UTC()
+	return func(t *rapid.T, s State) Msg {
+		switch {
+		case s.Status == Uncreated:
+			return Create{ID: "d-1", By: "ana", At: at, Title: "probe",
+				Options: []Option{{ID: "o1", Title: "yes"}, {ID: "o2", Title: "no"}}}
+		case s.Status == Open && target != Open:
+			return RecordOutcome{By: "ben", At: at, Chosen: "o1", Rationale: "done"}
+		case s.Status == target:
+			return trigger
+		}
+		return messages(t, s)
+	}
+}
+
 // A mutant decider must fail the spec: this is how the rules prove they have teeth.
 func TestRegisterSpecCatchesMutants(t *testing.T) {
 	type mutant struct {
-		rule   string // the rule that must catch it
-		decide func(State, Msg) decision
+		rule    string // the rule that must catch it
+		decide  func(State, Msg) decision
+		target  Status // the status trigger must be drawn in
+		trigger Msg    // the message that reaches the mutation
 	}
 	mutants := map[string]mutant{
 		// Positions keep changing after the outcome is recorded.
@@ -280,21 +305,21 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 				return accept(s, PositionSaved{Member: p.By, Option: p.Option, Body: p.Body})
 			}
 			return decide(s, m)
-		}},
+		}, Decided, SavePosition{By: "ana", Option: "o1", Body: "changed"}},
 		// Dropping a decided decision without reopening it.
 		"settled moves sideways": {"DR1", func(s State, m Msg) decision {
 			if st, ok := m.(SetStatus); ok && s.Status == Decided && st.To == Dropped {
 				return decision{Result: Result{Status: Dropped}, Events: []Event{StatusChanged{From: s.Status, To: Dropped}}}
 			}
 			return decide(s, m)
-		}},
+		}, Decided, SetStatus{By: "ana", To: Dropped}},
 		// Recording again overwrites the outcome in place.
 		"outcome rewritten": {"DR6", func(s State, m Msg) decision {
 			if r, ok := m.(RecordOutcome); ok && s.Status == Decided && s.option(r.Chosen) && r.Rationale != "" {
 				return accept(s, DecisionRecorded{Outcome: Outcome{Chosen: r.Chosen, Rationale: r.Rationale, DecidedBy: r.By, DecidedAt: r.At}})
 			}
 			return decide(s, m)
-		}},
+		}, Decided, RecordOutcome{By: "ben", At: time.Unix(1_700_000_000, 0).UTC(), Chosen: "o2", Rationale: "revised"}},
 		// An outcome is recorded with no actor or no time. The message is
 		// otherwise well formed, so only DR2 can catch it.
 		"incomplete outcome": {"DR2", func(s State, m Msg) decision {
@@ -306,12 +331,13 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 					Effects: []Effect{IndexReferences{Decision: s.ID, Text: s.Title + "\n" + rationale}}}
 			}
 			return decide(s, m)
-		}},
+		}, Open, RecordOutcome{By: "ben", At: time.Time{}, Chosen: "o1", Rationale: "done"}},
 	}
 	for name, mut := range mutants {
 		t.Run(name, func(t *testing.T) {
 			m := machine()
 			m.Decider.Decide = mut.decide
+			m.Messages = aimed(mut.target, mut.trigger)
 			msg, failed := spectest.Fails(t, m.Check)
 			if !strings.Contains(msg, mut.rule+" violated") {
 				t.Fatalf("the %q mutant must be caught by %s; failed %v: %s", name, mut.rule, failed, firstLine(msg))
