@@ -14,14 +14,16 @@ import (
 type Meta struct {
 	// Actor is an opaque ID for who sent the message. Never a name or an
 	// email: entries are append-only, so they must not hold personal data.
+	// It is indexed, so it may be at most 1024 bytes.
 	Actor string
 	// Via is the channel the message came through: "ui", "api", "mcp", an
-	// agent's name. The Dispatcher sets "outbox".
+	// agent's name. The Dispatcher sets "outbox". It may be at most 1024 bytes.
 	Via string
-	// CorrelationID ties together every message in one request or flow.
+	// CorrelationID ties together every message in one request or flow. It is
+	// indexed, so it may be at most 1024 bytes.
 	CorrelationID string
 	// CausationID names what directly caused this message: an entry, or an
-	// effect delivery's Key.
+	// effect delivery's Key. It may be at most 1024 bytes.
 	CausationID string
 	// OccurredAt is when the producer says this happened, which can be well
 	// before it was recorded. Zero when unknown.
