@@ -2,6 +2,7 @@ package ledger_test
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,11 +22,13 @@ func TestQARebuildFillsAViewForAStreamWrittenDuringIt(t *testing.T) {
 	}
 
 	// The rebuild has listed the streams (just "a") and paused inside its
-	// write, before it has committed.
+	// write, before it has committed. Only the first write pauses, or a stream
+	// it lists later would pause too and never be reached.
 	inWrite := make(chan struct{})
+	var once sync.Once
 	slow := view
 	slow.Write = func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
-		close(inWrite)
+		once.Do(func() { close(inWrite) })
 		time.Sleep(200 * time.Millisecond)
 		return view.Write(b, at, cause)
 	}
@@ -71,9 +74,10 @@ func TestQARebuildEntriesFillsAnEntryViewForAStreamWrittenDuringIt(t *testing.T)
 	}
 
 	inWrite := make(chan struct{})
+	var once sync.Once
 	slow := history
 	slow.Write = func(b *ledger.Batch, before, after ledger.Loaded[counter], e ledger.Entry, events []event) error {
-		close(inWrite)
+		once.Do(func() { close(inWrite) })
 		time.Sleep(200 * time.Millisecond)
 		return history.Write(b, before, after, e, events)
 	}
