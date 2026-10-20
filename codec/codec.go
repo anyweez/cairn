@@ -739,6 +739,16 @@ func sortRegistrations(rs []Registration) {
 // goTypeString renders a runtime type as go/types does for the manifest: a
 // named type with its full import path, a basic type by name.
 func goTypeString(t reflect.Type) string {
+	// A defined type is named however its kind looks: `type Listing []string`
+	// is example.com/x.Listing to go/types, not []string. Ask for the name
+	// before expanding a composite, or the runtime half of the manifest
+	// cross-check names a different type than the static half.
+	if t.Name() != "" {
+		if t.PkgPath() == "" {
+			return t.Name()
+		}
+		return t.PkgPath() + "." + t.Name()
+	}
 	switch t.Kind() {
 	case reflect.Pointer:
 		return "*" + goTypeString(t.Elem())
@@ -749,13 +759,7 @@ func goTypeString(t reflect.Type) string {
 	case reflect.Map:
 		return "map[" + goTypeString(t.Key()) + "]" + goTypeString(t.Elem())
 	}
-	if t.Name() == "" {
-		return t.String()
-	}
-	if t.PkgPath() == "" {
-		return t.Name()
-	}
-	return t.PkgPath() + "." + t.Name()
+	return t.String()
 }
 
 // Registrations returns the registrations of all four codecs, sorted.

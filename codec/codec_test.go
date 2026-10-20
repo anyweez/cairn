@@ -169,3 +169,49 @@ func TestCheckRegistrations(t *testing.T) {
 		})
 	}
 }
+
+// A defined type is named by go/types even when its underlying kind is a
+// composite: `type Listing []string` is example.com/x.Listing, not []string.
+// A registration rendered by reflect as the underlying type would name a
+// different sum than the manifest and fail the cross-check twice for one
+// correct codec.
+type namedListing []string
+type namedLookup map[string]int
+type namedPair [2]string
+type namedCount *int
+type namedList[T any] []T
+
+func sumNameOf[T any](t *testing.T) string {
+	t.Helper()
+	c := codec.New[T]()
+	codec.Register[T](c, "test.value", 1)
+	rs := c.Registrations()
+	if len(rs) != 1 {
+		t.Fatalf("got %d registrations, want 1", len(rs))
+	}
+	return rs[0].Sum
+}
+
+func TestRegistrationsNameADefinedCompositeAsGoTypesDoes(t *testing.T) {
+	const pkg = "github.com/anyweez/cairn/codec_test"
+	for _, tc := range []struct {
+		name string
+		sum  func(*testing.T) string
+		want string
+	}{
+		{"a defined slice", sumNameOf[namedListing], pkg + ".namedListing"},
+		{"a defined map", sumNameOf[namedLookup], pkg + ".namedLookup"},
+		{"a defined array", sumNameOf[namedPair], pkg + ".namedPair"},
+		{"a defined pointer", sumNameOf[namedCount], pkg + ".namedCount"},
+		{"a defined generic slice", sumNameOf[namedList[string]], pkg + ".namedList[string]"},
+		{"an unnamed slice", sumNameOf[[]string], "[]string"},
+		{"a pointer to a defined slice", sumNameOf[*namedListing], "*" + pkg + ".namedListing"},
+		{"a slice of defined slices", sumNameOf[[]namedListing], "[]" + pkg + ".namedListing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.sum(t); got != tc.want {
+				t.Errorf("sum: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
