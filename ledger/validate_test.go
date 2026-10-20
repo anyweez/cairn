@@ -47,6 +47,26 @@ func TestValidateNamesTheFirstMistake(t *testing.T) {
 	}
 }
 
+// A Kind reaches a text parameter on the paths that filter by Kind alone
+// (Rebuild, RebuildEntries, Streams, ReadAll), so one Postgres cannot store is
+// a setup mistake Validate reports, not a raw SQLSTATE from the driver.
+func TestValidateRefusesAnUnstorableKind(t *testing.T) {
+	t.Parallel()
+	for name, kind := range map[string]string{
+		"NUL":          "counter\x00x",
+		"invalid utf8": "counter\xffx",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			agg := counterOn(ledger.New(nil))
+			agg.Kind = kind
+			if err := agg.Validate(); err == nil || !strings.Contains(err.Error(), "Kind must be valid UTF-8") {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
 // Every method validates first, so a mistake is an error, not a panic.
 func TestMethodsValidateBeforeTouchingTheDatabase(t *testing.T) {
 	t.Parallel()

@@ -22,7 +22,10 @@ import (
 // idempotent.
 type Projection struct {
 	Store *Store
-	Name  string
+	// Name keys the projection's checkpoint, so it is required: a projection
+	// with no Name would share the empty checkpoint with every other unnamed
+	// projection, and only the first to run would apply anything.
+	Name string
 	// Kinds limits the projection to these stream kinds. Empty means all.
 	Kinds []string
 	Apply func(ctx context.Context, b *Batch, e Entry) error
@@ -33,8 +36,28 @@ type Projection struct {
 	OnError func(error)
 }
 
+// Validate reports the first thing wrong with how the projection is set up: no
+// store, no Name, or no Apply function. The name keys its checkpoint, so an
+// unnamed projection has no place of its own in the log. CatchUp runs it
+// first, so call it at startup to fail before Run would.
+func (p *Projection) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: projection %q: %s", p.Name, what) }
+	switch {
+	case p.Store == nil:
+		return fail("Store is nil")
+	case p.Name == "":
+		return fail("Name must be non-empty; it keys the checkpoint, and unnamed projections would share one")
+	case p.Apply == nil:
+		return fail("Apply is nil")
+	}
+	return nil
+}
+
 // CatchUp applies every entry visible now, returning how many it applied.
 func (p *Projection) CatchUp(ctx context.Context) (int, error) {
+	if err := p.Validate(); err != nil {
+		return 0, err
+	}
 	batch := p.BatchSize
 	if batch <= 0 {
 		batch = 100
@@ -107,8 +130,12 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 		if err != nil {
 			return total, err
 		}
-		if n == 0 {
-			return total, nil
+		// A short batch means there are no more entries visible as of the read
+		// that produced it. Return without reading again: the next call picks up
+		// anything that commits meanwhile, and the terminating transaction would
+		// otherwise cost four round trips on its own.
+		if n < batch {
+			return total + n, nil
 		}
 		total += n
 	}
@@ -119,6 +146,9 @@ var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runn
 // Run catches the projection up every interval until ctx is done. An error
 // ends it unless OnError is set.
 func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
 	return poll(ctx, interval, p.OnError, func(ctx context.Context) (bool, error) {
 		// CatchUp applies everything visible, so there is nothing to repeat.
 		_, err := p.CatchUp(ctx)

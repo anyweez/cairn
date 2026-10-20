@@ -60,11 +60,11 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Kind: a.Kind, ID: id} }
 
 // Validate reports the first thing wrong with how the aggregate is set up: no
-// store, a kind that is empty or contains a slash, a Decider missing a
-// function, a codec missing from Codecs, or a view or entry view whose name is
-// empty or repeats another's, or whose Write is nil. Every other method runs
-// it first, so a mistake is an error rather than a nil-pointer panic on the
-// first message; call it at startup to fail before then.
+// store, a kind that is empty, contains a slash or cannot be stored, a Decider
+// missing a function, a codec missing from Codecs, or a view or entry view
+// whose name is empty or repeats another's, or whose Write is nil. Every other
+// method runs it first, so a mistake is an error rather than a nil-pointer
+// panic on the first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
 	switch {
@@ -72,6 +72,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		return fail("Store is nil")
 	case a.Kind == "" || strings.Contains(a.Kind, "/"):
 		return fail("Kind must be non-empty and contain no slash")
+	case !cairn.StorableText(a.Kind):
+		// Rebuild, RebuildEntries, Streams and ReadAll pass the Kind to a text
+		// parameter without building a stream name, so an unstorable one would
+		// otherwise reach the driver and come back as a raw SQLSTATE.
+		return fail("Kind must be valid UTF-8 and contain no NUL")
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
