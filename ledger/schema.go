@@ -258,12 +258,29 @@ func (s *Store) migrate(ctx context.Context, migs []migration, ttl time.Duration
 	// can renew a lease while its only connection is busy migrating. The
 	// hijacked connection is closed rather than released at the end, and the
 	// pool opens a replacement when it next needs one.
-	if stat := s.pool.Stat(); stat.AcquiredConns() >= stat.MaxConns() {
+	//
+	// Stat is only a hint: another caller can take the last connection between
+	// the check and the acquire below, so that acquire is bounded as well and
+	// a timeout takes this same route rather than waiting on the caller's
+	// context while holding a lease nothing renews.
+	hijacked := false
+	hijack := func() {
+		if hijacked {
+			return
+		}
+		hijacked = true
 		raw := pooled.Hijack()
 		conn = raw
 		releaseConn = func() { _ = raw.Close(context.WithoutCancel(ctx)) }
 	}
-	renewOn, err := s.pool.Acquire(ctx)
+	if stat := s.pool.Stat(); stat.AcquiredConns() >= stat.MaxConns() {
+		hijack()
+	}
+	renewOn, err := acquireRenewalConn(ctx, s.pool, ttl)
+	if errors.Is(err, context.DeadlineExceeded) {
+		hijack()
+		renewOn, err = acquireRenewalConn(ctx, s.pool, ttl)
+	}
 	if err != nil {
 		// The lease is ours but nothing can renew it, so give it back rather
 		// than leave every later caller waiting out the TTL.
@@ -271,21 +288,20 @@ func (s *Store) migrate(ctx context.Context, migs []migration, ttl time.Duration
 		releaseConn()
 		return fmt.Errorf("cairn: acquiring a connection to renew the migration lease: %w", err)
 	}
-	releaseRenewal := renewOn.Release
 	// A migration can outlast its lease, so renew it while it runs: a lease
 	// that expires under a live holder lets a second caller take it and rerun
 	// the same statements alongside. The heartbeat cancels migrateCtx when it
 	// can no longer renew, so the migration's next statement fails.
 	migrateCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	heartbeat := startMigrationHeartbeat(migrateCtx, renewOn, holder, ttl, cancel)
+	heartbeat := startMigrationHeartbeat(migrateCtx, s.pool, renewOn, holder, ttl, cancel)
 	err = applyMigrations(migrateCtx, conn, holder, migs)
 	// Stop the heartbeat before releasing the lease, so no beat renews a row
-	// this caller is about to delete and a lost lease is reported.
+	// this caller is about to delete and a lost lease is reported. The
+	// heartbeat owns its connection and releases it as it stops.
 	if heartbeatErr := heartbeat.stop(); heartbeatErr != nil {
 		err = heartbeatErr
 	}
-	releaseRenewal()
 	s.deleteMigrationLease(ctx, conn, holder)
 	releaseConn()
 	return err
@@ -446,11 +462,32 @@ func newMigrationHolder() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// migrationHeartbeatAcquireTimeout is how long migrate waits for the
+// heartbeat's connection, and how long the heartbeat waits for a replacement,
+// before deciding the pool has none to give right now. It is shorter than the
+// beat interval (a third of the TTL), so a pool with no connection to spare
+// delays a renewal rather than stalling the loop that makes them.
+func migrationHeartbeatAcquireTimeout(ttl time.Duration) time.Duration {
+	timeout := ttl / 6
+	if timeout > 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	return timeout
+}
+
+// acquireRenewalConn takes a connection to renew the lease on, giving up after
+// migrationHeartbeatAcquireTimeout.
+func acquireRenewalConn(ctx context.Context, pool *pgxpool.Pool, ttl time.Duration) (*pgxpool.Conn, error) {
+	acqCtx, cancel := context.WithTimeout(ctx, migrationHeartbeatAcquireTimeout(ttl))
+	defer cancel()
+	return pool.Acquire(acqCtx)
+}
+
 // migrationHeartbeat renews the migration lease while its holder migrates.
-// Each beat is one autocommitted statement on a connection reserved for the
-// heartbeat as soon as the lease is taken, so it stays visible through a
+// Each beat is one autocommitted statement on a connection the heartbeat owns
+// for as long as it can use it, so a beat stays visible through a
 // transaction-mode pooler and no statement the migration runs can starve a
-// renewal. The connection is held for the whole migration: acquiring one
+// renewal. A connection is held for the whole migration: acquiring one
 // during it could wait on the migration's own statement.
 //
 // A beat that updates no row means the lease is no longer this caller's,
@@ -466,10 +503,23 @@ type migrationHeartbeat struct {
 }
 
 // startMigrationHeartbeat starts the renewal loop for holder's lease on
-// renewOn, the connection reserved for it. cancel is called if the lease is
-// lost, so the migration the heartbeat guards stops before it can record
-// anything.
-func startMigrationHeartbeat(ctx context.Context, renewOn *pgxpool.Conn, holder string, ttl time.Duration, cancel context.CancelFunc) *migrationHeartbeat {
+// renewOn, the connection reserved for it, and takes ownership of that
+// connection: the loop releases whichever connection it holds when it exits,
+// so migrate never releases a handle the heartbeat has already replaced.
+//
+// A beat whose statement fails proves nothing about the lease, because the row
+// is untouched; only a beat that succeeds and updates no row means the lease
+// was lost. A failed beat can mean its connection died -- a network reset, a
+// pooler or server restart, or a beat interrupted mid-statement -- so the
+// heartbeat gives that connection up and renews on a replacement from pool.
+// Keeping it would fail every later beat on the same dead handle and let the
+// lease expire under a live holder, the failure this heartbeat exists to
+// prevent. The replacement is taken with a bound shorter than the beat
+// interval, so a busy pool skips a beat rather than stalling the loop, and the
+// next beat tries again while the lease is still live. cancel is called if the
+// lease is lost, so the migration the heartbeat guards stops before it can
+// record anything.
+func startMigrationHeartbeat(ctx context.Context, pool *pgxpool.Pool, renewOn *pgxpool.Conn, holder string, ttl time.Duration, cancel context.CancelFunc) *migrationHeartbeat {
 	// The heartbeat's own context is separate from the migration's, so stop
 	// can unblock a beat that is waiting on the database; losing the lease
 	// cancels the migration through cancel instead.
@@ -477,6 +527,12 @@ func startMigrationHeartbeat(ctx context.Context, renewOn *pgxpool.Conn, holder 
 	h := &migrationHeartbeat{stopCh: make(chan struct{}), doneCh: make(chan struct{}), cancel: hbCancel}
 	go func() {
 		defer close(h.doneCh)
+		conn := renewOn
+		defer func() {
+			if conn != nil {
+				conn.Release()
+			}
+		}()
 		// Renew well inside the TTL, so one missed beat does not let the lease
 		// expire before the next.
 		ticker := time.NewTicker(ttl / 3)
@@ -488,14 +544,28 @@ func startMigrationHeartbeat(ctx context.Context, renewOn *pgxpool.Conn, holder 
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				tag, err := renewOn.Exec(hbCtx, `
+				if conn == nil {
+					// The last beat's connection is gone: take a replacement, and
+					// give up this beat rather than the loop if the pool cannot
+					// supply one in time.
+					replacement, err := acquireRenewalConn(hbCtx, pool, ttl)
+					if err != nil {
+						continue
+					}
+					conn = replacement
+				}
+				tag, err := conn.Exec(hbCtx, `
 UPDATE cairn.migration_lock
 SET expires_at = now() + make_interval(secs => $2)
 WHERE id = 1 AND holder = $1`, holder, ttl.Seconds())
 				if err != nil {
-					// A transient failure leaves the row alone; the next beat
-					// retries. Only a beat that succeeds and updates no row
-					// proves the lease is not ours.
+					// The row is untouched, so the beat proves nothing about the
+					// lease; only a beat that succeeds and updates no row does.
+					// The connection may be dead, so give it up and renew on a
+					// replacement next beat rather than fail every later beat on
+					// the same handle.
+					conn.Release()
+					conn = nil
 					continue
 				}
 				if tag.RowsAffected() == 0 {
