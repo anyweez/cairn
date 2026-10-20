@@ -32,3 +32,28 @@ func TestABatchNamesTheViewWhoseStatementFailed(t *testing.T) {
 		t.Fatalf("the error must name the view whose statement failed, got %v", err)
 	}
 }
+
+// The same defect the other way round: the first of two views with the same
+// SQL has the argument that cannot be encoded. Naming the last statement with
+// that SQL would pass the test above and be no better.
+func TestABatchNamesTheFirstViewWhenItsStatementFailed(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	agg.Views = []ledger.View[counter]{
+		{Name: "first", Write: func(b *ledger.Batch, _ ledger.Loaded[counter], _ ledger.Entry) error {
+			b.Queue(`SELECT $1::int`, make(chan int))
+			return nil
+		}},
+		{Name: "second", Write: func(b *ledger.Batch, _ ledger.Loaded[counter], _ ledger.Entry) error {
+			b.Queue(`SELECT $1::int`, 1)
+			return nil
+		}},
+	}
+	_, err := agg.Handle(ctx, "a", add{1, 10})
+	if err == nil {
+		t.Fatal("want an encoding error")
+	}
+	if !strings.Contains(err.Error(), "view first at counter/a#1") {
+		t.Fatalf("the error must name the view whose statement failed, got %v", err)
+	}
+}

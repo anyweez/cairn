@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Batch collects statements that callers hand to the ledger. The ledger sends
@@ -104,9 +105,9 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			// happen.
 			closeErr := results.Close()
 			if b.commits && b.hasCommit && committed(s, err, closeErr) {
-				return &recordedError{err: b.failed(i, err)}
+				return &recordedError{err: b.failed(s, i, err)}
 			}
-			return b.failed(i, err)
+			return b.failed(s, i, err)
 		}
 	}
 	return results.Close()
@@ -174,15 +175,15 @@ func (b *Batch) end() {
 
 // failed blames the statement at i for err, unless err comes from preparing
 // the batch: pgx prepares every statement before running any, and reports a
-// failure there against the first, naming the SQL that actually failed.
-func (b *Batch) failed(i int, err error) error {
+// failure there against the first result rather than the statement at fault,
+// naming only the SQL that failed. Several statements can queue the same SQL —
+// two views sharing a helper, a projection applying one upsert to every entry
+// — so the first of them is not necessarily the one that failed.
+func (b *Batch) failed(s batchSender, i int, err error) error {
 	var prep pgx.ErrPreprocessingBatch
 	if errors.As(err, &prep) {
-		for j, q := range b.queued.QueuedQueries {
-			if q.SQL == prep.SQL() {
-				i = j
-				break
-			}
+		if j, ok := b.blame(s, prep.SQL()); ok {
+			i = j
 		}
 	}
 	owner := b.items[i].owner
@@ -194,4 +195,73 @@ func (b *Batch) failed(i int, err error) error {
 		index++
 	}
 	return &batchError{owner: owner, index: index, err: err}
+}
+
+// blame returns the index of the queued statement with the given SQL that pgx
+// could not build, so that a build failure names the statement whose
+// arguments are bad rather than the first one that happens to share its SQL.
+// pgx prepares every statement before it builds any argument, so the
+// statements before the failing one — including any with the same SQL — built
+// fine, and it stops at the first whose arguments it cannot encode.
+//
+// The type map encodes each argument without knowing the types the statement
+// declared for its parameters, which pgx does not report with the error: it
+// infers a type from each value and accepts either format, as pgx does. A
+// value that encodes as its own type but not as the parameter's (a string
+// where the statement expects an integer) is therefore not recognised, and
+// neither is a failure of the SQL itself rather than of an argument, which
+// every statement with that SQL shares. Then the first match stands, as it did
+// before.
+func (b *Batch) blame(s batchSender, sql string) (int, bool) {
+	m := senderTypeMap(s)
+	if m == nil {
+		return 0, false
+	}
+	first := -1
+	for j, q := range b.queued.QueuedQueries {
+		if q.SQL != sql {
+			continue
+		}
+		if first < 0 {
+			first = j
+		}
+		if !encodable(m, q.Arguments) {
+			return j, true
+		}
+	}
+	return first, first >= 0
+}
+
+// encodable reports whether pgx could build every argument of a statement. A
+// leading QueryRewriter is not an argument — pgx applies it instead — and an
+// argument that either format encodes is one pgx would accept.
+func encodable(m *pgtype.Map, args []any) bool {
+	for len(args) > 0 {
+		if _, ok := args[0].(pgx.QueryRewriter); !ok {
+			break
+		}
+		args = args[1:]
+	}
+	for _, arg := range args {
+		if _, err := m.Encode(0, pgtype.BinaryFormatCode, arg, nil); err == nil {
+			continue
+		}
+		if _, err := m.Encode(0, pgtype.TextFormatCode, arg, nil); err == nil {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// senderTypeMap is the type map of the connection a batch was sent on, or nil
+// for a sender that doesn't name one.
+func senderTypeMap(s batchSender) *pgtype.Map {
+	switch s := s.(type) {
+	case *Tx:
+		return s.tx.Conn().TypeMap()
+	case interface{ Conn() *pgx.Conn }:
+		return s.Conn().TypeMap()
+	}
+	return nil
 }
