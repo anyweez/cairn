@@ -77,8 +77,6 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		// parameter without building a stream name, so an unstorable one would
 		// otherwise reach the driver and come back as a raw SQLSTATE.
 		return fail("Kind must be valid UTF-8 and contain no NUL")
-	case len(a.Kind) > maxIndexedTextBytes:
-		return fail(fmt.Sprintf("Kind is %d bytes, longer than the %d-byte limit", len(a.Kind), maxIndexedTextBytes))
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
@@ -160,16 +158,19 @@ type options struct {
 
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
-// returned. A key is stored in a btree index, so it must be text the ledger can
-// store — valid UTF-8, without a NUL — and at most 1024 bytes. Handle and Apply
-// refuse any other key before it reaches Postgres.
+// returned. A new key is stored in a btree index, so it must be text the ledger
+// can store — valid UTF-8, without a NUL — and at most 1024 bytes. Handle and
+// Apply refuse any other new key before it reaches Postgres. A key recorded
+// before that bound existed is still looked up and answered, so a retry
+// spanning its introduction gets its first answer.
 func IdempotencyKey(key string) Option { return func(o *options) { o.key = key } }
 
-// collect applies opts and refuses a key the ledger cannot store or index. A
-// key is passed to a text parameter both when it is looked up and when it is
-// written, so one with a NUL or invalid UTF-8 would otherwise come back from
-// the driver as a raw SQLSTATE, and one too long for the index that keys on it
-// as a raw SQLSTATE 54000.
+// collect applies opts and refuses a key the ledger cannot store. A key is
+// passed to a text parameter both when it is looked up and when it is written,
+// so one with a NUL or invalid UTF-8 would otherwise come back from the driver
+// as a raw SQLSTATE. Its length is checked only when a new entry writes it
+// (queueAppend): a key stored before that bound existed must still be found by
+// its retry.
 func collect(opts []Option) (options, error) {
 	var o options
 	for _, opt := range opts {
@@ -177,10 +178,6 @@ func collect(opts []Option) (options, error) {
 	}
 	if !cairn.StorableText(o.key) {
 		return o, fmt.Errorf("cairn: the idempotency key is not valid UTF-8 or contains a NUL")
-	}
-	if n := len(o.key); n > maxIndexedTextBytes {
-		return o, fmt.Errorf("cairn: the idempotency key %s is %d bytes, longer than the %d-byte limit",
-			quoteText(o.key), n, maxIndexedTextBytes)
 	}
 	return o, nil
 }

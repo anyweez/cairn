@@ -263,6 +263,10 @@ func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
 // composite index spends that budget on all of its columns, so a stream name
 // and an idempotency key are each bounded well below it. The limit is bytes,
 // not runes, because that is how Postgres measures UTF-8 text.
+//
+// It applies when a new index entry is written, not when a stored one is read:
+// a value written before the bound existed is already in the ledger, so reads
+// must accept whatever Postgres stored.
 const maxIndexedTextBytes = 1024
 
 // maxQuotedTextBytes bounds how much of a rejected value an error quotes. The
@@ -285,10 +289,13 @@ func quoteText(v string) string {
 }
 
 // validStream refuses a stream whose name could be another's (the name joins
-// kind and ID with a slash, so a kind may not contain one), that Postgres
-// cannot store, or whose name is too long for the btree indexes that key on
-// it. A NUL, invalid UTF-8 or an over-long name would otherwise reach the
-// driver as a text parameter and fail with a raw SQLSTATE.
+// kind and ID with a slash, so a kind may not contain one), or that Postgres
+// cannot store. A NUL or invalid UTF-8 would otherwise reach the driver as a
+// text parameter and fail with a raw SQLSTATE.
+//
+// It does not bound the name's length: a stream written before that bound
+// existed is already in the ledger and must stay readable. validNewStream
+// applies the bound when an append creates a stream.
 func validStream(st Stream) error {
 	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
 		return fmt.Errorf("cairn: invalid stream %q", st)
@@ -296,6 +303,14 @@ func validStream(st Stream) error {
 	if !cairn.StorableText(st.Kind) || !cairn.StorableText(st.ID) {
 		return fmt.Errorf("cairn: invalid stream %q: the name is not valid UTF-8 or contains a NUL", st)
 	}
+	return nil
+}
+
+// validNewStream refuses a stream name too long for the btree indexes that key
+// on it, when the append would create the stream. A name that already exists
+// is not bounded: Postgres stored it, so it fits, and its entries stay
+// recordable.
+func validNewStream(st Stream) error {
 	if n := len(st.String()); n > maxIndexedTextBytes {
 		return fmt.Errorf("cairn: invalid stream %s: the name is %d bytes, longer than the %d-byte limit",
 			quoteText(st.String()), n, maxIndexedTextBytes)
@@ -303,19 +318,15 @@ func validStream(st Stream) error {
 	return nil
 }
 
-// validKind refuses a kind that could be another's, that Postgres cannot
-// store, or that is too long for the btree indexes that key on it, for the
-// paths that filter by kind alone.
+// validKind refuses a kind that could be another's, or that Postgres cannot
+// store, for the paths that filter by kind alone. It does not bound the kind's
+// length: a stream written before that bound existed must stay listable.
 func validKind(kind string) error {
 	if kind == "" || strings.Contains(kind, "/") {
 		return fmt.Errorf("cairn: invalid stream kind %q", kind)
 	}
 	if !cairn.StorableText(kind) {
 		return fmt.Errorf("cairn: invalid stream kind %q: the name is not valid UTF-8 or contains a NUL", kind)
-	}
-	if n := len(kind); n > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: invalid stream kind %s: the kind is %d bytes, longer than the %d-byte limit",
-			quoteText(kind), n, maxIndexedTextBytes)
 	}
 	return nil
 }
@@ -364,6 +375,13 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if err != nil {
 		return err
 	}
+	if seq == 0 {
+		// The first entry creates the stream, so this is where its name must
+		// fit the indexes that will hold it.
+		if err := validNewStream(stream); err != nil {
+			return err
+		}
+	}
 	e.Stream, e.Seq, e.RecordedAt = stream, seq+1, at
 
 	message, err := json.Marshal(e.Message)
@@ -394,21 +412,30 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if e.IdempotencyKey != "" {
 		key = &e.IdempotencyKey
 	}
+	// A new key is written into a btree index, so its length is bounded here.
+	// The same check is not made when a key is looked up: a key stored before
+	// this bound existed must still answer its retry.
 	if n := len(e.IdempotencyKey); e.IdempotencyKey != "" && n > maxIndexedTextBytes {
 		return fmt.Errorf("cairn: the idempotency key %s for %s is %d bytes, longer than the %d-byte limit",
 			quoteText(e.IdempotencyKey), stream, n, maxIndexedTextBytes)
 	}
 	for _, text := range []struct {
-		name  string
-		value string
+		name    string
+		value   string
+		indexed bool
 	}{
-		{"actor", e.Meta.Actor},
-		{"via", e.Meta.Via},
-		{"correlation ID", e.Meta.CorrelationID},
-		{"causation ID", e.Meta.CausationID},
+		{"actor", e.Meta.Actor, true},
+		{"via", e.Meta.Via, false},
+		{"correlation ID", e.Meta.CorrelationID, true},
+		{"causation ID", e.Meta.CausationID, false},
 	} {
 		if !cairn.StorableText(text.value) {
 			return fmt.Errorf("cairn: metadata %s for %s is not valid UTF-8 or contains a NUL", text.name, stream)
+		}
+		// Via and causation ID are not indexed, so only the indexed fields have
+		// a btree entry whose size their length could exceed.
+		if !text.indexed {
+			continue
 		}
 		if n := len(text.value); n > maxIndexedTextBytes {
 			return fmt.Errorf("cairn: metadata %s %s for %s is %d bytes, longer than the %d-byte limit",

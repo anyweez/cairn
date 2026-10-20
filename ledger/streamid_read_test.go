@@ -9,14 +9,11 @@ import (
 	"github.com/anyweez/cairn/ledger"
 )
 
-// A stream ID or kind that Postgres cannot store is rejected cleanly on the
-// write paths (validStream, used by locking) and by Load. The read paths call
-// the same SQL with the same caller-supplied name but skip validStream, so the
-// caller gets a raw *pgconn.PgError instead of an error cairn produced. An
-// application cannot tell a malformed ID (its caller's fault, a 400) from an
-// infrastructure failure (a 500).
-//
-// Same root as t2555's stream-ID case, on the paths its fix did not reach.
+// A stream ID or kind that Postgres cannot store is rejected cleanly on both
+// the write paths and the read paths: every path validates the text before it
+// reaches the driver, so the caller gets an error cairn produced rather than a
+// raw *pgconn.PgError. An application otherwise cannot tell a malformed ID (its
+// caller's fault, a 400) from an infrastructure failure (a 500).
 func TestReadPathsRejectAStreamNamePostgresCannotStore(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)

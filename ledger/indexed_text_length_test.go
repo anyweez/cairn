@@ -17,8 +17,8 @@ import (
 // correlation ID are also text columns a btree index keys on, and an
 // incompressible value longer than the index can hold otherwise reaches
 // Postgres and comes back as a raw SQLSTATE 54000. Via and causation ID are
-// not indexed, but take the same bound so every piece of entry metadata has
-// one rule.
+// not indexed, so they have no index entry whose size their length could
+// exceed, and are not bounded.
 func TestMetadataTooLongForAnIndexIsRefusedCleanly(t *testing.T) {
 	t.Parallel()
 
@@ -31,8 +31,6 @@ func TestMetadataTooLongForAnIndexIsRefusedCleanly(t *testing.T) {
 	cases := map[string]ledger.Meta{
 		"actor":          {Actor: long},
 		"correlation ID": {CorrelationID: long},
-		"via":            {Via: long},
-		"causation ID":   {CausationID: long},
 	}
 	for name, meta := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -58,12 +56,39 @@ func TestMetadataTooLongForAnIndexIsRefusedCleanly(t *testing.T) {
 	}
 }
 
-func TestValidateRefusesAnOversizedKind(t *testing.T) {
+// A kind longer than the index bound is still valid to read: a stream written
+// before the bound existed may have one. The bound applies where a new stream
+// is created, which is the only place the name reaches an index.
+func TestAnOversizedKindIsRefusedWhenANewStreamIsCreated(t *testing.T) {
 	t.Parallel()
-	agg := counterOn(ledger.New(nil))
+	agg := newCounter(t)
 	agg.Kind = strings.Repeat("k", 1025)
-	if err := agg.Validate(); err == nil || !strings.Contains(err.Error(), "Kind is 1025 bytes, longer than the 1024-byte limit") {
-		t.Fatalf("Validate: %v", err)
+	if err := agg.Validate(); err != nil {
+		t.Fatalf("Validate refused a kind a ledger may already hold: %v", err)
+	}
+	if _, err := agg.Handle(ctx, "a", add{1, 10}); err == nil ||
+		!strings.Contains(err.Error(), "1027 bytes, longer than the 1024-byte limit") {
+		t.Fatalf("Handle: %v", err)
+	}
+}
+
+// Via and causation ID are not indexed, so a long value is stored and read
+// back unchanged rather than refused for an index's sake.
+func TestUnindexedMetadataIsNotBounded(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	long := strings.Repeat("m", 8192)
+	meta := ledger.Meta{Via: long, CausationID: long}
+
+	if _, err := agg.Handle(ledger.ContextWithMeta(ctx, meta), "a", add{1, 10}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Meta.Via != long || entries[0].Meta.CausationID != long {
+		t.Fatalf("stored metadata: %+v", entries)
 	}
 }
 
@@ -90,9 +115,10 @@ func TestAnOverLongValueIsNotEchoedInTheRefusal(t *testing.T) {
 			_, err := agg.Handle(ctx, long, add{1, 100})
 			return err
 		}},
-		"kind": {len(long), func(agg *counterAgg) error {
+		"kind": {len(long) + len("/a"), func(agg *counterAgg) error {
 			agg.Kind = long
-			return agg.Validate()
+			_, err := agg.Handle(ctx, "a", add{1, 100})
+			return err
 		}},
 		"idempotency key": {len(long), func(agg *counterAgg) error {
 			_, err := agg.Handle(ctx, "a", add{1, 100}, ledger.IdempotencyKey(long))
