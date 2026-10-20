@@ -5,10 +5,12 @@
 #   export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 set -euo pipefail
 
+source "$(dirname "$0")/containers.sh"
+
 name=cairn-test-postgres
 port=${CAIRN_TEST_PORT:-55871}
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+if ! container_publishes "$name" 5432 "$port"; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   # max_prepared_transactions defaults to 0, which makes PREPARE TRANSACTION
   # fail and the ledger's prepared-transaction test skip. The LEAST fence that
