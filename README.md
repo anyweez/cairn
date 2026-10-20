@@ -398,8 +398,11 @@ export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 go test ./...
 ```
 
-Without the database URL, ledger tests are skipped. In CI, set
-`CAIRN_REQUIRE_DATABASE=1` as well, so they fail instead of skipping.
+Without the database URL, ledger tests are skipped. Set
+`CAIRN_REQUIRE_DATABASE=1` as well to make a missing database fail instead of
+skip. It also makes the prepared-transaction test fail when the server has
+`max_prepared_transactions=0`, because the gate must not pass without
+exercising that fence; `scripts/test-postgres.sh` sets it above 0.
 
 The manifest tool is its own module, so the library doesn't depend on
 `golang.org/x/tools`. Its tests also check that the committed manifest is
