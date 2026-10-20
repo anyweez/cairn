@@ -26,6 +26,7 @@ func NewService(store *ledger.Store) *Service {
 			Codecs:       Codecs(),
 			StateVersion: "decision/1",
 			Actor:        sender,
+			StreamOf:     decisionOf,
 		},
 		Now: time.Now,
 		// Random, so a restarted process never mints an ID already in the ledger.
@@ -53,6 +54,18 @@ func sender(m Msg) string {
 		return m.By
 	case Acknowledge:
 		return m.By
+	}
+	return ""
+}
+
+// decisionOf is the decision a message names for itself: a Create names the
+// decision it opens, and every other message is addressed to a stream the
+// caller already has. The ledger records a Create only on the stream it names,
+// so a decision's ID and its stream are one identifier — Supersede and the
+// reference index rely on that.
+func decisionOf(m Msg) string {
+	if c, ok := m.(Create); ok {
+		return c.ID
 	}
 	return ""
 }
@@ -102,7 +115,8 @@ func (s *Service) Acknowledge(ctx context.Context, id, by string, committed bool
 // Supersede marks id replaced by with. Both streams are locked in one
 // transaction, so the replacement cannot be reopened or superseded back while
 // this decides; what was read of it travels in the message, so replay sees
-// exactly the facts the decision was made on.
+// exactly the facts the decision was made on. Since a decision's stream is its
+// ID (see decisionOf), with names the replacement as both.
 func (s *Service) Supersede(ctx context.Context, id, with, by string) error {
 	var refusal *cairn.Refusal
 	streams := []ledger.Stream{s.Register.Stream(id)}
@@ -120,17 +134,9 @@ func (s *Service) Supersede(ctx context.Context, id, with, by string) error {
 			if err != nil {
 				return err
 			}
-			// The decider refuses a decision that supersedes itself by
-			// comparing With to the decision's own ID, so With carries the
-			// replacement's ID rather than the stream it was read from. A
-			// caller allowed to record a Create whose ID is not its stream
-			// otherwise makes those two differ, and the self-check misses
-			// while the supersede goes through. A stream holding no decision
-			// keeps With as the stream, so the decider refuses it as
-			// not-decided rather than as the empty replacement.
-			if replacement.State.ID != "" {
-				msg.With = replacement.State.ID
-			}
+			// with is the replacement's stream, and a decision's stream is its
+			// ID, so With names the decision the self-supersede guard and DR3
+			// compare against.
 			msg.WithStatus, msg.WithSupersededBy = replacement.State.Status, replacement.State.SupersededBy
 		}
 		h, err := s.Register.Apply(ctx, tx, &target, msg)

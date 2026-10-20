@@ -11,7 +11,8 @@ import "sync"
 // decision no longer has. Every delivery carries the seq of the entry that
 // produced the effect, so the index keeps the seq of the text it holds and
 // ignores a delivery that is older. Text is absolute, so applying the same
-// entry again is harmless.
+// entry again is harmless. A decision's ID is the stream it is recorded on, so
+// the seq kept for it is counted on the one stream that writes its text.
 type ReferenceIndex struct {
 	mu   sync.Mutex
 	text map[string]string

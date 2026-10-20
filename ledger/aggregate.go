@@ -54,6 +54,15 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// field), which then fills Meta.Actor. A message whose metadata names a
 	// different actor is not recorded, so the two can never disagree.
 	Actor func(M) string
+
+	// StreamOf, when set, returns the ID of the stream a message itself names
+	// (the entity's own ID, carried in the message). A message that names one
+	// is recorded only on that stream: a store that carries the same entity
+	// under two identifiers would otherwise let a message about one be recorded
+	// on another. Handle and Apply refuse the message with ErrStreamMismatch
+	// before it is decided, and nothing is recorded. A message that names no
+	// stream returns the empty string and may be recorded on any.
+	StreamOf func(M) string
 }
 
 // Stream names one of this aggregate's streams.
@@ -683,11 +692,20 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	return finish(), nil
 }
 
+// ErrStreamMismatch is returned for a message that names a stream other than
+// the one it is being recorded on. See Aggregate.StreamOf.
+var ErrStreamMismatch = errors.New("cairn: the message names a stream it is not recorded on")
+
 // queueEntry decides msg against at and queues recording the decision as an
 // entry recorded at now, with its effects. next is the stream's state after
 // it; finish returns what was recorded, once the batch has run. events are
 // the decision's.
 func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[R], next Loaded[S], entry *Entry, events []Ev, err error) {
+	if a.StreamOf != nil {
+		if named := a.StreamOf(msg); named != "" && named != at.Stream.ID {
+			return nil, at, nil, nil, fmt.Errorf("%w: %s names %s", ErrStreamMismatch, at.Stream, quoteText(named))
+		}
+	}
 	decision := a.Decider.Decide(at.State, msg)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
 		return nil, at, nil, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
