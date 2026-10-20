@@ -8,6 +8,8 @@
 #   export CAIRN_TEST_DATABASE_URL=$(scripts/test-pgbouncer.sh)
 set -euo pipefail
 
+source "$(dirname "$0")/containers.sh"
+
 cd "$(dirname "$0")/.."
 
 scripts/test-postgres.sh >/dev/null
@@ -19,7 +21,7 @@ port=${CAIRN_TEST_PGBOUNCER_PORT:-55873}
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker network connect "$network" cairn-test-postgres 2>/dev/null || true
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+if ! container_publishes "$name" 5432 "$port"; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   # No DB_NAME: every database name is passed through, since each test
   # creates its own.

@@ -7,6 +7,8 @@
 #   go test ./ledger -run '^$' -bench Handle -benchtime 5s
 set -euo pipefail
 
+source "$(dirname "$0")/containers.sh"
+
 cd "$(dirname "$0")/.."
 direct=$(scripts/test-postgres.sh)
 
@@ -19,7 +21,8 @@ proxy_port=${CAIRN_TOXIPROXY_PORT:-55872}
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker network connect "$network" "$postgres" 2>/dev/null || true
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$proxy"; then
+if ! container_publishes "$proxy" 8474 "$api_port" ||
+   ! container_publishes "$proxy" "$proxy_port" "$proxy_port"; then
   docker rm -f "$proxy" >/dev/null 2>&1 || true
   docker run -d --name "$proxy" --network "$network" \
     -p "127.0.0.1:${api_port}:8474" -p "127.0.0.1:${proxy_port}:${proxy_port}" \

@@ -257,8 +257,20 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		m.checkSnapshot(j, state)
 	}
 
-	replayed := m.Decider.Fold(m.Decider.Initial(), events)
-	j(Replayable, spec.Check(m.Equal(replayed, state), "folded %+v, ran to %+v", replayed, state))
+	// The replay is the call Replayable exists to judge, so a panic in it is
+	// attributed to D5 rather than escaping to rapid as an unnamed harness
+	// panic.
+	replayed, ok := guard(func() S { return m.Decider.Fold(m.Decider.Initial(), events) })
+	if !ok {
+		j(Replayable, spec.Fail("replaying the run's events panicked: %v", replayed.panic))
+		return
+	}
+	same, equalOK := guard(func() bool { return m.Equal(replayed.value, state) })
+	if !equalOK {
+		j(Replayable, spec.Fail("comparing the replayed state panicked: %v", same.panic))
+		return
+	}
+	j(Replayable, spec.Check(same.value, "folded %+v, ran to %+v", replayed.value, state))
 }
 
 // checkState checks every invariant against one state.
@@ -276,27 +288,33 @@ func (m Machine[S, M, R, Ev, Ef]) checkSnapshot(j func(spec.Rule, spec.Verdict),
 	if !m.Snapshots {
 		return
 	}
-	data, err := json.Marshal(state)
-	var back S
-	if err == nil {
-		err = json.Unmarshal(data, &back)
-	}
-	j(Snapshottable, spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err))
+	j(Snapshottable, checked(func() spec.Verdict {
+		data, err := json.Marshal(state)
+		var back S
+		if err == nil {
+			err = json.Unmarshal(data, &back)
+		}
+		return spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err)
+	}))
 }
 
 func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), msg M, d cairn.Decision[R, Ev, Ef]) {
 	if m.Codecs == nil {
 		return
 	}
-	j(Encodable, roundTripMaybeRefused(m.Codecs.Messages, msg, d.Refused()))
+	// A codec calls the value's own marshaller, which is user code, so the
+	// round trip is wrapped like the laws and changes: a panic is a D6
+	// violation rather than an unnamed crash of the whole run.
+	encodable := func(check func() spec.Verdict) { j(Encodable, checked(check)) }
+	encodable(func() spec.Verdict { return roundTripMaybeRefused(m.Codecs.Messages, msg, d.Refused()) })
 	if !d.Refused() {
-		j(Encodable, roundTrip(m.Codecs.Results, d.Result))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Results, d.Result) })
 	}
 	for _, e := range d.Events {
-		j(Encodable, roundTrip(m.Codecs.Events, e))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Events, e) })
 	}
 	for _, e := range d.Effects {
-		j(Encodable, roundTrip(m.Codecs.Effects, e))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Effects, e) })
 	}
 }
 
@@ -428,12 +446,32 @@ type model[MS, S, M, R any] struct{ def Model[MS, S, M, R] }
 func (m model[MS, S, M, R]) rule() spec.Rule { return m.def.Rule }
 
 func (m model[MS, S, M, R]) start() refinementRun[S, M, R] {
-	return &modelRun[MS, S, M, R]{def: m.def, state: m.def.Initial()}
+	r := &modelRun[MS, S, M, R]{def: m.def}
+	initial, ok := guard(func() MS { return m.def.Initial() })
+	if !ok {
+		r.initial = spec.Fail("the model's Initial panicked: %v", initial.panic)
+		r.diverged = true
+		return r
+	}
+	r.state = initial.value
+	return r
+}
+
+// modelStep is one answer from a model's Step, so the call can be guarded as a
+// single value.
+type modelStep[MS, R any] struct {
+	next    MS
+	want    R
+	refusal *cairn.Refusal
 }
 
 type modelRun[MS, S, M, R any] struct {
 	def   Model[MS, S, M, R]
 	state MS
+	// initial is a failure to build the model's starting state. It is judged
+	// as the model's first comparison, so a Proposed model reports it and an
+	// Established one fails, rather than the panic escaping to rapid.
+	initial spec.Verdict
 	// diverged is set at the model's first disagreement. A proposed model's run
 	// goes on, but there is no mapping back from the machine's state, so every
 	// later comparison would only repeat the first.
@@ -441,9 +479,23 @@ type modelRun[MS, S, M, R any] struct {
 }
 
 func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict {
-	v := r.def.Agree(impl, r.state)
+	if _, failed := r.initial.Failed(); failed {
+		return r.initial
+	}
+	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(impl, r.state) })
 	_, r.diverged = v.Failed()
 	return v
+}
+
+// modelChecked runs a model's own function, turning a panic in it into a
+// violation of the model's rule, as checked does for a law, change or
+// invariant.
+func modelChecked(what string, check func() spec.Verdict) spec.Verdict {
+	v, ok := guard(check)
+	if !ok {
+		return spec.Fail("the model's %s panicked: %v", what, v.panic)
+	}
+	return v.value
 }
 
 func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
@@ -460,7 +512,14 @@ func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, af
 }
 
 func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
-	next, want, wantRefusal := r.def.Step(r.state, msg)
+	step, ok := guard(func() modelStep[MS, R] {
+		next, want, wantRefusal := r.def.Step(r.state, msg)
+		return modelStep[MS, R]{next: next, want: want, refusal: wantRefusal}
+	})
+	if !ok {
+		return []spec.Verdict{spec.Fail("the model's Step panicked on %s: %v", describe(msg), step.panic)}
+	}
+	next, want, wantRefusal := step.value.next, step.value.want, step.value.refusal
 	code := func(r *cairn.Refusal) string {
 		if r == nil {
 			return "accepted"
@@ -471,12 +530,14 @@ func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal,
 		spec.Check(code(refusal) == code(wantRefusal), "machine %s, model %s", code(refusal), code(wantRefusal)),
 	}
 	if refusal == nil && wantRefusal == nil {
-		verdicts = append(verdicts, spec.Check(r.def.SameResult(result, want), "machine returned %+v, model %+v", result, want))
+		verdicts = append(verdicts, modelChecked("SameResult", func() spec.Verdict {
+			return spec.Check(r.def.SameResult(result, want), "machine returned %+v, model %+v", result, want)
+		}))
 	}
 	if wantRefusal == nil {
 		r.state = next
 	}
-	return append(verdicts, r.def.Agree(after, r.state))
+	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(after, r.state) }))
 }
 
 // ---- report -----------------------------------------------------------------

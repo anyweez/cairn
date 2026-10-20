@@ -62,9 +62,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Ki
 // Validate reports the first thing wrong with how the aggregate is set up: no
 // store, a kind that is empty, contains a slash or cannot be stored, a Decider
 // missing a function, a codec missing from Codecs, or a view or entry view
-// whose name is empty or repeats another's. Every other method runs it first,
-// so a mistake is an error rather than a nil-pointer panic on the first
-// message; call it at startup to fail before then.
+// whose name is empty or repeats another's, or whose Write is nil. Every other
+// method runs it first, so a mistake is an error rather than a nil-pointer
+// panic on the first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
 	switch {
@@ -103,6 +103,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("view " + v.Name + " has no Write")
+		}
 	}
 	for _, v := range a.EntryViews {
 		if v.Name == "" {
@@ -112,6 +115,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("entry view " + v.Name + " has no Write")
+		}
 	}
 	return nil
 }
@@ -154,24 +160,28 @@ type options struct {
 
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
-// returned. A key is stored in a btree index, so it may be at most 1024 bytes.
+// returned. A key is stored in a btree index, so it must be text the ledger can
+// store — valid UTF-8, without a NUL — and at most 1024 bytes. Handle and Apply
+// refuse any other key before it reaches Postgres.
 func IdempotencyKey(key string) Option { return func(o *options) { o.key = key } }
 
-// validIdempotencyKey refuses a key too long for the index that keys on it
-// before it is looked up or written.
-func validIdempotencyKey(key string) error {
-	if len(key) > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: the idempotency key is longer than %d bytes", maxIndexedTextBytes)
-	}
-	return nil
-}
-
-func collect(opts []Option) options {
+// collect applies opts and refuses a key the ledger cannot store or index. A
+// key is passed to a text parameter both when it is looked up and when it is
+// written, so one with a NUL or invalid UTF-8 would otherwise come back from
+// the driver as a raw SQLSTATE, and one too long for the index that keys on it
+// as a raw SQLSTATE 54000.
+func collect(opts []Option) (options, error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return o
+	if !cairn.StorableText(o.key) {
+		return o, fmt.Errorf("cairn: the idempotency key is not valid UTF-8 or contains a NUL")
+	}
+	if len(o.key) > maxIndexedTextBytes {
+		return o, fmt.Errorf("cairn: the idempotency key is longer than %d bytes", maxIndexedTextBytes)
+	}
+	return o, nil
 }
 
 // Handle decides msg against the stream id and records the result, in its own
@@ -188,8 +198,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg 
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
-	if err := validIdempotencyKey(o.key); err != nil {
+	o, err := collect(opts)
+	if err != nil {
 		return Handled[R]{}, err
 	}
 	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
@@ -610,8 +620,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
-	if err := validIdempotencyKey(o.key); err != nil {
+	o, err := collect(opts)
+	if err != nil {
 		return Handled[R]{}, err
 	}
 	// Resolve the metadata before the key is looked up, so a request that
