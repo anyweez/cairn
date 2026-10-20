@@ -159,6 +159,21 @@ func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
 	return k, true
 }
 
+// jsonNil reports whether json.Marshal renders v as null and so never calls
+// MarshalJSON or MarshalText on it: a nil pointer, or a nil interface, or an
+// interface whose dynamic value is a nil pointer. The dynamic value is what
+// has to be tested — a Value of kind Interface is never of kind Pointer, even
+// when it holds one.
+func jsonNil(v reflect.Value) bool {
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return true
+		}
+		v = v.Elem()
+	}
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
 func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	if !v.IsValid() {
 		return nil
@@ -185,8 +200,8 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		}
 		if _, ok := v.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer as null and never calls
-			// MarshalText.
-			if v.Kind() == reflect.Pointer && v.IsNil() {
+			// MarshalText — including a nil pointer held behind an interface.
+			if jsonNil(v) {
 				return nil
 			}
 			_, err := renderStorableText(v, path)
@@ -467,8 +482,9 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 	if k.CanInterface() {
 		if _, ok := k.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer key as the empty string and
-			// never calls its MarshalText.
-			if k.Kind() == reflect.Pointer && k.IsNil() {
+			// never calls its MarshalText — including a nil pointer held
+			// behind an interface.
+			if jsonNil(k) {
 				return "", nil
 			}
 			return renderStorableText(k, path)
@@ -484,7 +500,7 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 // calls the method, and a marshaller that fails is left to Encode's own
 // json.Marshal, which reports that failure once.
 func checkStorableMarshaler(v reflect.Value, path string) error {
-	if v.Kind() == reflect.Pointer && v.IsNil() {
+	if jsonNil(v) {
 		return nil
 	}
 	data, err := v.Interface().(json.Marshaler).MarshalJSON()

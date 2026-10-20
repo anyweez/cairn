@@ -45,7 +45,16 @@ func TestEncodeAcceptsANilTextMarshalerBehindAnInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := back.(ifaceTextHolder).V; got != (*nilText)(nil) {
-		t.Fatalf("round-trip returned %#v, want a nil pointer", got)
+	// The stored JSON is {"v":null}, which carries no dynamic type, so
+	// encoding/json decodes it into an any field as an untyped nil and the
+	// nil pointer's type does not survive the round trip — the same answer
+	// json.Unmarshal would give on its own. What must survive is the null,
+	// not the type: nil (untyped or a nil pointer) is what comes back.
+	got := back.(ifaceTextHolder).V
+	if got == nil {
+		return
+	}
+	if p, ok := got.(*nilText); !ok || p != nil {
+		t.Fatalf("round-trip returned %#v, want nil", got)
 	}
 }
