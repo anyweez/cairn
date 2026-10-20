@@ -130,8 +130,12 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 		if err != nil {
 			return total, err
 		}
-		if n == 0 {
-			return total, nil
+		// A short batch means there are no more entries visible as of the read
+		// that produced it. Return without reading again: the next call picks up
+		// anything that commits meanwhile, and the terminating transaction would
+		// otherwise cost four round trips on its own.
+		if n < batch {
+			return total + n, nil
 		}
 		total += n
 	}
