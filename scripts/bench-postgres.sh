@@ -8,6 +8,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/lib-lock.sh
 direct=$(scripts/test-postgres.sh)
 
 network=cairn-bench
@@ -16,6 +17,11 @@ proxy=cairn-toxiproxy
 api_port=${CAIRN_TOXIPROXY_API_PORT:-8474}
 proxy_port=${CAIRN_TOXIPROXY_PORT:-55872}
 
+# Creating the network and the proxy is a check-then-act: callers that start
+# together both see neither, and one caller's `docker rm -f` can delete the
+# container another just started. Serialise them, so the loser reuses the
+# winner's network and container instead of colliding with it on the name.
+lock_acquire cairn-bench-postgres
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker network connect "$network" "$postgres" 2>/dev/null || true
 
@@ -25,6 +31,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$proxy"; then
     -p "127.0.0.1:${api_port}:8474" -p "127.0.0.1:${proxy_port}:${proxy_port}" \
     ghcr.io/shopify/toxiproxy:2.9.0 >/dev/null
 fi
+lock_release
 api="http://127.0.0.1:${api_port}"
 for _ in $(seq 1 40); do
   curl -sf "$api/version" >/dev/null 2>&1 && up=1 && break
@@ -35,10 +42,13 @@ if [ -z "${up:-}" ]; then
   exit 1
 fi
 
-# Create the proxy unless it exists already.
+# Create the proxy unless it exists already, under the same lock so two
+# callers cannot both see it missing and race the POST.
+lock_acquire cairn-bench-postgres
 if ! curl -sf "$api/proxies/cairn-pg" >/dev/null; then
   curl -sf -X POST "$api/proxies" -d "{\"name\":\"cairn-pg\",\"listen\":\"0.0.0.0:${proxy_port}\",\"upstream\":\"${postgres}:5432\",\"enabled\":true}" >/dev/null
 fi
+lock_release
 
 echo "export CAIRN_TEST_DATABASE_URL='${direct}'"
 echo "export CAIRN_BENCH_PROXY_ADDR='127.0.0.1:${proxy_port}'"
