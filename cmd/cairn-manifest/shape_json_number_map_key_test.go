@@ -52,3 +52,34 @@ func TestAJSONNumberMapKeyIsShapedAsAString(t *testing.T) {
 		t.Fatalf("fields() renders map[string]json.Number as %v, want %v; a json.Number value must stay a number", value, want)
 	}
 }
+
+// A string-kind map key with its own MarshalText is written as the string
+// itself: resolveKeyName returns the key's string before any marshaler is
+// consulted, so the key type's name says nothing about what is on the wire
+// and the manifest must not record it as the key.
+type textKey string
+
+func (textKey) MarshalText() ([]byte, error) { return []byte("Tk"), nil }
+
+type textKeyMap struct {
+	M map[textKey]int `json:"m"`
+}
+
+func TestAStringKindMapKeyWithAMarshalerIsShapedAsAString(t *testing.T) {
+	textRAW, err := json.Marshal(textKeyMap{M: map[textKey]int{"1": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stringRAW, err := json.Marshal(stringKeyMap{M: map[string]int{"1": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(textRAW) != string(stringRAW) {
+		t.Fatalf("the fixtures differ on the wire: MarshalText key %s, string key %s", textRAW, stringRAW)
+	}
+
+	text, str := fields(lookedUpType(t, "textKeyMap")), fields(lookedUpType(t, "stringKeyMap"))
+	if !slices.Equal(text, str) {
+		t.Fatalf("fields() renders a MarshalText map key as %v, not the %v a string key gives; the two are identical on the wire", text, str)
+	}
+}
