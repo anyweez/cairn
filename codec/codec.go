@@ -125,12 +125,14 @@ func (e *NotStorableError) Error() string {
 // CheckStorable reports whether v can be stored in the ledger and read back
 // unchanged. json.Marshal replaces a string that is not valid UTF-8 with
 // U+FFFD, and Postgres jsonb cannot represent a NUL, so either would silently
-// store text the caller never wrote. A time.Time outside the years JSON can
-// encode would instead fail at Encode with time.Time's own marshal error.
+// store text the caller never wrote.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalJSON
 // decides its own encoding and is not inspected, because those bytes are the
-// JSON — except time.Time, whose MarshalJSON rejects years outside [0,9999].
+// JSON — except time.Time, which is judged by the value it comes back as: its
+// JSON carries a zone offset only to the minute and a year only in [0,9999],
+// so a time a caller can build may fail to encode or, worse, decode as a
+// different instant.
 // A type with its own MarshalText does not decide its encoding: json writes the
 // text through its own string encoder, so the bytes it returns are checked like
 // any other string. A MarshalText or MarshalJSON on the pointer to the value
@@ -145,9 +147,13 @@ var (
 	ptrToTimeType = reflect.PointerTo(timeType)
 )
 
-// checkStorableTime catches the one json.Marshaler whose encoding can fail for
-// a value a caller can construct: time.Time renders only years in [0,9999],
-// and json.Marshal rejects the rest. Returning false means v is not a time.
+// checkStorableTime catches the one json.Marshaler that has to be inspected:
+// time.Time renders only years in [0,9999] and an offset to the minute, so a
+// value a caller can construct may fail to encode or come back as a different
+// instant. Rather than list those cases, it marshals the time and requires it
+// to decode Equal — the rule itself (a value must survive its codec, README
+// D6), which covers any case JSON grows later. Returning false means v is not
+// a time.
 func checkStorableTime(v reflect.Value, path string) (bool, error) {
 	switch v.Type() {
 	case timeType:
@@ -160,8 +166,16 @@ func checkStorableTime(v reflect.Value, path string) (bool, error) {
 		return false, nil
 	}
 	t := v.Interface().(time.Time)
-	if y := t.Year(); y < 0 || y > 9999 {
-		return true, &NotStorableError{Path: path, Reason: fmt.Sprintf("has year %d, outside the range JSON can encode ([0,9999])", y)}
+	data, err := t.MarshalJSON()
+	if err != nil {
+		return true, &NotStorableError{Path: path, Reason: fmt.Sprintf("cannot be encoded as JSON: %v", err)}
+	}
+	var back time.Time
+	if err := back.UnmarshalJSON(data); err != nil {
+		return true, &NotStorableError{Path: path, Reason: fmt.Sprintf("cannot be decoded from its own JSON %s: %v", data, err)}
+	}
+	if !back.Equal(t) {
+		return true, &NotStorableError{Path: path, Reason: fmt.Sprintf("does not survive its JSON encoding: %v came back as %v", t, back)}
 	}
 	return true, nil
 }

@@ -108,21 +108,25 @@ func TestCheckStorableRejectsTextTheLedgerCannotKeep(t *testing.T) {
 	}
 }
 
-// time.Time is a json.Marshaler, so the walk would otherwise trust it; its
-// MarshalJSON rejects a year outside [0,9999] after Decide has accepted the
-// message. CheckStorable must reject it, and leave the encodable edges alone.
-func TestCheckStorableRejectsATimeJSONCannotEncode(t *testing.T) {
+// time.Time is a json.Marshaler, so the walk would otherwise trust it; JSON
+// carries its year only in [0,9999] and its offset only to the minute, so a
+// value Decide accepts can still fail Encode or come back as a different
+// instant. CheckStorable must reject it, and leave an ordinary zone alone.
+func TestCheckStorableRejectsATimeJSONCannotKeep(t *testing.T) {
 	type stamped struct {
 		At time.Time `json:"at"`
 	}
 	for name, at := range map[string]time.Time{
-		"a negative year": time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC),
-		"year 10000":      time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		"a negative year":      time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC),
+		"year 10000":           time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		"a seconds offset":     time.Date(1900, 1, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32)),
+		"an offset of 24h":     time.Date(1900, 1, 1, 12, 0, 0, 0, time.FixedZone("BIG", 24*60*60)),
+		"an offset below -24h": time.Date(1900, 1, 1, 12, 0, 0, 0, time.FixedZone("BIG", -24*60*60)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := codec.CheckStorable(stamped{At: at})
 			if err == nil {
-				t.Fatalf("CheckStorable accepted a time it cannot encode: %v", at)
+				t.Fatalf("CheckStorable accepted a time it cannot keep: %v", at)
 			}
 			var notStorable *codec.NotStorableError
 			if !errors.As(err, &notStorable) {
@@ -130,14 +134,33 @@ func TestCheckStorableRejectsATimeJSONCannotEncode(t *testing.T) {
 			}
 		})
 	}
-	for _, at := range []time.Time{
-		{},
-		time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC),
+	for name, at := range map[string]time.Time{
+		"the zero time":       {},
+		"year 0":              time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+		"year 9999":           time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC),
+		"a whole-minute zone": time.Date(1900, 1, 1, 12, 0, 0, 0, time.FixedZone("IST", 5*3600+30*60)),
 	} {
-		if err := codec.CheckStorable(stamped{At: at}); err != nil {
-			t.Fatalf("CheckStorable rejected an encodable time %v: %v", at, err)
-		}
+		t.Run(name, func(t *testing.T) {
+			if err := codec.CheckStorable(stamped{At: at}); err != nil {
+				t.Fatalf("CheckStorable rejected a time it can keep, %v: %v", at, err)
+			}
+		})
+	}
+}
+
+// The walk reaches a time behind a pointer too, and a nil one is JSON's null,
+// which needs no encoding at all.
+func TestCheckStorableChecksATimeBehindAPointer(t *testing.T) {
+	type stamped struct {
+		At *time.Time `json:"at"`
+	}
+	at := time.Date(1900, 1, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32))
+	var notStorable *codec.NotStorableError
+	if err := codec.CheckStorable(stamped{At: &at}); !errors.As(err, &notStorable) {
+		t.Fatalf("CheckStorable accepted a time behind a pointer that it cannot keep: %v", err)
+	}
+	if err := codec.CheckStorable(stamped{}); err != nil {
+		t.Fatalf("CheckStorable rejected a nil time, which JSON encodes as null: %v", err)
 	}
 }
 
