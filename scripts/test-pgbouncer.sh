@@ -9,6 +9,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/lib-lock.sh
 
 scripts/test-postgres.sh >/dev/null
 
@@ -16,27 +17,25 @@ network=cairn-test
 name=cairn-test-pgbouncer
 port=${CAIRN_TEST_PGBOUNCER_PORT:-55873}
 
-lock=${TMPDIR:-/tmp}/cairn-test-pgbouncer.lock
-(
-  # Creating the network and the container is a check-then-act: callers that
-  # start together both see neither, and one caller's `docker rm -f` can delete
-  # the container another just started. Serialise them, so the loser reuses the
-  # winner's network and container instead of colliding with it on the name.
-  flock 9
-  docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
-  docker network connect "$network" cairn-test-postgres 2>/dev/null || true
+# Creating the network and the container is a check-then-act: callers that
+# start together both see neither, and one caller's `docker rm -f` can delete
+# the container another just started. Serialise them, so the loser reuses the
+# winner's network and container instead of colliding with it on the name.
+lock_acquire cairn-test-pgbouncer
+docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
+docker network connect "$network" cairn-test-postgres 2>/dev/null || true
 
-  if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-    docker rm -f "$name" >/dev/null 2>&1 || true
-    # No DB_NAME: every database name is passed through, since each test
-    # creates its own.
-    docker run -d --name "$name" --network "$network" -p "127.0.0.1:${port}:5432" \
-      -e DB_HOST=cairn-test-postgres -e DB_USER=cairn -e DB_PASSWORD=cairn \
-      -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction \
-      -e MAX_CLIENT_CONN=1000 -e DEFAULT_POOL_SIZE=40 \
-      edoburu/pgbouncer:v1.24.1-p1 >/dev/null
-  fi
-) 9>"$lock"
+if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # No DB_NAME: every database name is passed through, since each test
+  # creates its own.
+  docker run -d --name "$name" --network "$network" -p "127.0.0.1:${port}:5432" \
+    -e DB_HOST=cairn-test-postgres -e DB_USER=cairn -e DB_PASSWORD=cairn \
+    -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction \
+    -e MAX_CLIENT_CONN=1000 -e DEFAULT_POOL_SIZE=40 \
+    edoburu/pgbouncer:v1.24.1-p1 >/dev/null
+fi
+lock_release
 for _ in $(seq 1 60); do
   docker exec "$name" sh -c 'nc -z 127.0.0.1 5432' >/dev/null 2>&1 && ready=1 && break
   sleep 0.5
