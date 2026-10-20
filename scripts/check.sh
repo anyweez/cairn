@@ -21,7 +21,8 @@ if [ -z "${CAIRN_TEST_DATABASE_URL:-}" ]; then
   CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 fi
 export CAIRN_TEST_DATABASE_URL
-# Fail, rather than skip, the ledger tests if the database is missing.
+# Fail, rather than skip, a ledger test that needs a database or a server
+# that can prepare transactions.
 export CAIRN_REQUIRE_DATABASE=1
 go test -race ./...
 
