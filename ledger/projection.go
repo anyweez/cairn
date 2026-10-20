@@ -144,7 +144,7 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runner")
 
 // Run catches the projection up every interval until ctx is done. An error
-// ends it unless OnError is set.
+// ends it unless OnError is set. The interval must be positive.
 func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
 	if err := p.Validate(); err != nil {
 		return err
@@ -160,6 +160,9 @@ func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
 // once reports more to do. An error ends it unless onError is set, in which
 // case it is reported there and the next interval tries again.
 func poll(ctx context.Context, interval time.Duration, onError func(error), once func(context.Context) (bool, error)) error {
+	if interval <= 0 {
+		return fmt.Errorf("cairn: interval must be positive, got %v", interval)
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {

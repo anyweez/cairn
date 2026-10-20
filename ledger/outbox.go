@@ -211,7 +211,7 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byt
 }
 
 // Run drains the outbox every interval until ctx is done. An error ends it
-// unless OnError is set.
+// unless OnError is set. The interval must be positive.
 func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error {
 	return poll(ctx, interval, d.OnError, func(ctx context.Context) (bool, error) {
 		n, err := d.DrainOnce(ctx)

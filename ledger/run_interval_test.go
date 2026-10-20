@@ -10,18 +10,19 @@ import (
 	"github.com/anyweez/cairn/ledger"
 )
 
-// A caller that wants a dispatcher or projection to poll without waiting
-// passes a zero interval. Run must report the bad interval rather than
-// panicking out of the caller's goroutine. A zero interval is not documented
-// as invalid, and the defaulted config fields around it (BatchSize, Lease,
-// Backoff) suggest a zero is a value to default rather than to crash on.
+// A caller that passes a zero interval — a natural way to ask for "poll without
+// waiting", consistent with the defaulted config fields around it — must get an
+// error rather than a panic out of the caller's goroutine.
 func TestRunRejectsANonPositiveIntervalInsteadOfPanicking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // let a fixed Run return instead of waiting forever
 
 	cases := map[string]func(context.Context, time.Duration) error{
 		"dispatcher": (&ledger.Dispatcher[struct{}]{}).Run,
-		"projection": (&ledger.Projection{}).Run,
+		"projection": (&ledger.Projection{
+			Store: &ledger.Store{}, Name: "test",
+			Apply: func(context.Context, *ledger.Batch, ledger.Entry) error { return nil },
+		}).Run,
 	}
 	for name, run := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -38,6 +39,9 @@ func TestRunRejectsANonPositiveIntervalInsteadOfPanicking(t *testing.T) {
 			case err := <-done:
 				if err != nil && strings.HasPrefix(err.Error(), "panic:") {
 					t.Fatalf("Run panicked on a zero interval: %v", err)
+				}
+				if err == nil || !strings.Contains(err.Error(), "interval") {
+					t.Fatalf("Run returned %v; want an error naming the interval", err)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("Run hung on a zero interval")
