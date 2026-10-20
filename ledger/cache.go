@@ -66,12 +66,13 @@ type laneKey struct {
 
 // trustAbove is how often a stream's cached state must have been right for
 // the next message to be decided from it. A right guess costs one round trip
-// and a wrong one three, against two for reading first, so guessing pays above
-// half; the margin covers the lock waits a wrong guess adds for others.
+// and a wrong one four, against two for reading first, so guessing pays above
+// two in three; the margin covers the lock waits a wrong guess adds for others.
 const trustAbove = 0.75
 
-// rightWeight is how much one message moves a stream's average: after about
-// seven messages the other way, a stream crosses trustAbove.
+// rightWeight is how much one message moves a stream's average: from a
+// trusted 1, three wrong messages take a stream below trustAbove, and from 0
+// eleven right ones bring it back.
 const rightWeight = 1.0 / 8
 
 func newStateCache(streams int) *stateCache {
