@@ -77,6 +77,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		// parameter without building a stream name, so an unstorable one would
 		// otherwise reach the driver and come back as a raw SQLSTATE.
 		return fail("Kind must be valid UTF-8 and contain no NUL")
+	case len(a.Kind) > maxIndexedTextBytes:
+		return fail(fmt.Sprintf("Kind must be at most %d bytes", maxIndexedTextBytes))
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
@@ -152,8 +154,17 @@ type options struct {
 
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
-// returned.
+// returned. A key is stored in a btree index, so it may be at most 1024 bytes.
 func IdempotencyKey(key string) Option { return func(o *options) { o.key = key } }
+
+// validIdempotencyKey refuses a key too long for the index that keys on it
+// before it is looked up or written.
+func validIdempotencyKey(key string) error {
+	if len(key) > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: the idempotency key is longer than %d bytes", maxIndexedTextBytes)
+	}
+	return nil
+}
 
 func collect(opts []Option) options {
 	var o options
@@ -178,6 +189,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg 
 		return Handled[R]{}, err
 	}
 	o := collect(opts)
+	if err := validIdempotencyKey(o.key); err != nil {
+		return Handled[R]{}, err
+	}
 	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
 
@@ -597,6 +611,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 		return Handled[R]{}, err
 	}
 	o := collect(opts)
+	if err := validIdempotencyKey(o.key); err != nil {
+		return Handled[R]{}, err
+	}
 	// Resolve the metadata before the key is looked up, so a request that
 	// names an actor its metadata contradicts is refused rather than answered
 	// from that actor's entry.
