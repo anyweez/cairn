@@ -154,7 +154,13 @@ func isMermaidID(s string) bool {
 		}
 	}
 	switch strings.ToLower(s) {
-	case "state", "direction", "note", "class", "classdef", "hide", "scale", "end":
+	// Every word the state-diagram lexer reads at the start of a line as a
+	// directive rather than a state id. The list is a copy of the lexer's
+	// keywords, so it has to be kept complete: a missing one renders a state
+	// as diagram syntax and loses the whole diagram.
+	case "state", "statediagram", "direction", "note", "class", "classdef", "cssclass",
+		"style", "default", "hide", "scale", "click", "acctitle", "accdescr",
+		"title", "end":
 		return false
 	}
 	return true
@@ -164,7 +170,10 @@ func isMermaidID(s string) bool {
 // syntax, or that would split the line. A numeric entity decodes back to the
 // original text in the renderer, so labels stay readable while a trigger
 // containing "-->" cannot introduce an edge; such a label is escaped whole so
-// the injected state's name does not appear in the diagram either.
+// the injected state's name does not appear in the diagram either. The colon
+// is escaped for the same reason: the lexer ends the label at the separator,
+// so a trigger like "set_status:open" would otherwise cut the line short and
+// make the whole diagram unparseable.
 func mermaidLabel(s string) string {
 	whole := strings.Contains(s, "-->")
 	var b strings.Builder
@@ -180,7 +189,7 @@ func mermaidLabel(s string) string {
 
 func mermaidSyntax(r rune) bool {
 	switch r {
-	case '\n', '\r', '\t', '"', '&', ';', '%', '\\', '<', '>', '#':
+	case '\n', '\r', '\t', '"', '&', ';', '%', '\\', '<', '>', '#', ':':
 		return true
 	}
 	return false
