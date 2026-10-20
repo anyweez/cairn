@@ -15,6 +15,9 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
+	"sync"
+	"unicode"
 
 	"github.com/anyweez/cairn"
 )
@@ -208,18 +211,14 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		defer delete(seen, k)
 		return checkStorable(v.Elem(), path, seen)
 	case reflect.Struct:
-		t := v.Type()
-		for i := 0; i < v.NumField(); i++ {
-			f := t.Field(i)
-			// json.Marshal skips an unexported field, but not an unexported
-			// embedded struct's exported fields.
-			if f.PkgPath != "" && !f.Anonymous {
+		for _, f := range storableFields(v.Type()) {
+			fv, err := v.FieldByIndexErr(f.index)
+			if err != nil {
+				// An embedded pointer on the path is nil, so json writes no
+				// field beyond it.
 				continue
 			}
-			if f.Tag.Get("json") == "-" {
-				continue
-			}
-			if err := checkStorable(v.Field(i), path+"."+f.Name, seen); err != nil {
+			if err := checkStorable(fv, path+"."+f.path, seen); err != nil {
 				return err
 			}
 		}
@@ -264,6 +263,185 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		}
 	}
 	return nil
+}
+
+// storableField is a field encoding/json writes for a struct type: the index
+// path to it and the Go field names along that path, for an error message.
+type storableField struct {
+	index []int
+	path  string
+}
+
+// storableFieldsCache holds the resolved fields of a struct type. The set
+// depends only on the type, and Encode walks it for every entry.
+var storableFieldsCache sync.Map // reflect.Type -> []storableField
+
+// storableFields returns the fields encoding/json actually writes for a struct
+// type, after resolving field-name dominance the way encoding/json does: a
+// name reachable through more than one field keeps only its shallowest field,
+// a tagged field beats an untagged one at the same depth, and any remaining
+// tie drops the name. A field json drops is never stored, so its text is not a
+// reason to refuse the value.
+func storableFields(t reflect.Type) []storableField {
+	if cached, ok := storableFieldsCache.Load(t); ok {
+		return cached.([]storableField)
+	}
+	fields := computeStorableFields(t)
+	storableFieldsCache.Store(t, fields)
+	return fields
+}
+
+// fieldCandidate is one field encoding/json may write, before name dominance
+// removes the ones it drops.
+type fieldCandidate struct {
+	name   string // the JSON key
+	index  []int  // path from the root struct
+	tagged bool   // its JSON tag named it, which breaks a depth tie
+	path   string // its Go field names, for an error message
+}
+
+func computeStorableFields(t reflect.Type) []storableField {
+	type queued struct {
+		typ   reflect.Type
+		index []int
+		path  string
+	}
+
+	current := []queued{}
+	next := []queued{{typ: t}}
+	// count is how many times a type was queued at the current depth. A type
+	// reachable twice contributes its fields twice, which is what makes the
+	// dominance pass drop an ambiguous name rather than pick one.
+	var count, nextCount map[reflect.Type]int
+	visited := map[reflect.Type]bool{}
+	var cands []fieldCandidate
+
+	for len(next) > 0 {
+		current, next = next, current[:0]
+		count, nextCount = nextCount, map[reflect.Type]int{}
+		for _, q := range current {
+			if visited[q.typ] {
+				continue
+			}
+			visited[q.typ] = true
+			for i := 0; i < q.typ.NumField(); i++ {
+				f := q.typ.Field(i)
+				if f.Anonymous {
+					ft := f.Type
+					if ft.Kind() == reflect.Pointer {
+						ft = ft.Elem()
+					}
+					// json.Marshal skips an unexported embedded non-struct, but
+					// keeps an unexported embedded struct for its exported fields.
+					if f.PkgPath != "" && ft.Kind() != reflect.Struct {
+						continue
+					}
+				} else if f.PkgPath != "" {
+					continue
+				}
+				tag := f.Tag.Get("json")
+				if tag == "-" {
+					continue
+				}
+				name, _, _ := strings.Cut(tag, ",")
+				if !validJSONTag(name) {
+					// json discards an invalid tag name and falls back to the Go
+					// field name, so the field is untagged for dominance too.
+					name = ""
+				}
+				tagged := name != ""
+
+				index := make([]int, len(q.index)+1)
+				copy(index, q.index)
+				index[len(q.index)] = i
+				fieldPath := f.Name
+				if q.path != "" {
+					fieldPath = q.path + "." + f.Name
+				}
+
+				ft := f.Type
+				if ft.Name() == "" && ft.Kind() == reflect.Pointer {
+					// json follows an unnamed pointer to an embedded struct.
+					ft = ft.Elem()
+				}
+				if name != "" || !f.Anonymous || ft.Kind() != reflect.Struct {
+					if name == "" {
+						name = f.Name
+					}
+					c := fieldCandidate{name: name, index: index, tagged: tagged, path: fieldPath}
+					cands = append(cands, c)
+					if count[q.typ] > 1 {
+						cands = append(cands, c)
+					}
+					continue
+				}
+
+				nextCount[ft]++
+				if nextCount[ft] == 1 {
+					next = append(next, queued{typ: ft, index: index, path: fieldPath})
+				}
+			}
+		}
+	}
+
+	slices.SortFunc(cands, func(a, b fieldCandidate) int {
+		if c := strings.Compare(a.name, b.name); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(len(a.index), len(b.index)); c != 0 {
+			return c
+		}
+		if a.tagged != b.tagged {
+			if a.tagged {
+				return -1
+			}
+			return 1
+		}
+		return slices.Compare(a.index, b.index)
+	})
+
+	out := cands[:0]
+	for advance, i := 0, 0; i < len(cands); i += advance {
+		name := cands[i].name
+		for advance = 1; i+advance < len(cands) && cands[i+advance].name == name; advance++ {
+		}
+		if advance == 1 {
+			out = append(out, cands[i])
+			continue
+		}
+		// The first two are the shallowest. Still equal in depth and tag
+		// presence, the name is ambiguous and json writes none of them.
+		if len(cands[i].index) == len(cands[i+1].index) && cands[i].tagged == cands[i+1].tagged {
+			continue
+		}
+		out = append(out, cands[i])
+	}
+	cands = out
+
+	slices.SortFunc(cands, func(a, b fieldCandidate) int { return slices.Compare(a.index, b.index) })
+	fields := make([]storableField, len(cands))
+	for i, c := range cands {
+		fields[i] = storableField{index: c.index, path: c.path}
+	}
+	return fields
+}
+
+// validJSONTag reports whether s may name a JSON field, mirroring
+// encoding/json's isValidTag: letters, digits and a fixed set of punctuation.
+// A name containing a quote, a backslash or a control character is rejected.
+func validJSONTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+			// Backslash and quote are reserved; other punctuation is allowed.
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
 }
 
 // checkMapKey checks a map key the way json.Marshal will render it, and returns
