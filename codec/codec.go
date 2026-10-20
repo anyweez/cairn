@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/anyweez/cairn"
 )
@@ -122,13 +123,15 @@ func (e *NotStorableError) Error() string {
 // UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
 // would silently store text the caller never wrote.
 //
-// It walks the same values json.Marshal does. A type with its own MarshalJSON
-// decides its own encoding and is not inspected, because those bytes are the
-// JSON. A type with its own MarshalText does not: json writes the text through
-// its own string encoder, so the bytes it returns are checked like any other
-// string. A MarshalText or MarshalJSON on the pointer to the value counts too
-// wherever json reaches the value addressably, which is a slice or array
-// element, or a field of a struct behind a pointer.
+// It walks the same values json.Marshal does. A type with its own MarshalText
+// is checked through the text it returns, because json writes it through its
+// own string encoder rather than verbatim. A type with its own MarshalJSON
+// decides its own encoding, so the Go value behind it is not inspected; the
+// bytes it returns are, because json.Marshal copies them into the entry and
+// jsonb's alphabet is narrower than JSON's. A MarshalText or MarshalJSON on
+// the pointer to the value counts too wherever json reaches the value
+// addressably, which is a slice or array element, or a field of a struct
+// behind a pointer.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
@@ -163,13 +166,13 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	// json.Marshal uses a pointer-receiver MarshalJSON or MarshalText whenever
 	// the value is addressable — a slice or array element, or a struct behind a
 	// pointer — and prefers it to a value-receiver method, so it is checked
-	// first. A json.Marshaler decides its own bytes and is opaque; a
-	// TextMarshaler's bytes go through json's string encoder, so they are
-	// checked like any other string.
+	// first. A json.Marshaler decides its own bytes, but jsonb decides whether
+	// it can keep them; a TextMarshaler's bytes go through json's string
+	// encoder, so they are checked like any other string.
 	if v.CanAddr() && v.Kind() != reflect.Pointer && v.Addr().CanInterface() {
 		addr := v.Addr()
 		if _, ok := addr.Interface().(json.Marshaler); ok {
-			return nil
+			return checkStorableMarshaler(addr, path)
 		}
 		if _, ok := addr.Interface().(encoding.TextMarshaler); ok {
 			_, err := renderStorableText(addr, path)
@@ -178,7 +181,7 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	}
 	if v.CanInterface() {
 		if _, ok := v.Interface().(json.Marshaler); ok {
-			return nil
+			return checkStorableMarshaler(v, path)
 		}
 		if _, ok := v.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer as null and never calls
@@ -474,6 +477,92 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 	// An integer key becomes its decimal form, which is always storable. The
 	// value is only a path for anything else, which json.Marshal will reject.
 	return k.String(), nil
+}
+
+// checkStorableMarshaler calls v's MarshalJSON and checks the bytes jsonb will
+// be handed. A nil pointer is storable because json writes null and never
+// calls the method, and a marshaller that fails is left to Encode's own
+// json.Marshal, which reports that failure once.
+func checkStorableMarshaler(v reflect.Value, path string) error {
+	if v.Kind() == reflect.Pointer && v.IsNil() {
+		return nil
+	}
+	data, err := v.Interface().(json.Marshaler).MarshalJSON()
+	if err != nil {
+		return nil
+	}
+	return checkMarshalledJSON(data, path)
+}
+
+// checkMarshalledJSON reports whether the JSON a MarshalJSON returned can be
+// stored in jsonb and read back unchanged. json.Marshal compacts those bytes
+// but does not sanitize them, so they reach the entry as they are: a string in
+// them that is not valid UTF-8 is rejected by jsonb as an invalid byte
+// sequence (SQLSTATE 22021), and a NUL or an unpaired UTF-16 surrogate escape
+// is rejected as an unsupported Unicode escape (SQLSTATE 22P05). The bytes are
+// the type's to decide, but what jsonb can keep is not.
+func checkMarshalledJSON(data []byte, path string) error {
+	if !utf8.Valid(data) {
+		return &NotStorableError{Path: path}
+	}
+	for i := 0; i < len(data); {
+		if data[i] != '\\' || i+1 >= len(data) {
+			i++
+			continue
+		}
+		if data[i+1] != 'u' {
+			// An escaped quote, backslash or control character.
+			i += 2
+			continue
+		}
+		u, ok := jsonHex4(data[i+2:])
+		if !ok {
+			// Not JSON at all: json.Marshal refuses it, so there is no entry
+			// to keep.
+			return nil
+		}
+		switch {
+		case u == 0, u >= 0xdc00 && u <= 0xdfff:
+			// A NUL, or a low surrogate with no high surrogate before it.
+			return &NotStorableError{Path: path}
+		case u >= 0xd800 && u <= 0xdbff:
+			// A high surrogate is storable only as half of a pair.
+			lo, paired := rune(0), false
+			if i+12 <= len(data) && data[i+6] == '\\' && data[i+7] == 'u' {
+				lo, paired = jsonHex4(data[i+8:])
+			}
+			if !paired || lo < 0xdc00 || lo > 0xdfff {
+				return &NotStorableError{Path: path}
+			}
+			i += 12
+			continue
+		}
+		i += 6
+	}
+	return nil
+}
+
+// jsonHex4 reads the four hex digits of a \u escape, reporting whether b holds
+// them.
+func jsonHex4(b []byte) (rune, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	var u rune
+	for _, c := range b[:4] {
+		switch {
+		case c >= '0' && c <= '9':
+			c -= '0'
+		case c >= 'a' && c <= 'f':
+			c = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			c = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		u = u<<4 | rune(c)
+	}
+	return u, true
 }
 
 // renderStorableText calls v's MarshalText and returns the text json.Marshal
