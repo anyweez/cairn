@@ -1,6 +1,7 @@
 package spectest_test
 
 import (
+	"strings"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -36,5 +37,8 @@ func TestFailsReportsACheckThatPanicked(t *testing.T) {
 	msg, failed := spectest.Fails(t, m.Check)
 	if !failed {
 		t.Fatalf("a check that panicked must be reported as a failure, got failed=%v with: %s", failed, msg)
+	}
+	if !strings.Contains(msg, "the check did not finish") || !strings.Contains(msg, "panic") {
+		t.Fatalf("the failure must say the check died and carry rapid's report, got: %s", msg)
 	}
 }
