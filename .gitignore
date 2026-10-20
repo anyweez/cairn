@@ -1,3 +1,4 @@
 .worktrees/
 .scratch/
 **/testdata/rapid/
+/cmd/cairn-manifest/cairn-manifest
