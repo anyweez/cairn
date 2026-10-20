@@ -153,14 +153,25 @@ type options struct {
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
 // returned.
+//
+// A key is stored as text, in the same entry as the message, so it must be
+// text the ledger can store: valid UTF-8, without a NUL. Handle and Apply
+// refuse any other key before it reaches Postgres.
 func IdempotencyKey(key string) Option { return func(o *options) { o.key = key } }
 
-func collect(opts []Option) options {
+// collect applies opts and refuses a key the ledger cannot store. A key is
+// passed to a text parameter both when it is looked up and when it is written,
+// so one with a NUL or invalid UTF-8 would otherwise come back from the driver
+// as a raw SQLSTATE.
+func collect(opts []Option) (options, error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return o
+	if !cairn.StorableText(o.key) {
+		return o, fmt.Errorf("cairn: the idempotency key is not valid UTF-8 or contains a NUL")
+	}
+	return o, nil
 }
 
 // Handle decides msg against the stream id and records the result, in its own
@@ -177,7 +188,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg 
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
+	o, err := collect(opts)
+	if err != nil {
+		return Handled[R]{}, err
+	}
 	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
 
@@ -596,7 +610,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
+	o, err := collect(opts)
+	if err != nil {
+		return Handled[R]{}, err
+	}
 	// Resolve the metadata before the key is looked up, so a request that
 	// names an actor its metadata contradicts is refused rather than answered
 	// from that actor's entry.
