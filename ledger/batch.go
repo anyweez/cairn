@@ -114,7 +114,17 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			return b.failed(j, err)
 		}
 	}
-	return results.Close()
+	// Every handler above read its statement's result, the COMMIT tag among
+	// them, so the transaction is committed. Close then waits for the server
+	// to resynchronise after that — a round trip of its own — and a
+	// connection lost in between fails it with the commit already durable.
+	// The caller must hear that the message was recorded rather than that the
+	// transaction failed.
+	err := results.Close()
+	if err != nil && b.commits && b.hasCommit {
+		return &recordedError{err: err}
+	}
+	return err
 }
 
 // ErrRecorded reports that a batch's transaction committed, but a result could
@@ -125,9 +135,10 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 // it a second time.
 var ErrRecorded = errors.New("cairn: the message was recorded, but its result could not be read")
 
-// recordedError is a handler failing to read a result from a batch the
-// database had already committed. It carries the error that says what could
-// not be read, and matches ErrRecorded.
+// recordedError is an error from a batch the database had already committed:
+// a handler failed to read a result, or closing the results failed after the
+// commit. It carries the error that says what could not be read, and matches
+// ErrRecorded.
 type recordedError struct{ err error }
 
 func (e *recordedError) Error() string { return fmt.Sprintf("%v: %v", ErrRecorded, e.err) }
