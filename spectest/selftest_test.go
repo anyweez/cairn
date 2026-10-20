@@ -194,8 +194,8 @@ func machine() acct {
 }
 
 func TestCorrectMachinePasses(t *testing.T) {
-	if msg, failed := spectest.Fails(t, machine().Check); failed {
-		t.Fatalf("the correct machine failed: %s", msg)
+	if msg, failed, err := spectest.Fails(t, machine().Check); err != nil || failed {
+		t.Fatalf("the correct machine failed: err=%v %s", err, msg)
 	}
 }
 
@@ -453,8 +453,8 @@ func TestProposedModelReportsWithoutFailing(t *testing.T) {
 	m.Models = []spectest.Refinement[account, msg, int]{spectest.Refines(model)}
 
 	var violations []spectest.Violation
-	if msg, failed := spectest.Fails(t, func(t rapid.TB) { violations = m.CheckReport(t) }); failed {
-		t.Fatalf("a proposed model failed the check: %s", msg)
+	if msg, failed, err := spectest.Fails(t, func(t rapid.TB) { violations = m.CheckReport(t) }); err != nil || failed {
+		t.Fatalf("a proposed model failed the check: err=%v %s", err, msg)
 	}
 	if len(violations) != 1 || violations[0].Rule.ID != refinesLedger().ID {
 		t.Fatalf("want one violation of %s, got %+v", refinesLedger().ID, violations)
@@ -480,7 +480,10 @@ func TestInvariantCatchesOverdraft(t *testing.T) {
 
 func assertCaught(t *testing.T, m acct, rule, detail string) {
 	t.Helper()
-	msg, failed := spectest.Fails(t, m.Check)
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil {
+		t.Fatalf("the check died; %s should have caught the mutant: %v", rule, err)
+	}
 	if !failed {
 		t.Fatalf("the mutant survived; %s should have caught it", rule)
 	}
@@ -501,14 +504,14 @@ func TestKindMustMatchTheCheck(t *testing.T) {
 	model := ledgerModel()
 	model.Rule = wrong
 	m.Models = []spectest.Refinement[account, msg, int]{spectest.Refines(model)}
-	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A2 is checked by a model, so its Kind must be Refines") {
-		t.Fatalf("a model whose rule is not Refines must fail the check, got %q", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || !failed || !strings.Contains(msg, "A2 is checked by a model, so its Kind must be Refines") {
+		t.Fatalf("a model whose rule is not Refines must fail the check, got err=%v %q", err, msg)
 	}
 
 	m = machine()
 	m.Changes = []spec.Change[account, msg]{{Rule: refinesLedger(), Check: func(account, msg, account) spec.Verdict { return spec.Pass }}}
-	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A2 is checked by a change, not a model") {
-		t.Fatalf("a change whose rule is Refines must fail the check, got %q", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || !failed || !strings.Contains(msg, "A2 is checked by a change, not a model") {
+		t.Fatalf("a change whose rule is Refines must fail the check, got err=%v %q", err, msg)
 	}
 }
 
@@ -519,13 +522,13 @@ func TestChangesAreJudged(t *testing.T) {
 		return spec.Check(after.Balance >= 0, "balance went from %d to %d", before.Balance, after.Balance)
 	}}}
 	m.Invariants = nil
-	if msg, failed := spectest.Fails(t, m.Check); failed {
-		t.Fatalf("a change that holds must pass: %s", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || failed {
+		t.Fatalf("a change that holds must pass: err=%v %s", err, msg)
 	}
 	m.Changes[0].Check = func(before account, _ msg, after account) spec.Verdict {
 		return spec.Check(after.Balance <= before.Balance, "balance rose from %d to %d", before.Balance, after.Balance)
 	}
-	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "A1 violated") {
-		t.Fatalf("a change that fails must fail the check, got %q", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || !failed || !strings.Contains(msg, "A1 violated") {
+		t.Fatalf("a change that fails must fail the check, got err=%v %q", err, msg)
 	}
 }

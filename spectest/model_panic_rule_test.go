@@ -54,10 +54,10 @@ func TestModelPanicNamesItsRule(t *testing.T) {
 				Messages: func(t *rapid.T, _ int) int { return rapid.IntRange(1, 2).Draw(t, "msg") },
 				Models:   []spectest.Refinement[int, int, int]{spectest.Refines(tc.model)},
 			}
-			msg, failed := spectest.Fails(t, m.Check)
-			if !failed || !strings.Contains(msg, rule.ID+" violated") {
-				t.Fatalf("a panic in the model's %s must be reported as %s violated, got failed=%v:\n%s",
-					tc.name, rule.ID, failed, msg)
+			msg, failed, err := spectest.Fails(t, m.Check)
+			if err != nil || !failed || !strings.Contains(msg, rule.ID+" violated") {
+				t.Fatalf("a panic in the model's %s must be reported as %s violated, got err=%v failed=%v:\n%s",
+					tc.name, rule.ID, err, failed, msg)
 			}
 		})
 	}

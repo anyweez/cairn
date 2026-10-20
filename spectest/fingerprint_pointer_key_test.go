@@ -47,7 +47,10 @@ func TestIsolatedCatchesAPointerKeySwap(t *testing.T) {
 		},
 		Messages: func(t *rapid.T, _ map[*int]string) int { return rapid.IntRange(1, 2).Draw(t, "msg") },
 	}
-	msg, failed := Fails(t, m.Check)
+	msg, failed, err := Fails(t, m.Check)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !failed || !strings.Contains(msg, Isolated.ID+" violated") {
 		t.Fatalf("Evolve mutating a shared pointer-keyed map must be caught by %s, got failed=%v: %s",
 			Isolated.ID, failed, msg)

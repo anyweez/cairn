@@ -1,6 +1,7 @@
 package spectest
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,30 +11,56 @@ import (
 	"github.com/anyweez/cairn/spec"
 )
 
-// Fails runs check against a recorder instead of the real test and returns the
-// first failure a spectest rule reported, unshrunk, if any. It is how a spec
-// proves it has teeth: swap in a mutant Decider, and assert the check fails.
+// Fails runs check against a recorder instead of the real test and reports how
+// it finished. It is how a spec proves it has teeth: swap in a mutant Decider,
+// and assert the check fails — and that the rule the mutant was aimed at is
+// the one that fired.
 //
 //	m := machine()
 //	m.Decider.Decide = mutant
-//	if _, failed := spectest.Fails(t, m.Check); !failed { t.Fatal("mutant survived") }
+//	msg, failed, err := spectest.Fails(t, m.Check)
+//	if err != nil {
+//		t.Fatalf("the check did not finish cleanly: %v", err)
+//	}
+//	if !failed || !strings.Contains(msg, "B1 violated") {
+//		t.Fatal("mutant survived")
+//	}
 //
-// A generation shortfall is not a rule failure: a Messages generator that
-// rejects most draws with t.Skip makes rapid report "only generated N valid
-// tests", and counting that would let the mutant test pass without the rule
-// ever being exercised. A check that died is a failure, though: a panic in
-// user code with no rule to attribute it to (the Messages generator is the one
-// left) reaches rapid, which reports it on that same channel, and a mutant
-// test must not pass on a machine no run finished checking.
+// Asserting on the rule's name as well as on failed is what keeps a mutant
+// from passing because the wrong rule fired.
+//
+// Fails has three outcomes, not two:
+//
+//   - failed=true: a rule was violated, or the machine said something
+//     spectest refuses outright (a law whose Kind is Refines, an established
+//     rule that never applied). The message carries the rule's name. This is
+//     the kill a mutant test wants.
+//   - err != nil: the check did not produce a verdict. The Messages generator
+//     — the one piece of user code no rule guards — panicked, or rapid's
+//     harness gave up in a way Fails has no rule to attribute. Neither kill
+//     nor survival, so a mutant test that hits this one fails loudly instead
+//     of passing without a rule having caught anything.
+//   - otherwise: the check finished, no rule fired; the mutant survived.
 //
 // A mutant's failure is the expected outcome, not one to reproduce later, so
-// Fails does not let rapid see it: a saved fail file would be replayed against
-// the next mutant of the same test name instead of letting it search, and
-// shrinking costs seconds per mutant (tens of seconds under -race). Instead the
-// first violation is recorded and the check winds down without failing rapid.
-// No process-wide rapid flag is changed, so a Fails may run beside a parallel
-// Check.
-func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
+// Fails does not let rapid see it: rapid would shrink it and save a fail file
+// under the outer test's name, which the next run of the same name replays
+// instead of drawing again, and both paths read the process-wide rapid flags
+// a concurrent Check also reads. Instead the first violation is recorded and
+// the check winds down without failing rapid. No process-wide rapid flag is
+// changed, so a Fails may run beside a parallel Check. (A check that dies
+// still travels rapid's teardown on the way out — the death is attributed
+// below — so it may leave a fail file under the test's name: delete
+// testdata/rapid/<name> before re-running a mutant test whose machine has
+// changed.)
+//
+// What Fails reports is decided from what the code did — a verdict a rule
+// recorded, or spectest refusing the machine — never from the wording of
+// rapid's reports: every report reaching the recorder that spectest has not
+// itself marked is treated as a check that produced no verdict, whatever it
+// says. So a rapid this file has not been met cannot make a surviving mutant
+// pass again.
+func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool, err error) {
 	t.Helper()
 	r := &recorder{TB: t}
 	func() {
@@ -44,7 +71,10 @@ func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool) {
 		}()
 		check(r)
 	}()
-	return r.message.String(), r.violated
+	if r.died {
+		return r.message.String(), false, errors.New("the check did not finish cleanly: " + r.death)
+	}
+	return r.message.String(), r.violated, nil
 }
 
 var errStop = &struct{ string }{"spectest: recorded failure"}
@@ -55,11 +85,18 @@ type recorder struct {
 	// including rapid's own harness messages, so rapid's run loop behaves as it
 	// would against a real *testing.T.
 	failed bool
-	// violated is set when a rule is violated and when rapid reports that the
-	// check itself died, so Fails can tell either from the generation-shortfall
-	// message a rejecting generator produces. See Errorf.
+	// violated is set when a rule is violated and when spectest refuses the
+	// machine outright, so Fails can tell a caught mutant from a check that
+	// produced no verdict. See markViolation.
 	violated bool
-	message  strings.Builder
+	// died is set when the check finished without a verdict: a report rapid's
+	// harness makes that spectest has not recorded a violation for (see
+	// Errorf). It stops the check the way a violation does, so no later run
+	// redraws the same death.
+	died    bool
+	message strings.Builder
+	// death is the detail of the first thing that made the check inconclusive.
+	death string
 }
 
 // recordViolation is how judge reports an established rule violation while
@@ -75,26 +112,30 @@ func (r *recorder) recordViolation(rule spec.Rule, detail string) bool {
 	return true
 }
 
-// stopping reports that a violation has already been recorded, so the rest of
-// the check can be skipped.
-func (r *recorder) stopping() bool { return r.violated }
+// stopping reports that a violation has already been recorded or the check has
+// died, so the rest of it proves nothing and can be skipped.
+func (r *recorder) stopping() bool { return r.violated || r.died }
 
 // markViolation records that the check failed for a reason other than a rule
-// verdict counting: spectest reported it directly (a Kind mismatch, a vacuous
-// rule), or rapid reported that the check died. Either way Fails returns it as
-// a failure, unlike the generation shortfall, which does not call this.
+// verdict counting: spectest reporting one directly (a Kind mismatch, a
+// vacuous rule). Either way Fails returns it as a kill, unlike an unattributed
+// report from rapid's harness, which is a check that produced no verdict.
 func (r *recorder) markViolation() { r.violated = true }
 
-// checkDied reports whether format is rapid's own report that a check died
-// rather than simply found nothing: a panic in the property, a failure it
-// could not attribute to a rule, or a failure it could not reproduce. All are
-// reported through testing.TB.Errorf, and the wording is what separates them
-// from the generation shortfall, which is the one message on that channel that
-// is not a failure. Anything else rapid starts reporting this way is treated
-// as a death, so a new rapid message cannot silently make Fails pass again.
-func checkDied(format string) bool {
-	return strings.HasPrefix(format, "[rapid] ") &&
-		!strings.HasPrefix(format, "[rapid] only generated ")
+// recordDeath records that the check ended without a verdict: rapid's
+// harness gave up on it (a panic in the Messages generator — the one piece of
+// user code no rule guards — a shortfall, a wording this checkout has not
+// met). It is a check that died, not a rule the machine violated: a mutant
+// whose broken state makes the Messages generator panic has not been caught
+// by anything, and must fail loudly, not pass.
+func (r *recorder) recordDeath(detail string) {
+	if r.died {
+		return
+	}
+	r.died = true
+	r.Fail()
+	fmt.Fprintf(&r.message, "the check did not finish cleanly: %s\n", detail)
+	r.death = detail
 }
 
 func (r *recorder) Log(args ...any)                 {}
@@ -102,21 +143,30 @@ func (r *recorder) Logf(format string, args ...any) {}
 func (r *recorder) Error(args ...any)               { r.Fail(); fmt.Fprintln(&r.message, args...) }
 func (r *recorder) Errorf(format string, args ...any) {
 	r.Fail()
-	if checkDied(format) {
-		// rapid reports that the property panicked (or failed in a way it could
-		// not attribute, or could not reproduce) through Errorf, the same
-		// channel as the generation shortfall above. Nothing else records it
-		// under Fails, so without this the check reads as one that found
-		// nothing. Failing closed on rapid's messages keeps that true if rapid
-		// adds another way to give up.
-		r.markViolation()
-		fmt.Fprint(&r.message, "the check did not finish: ")
+	if r.violated {
+		// spectest's own reporters mark the violation first (markViolation)
+		// and then say it: a Kind mismatch, a vacuous rule.
+		fmt.Fprintf(&r.message, format+"\n", args...)
+		return
 	}
-	fmt.Fprintf(&r.message, format+"\n", args...)
+	if r.died {
+		return
+	}
+	// An error the recorder has not itself marked is rapid's harness speaking
+	// once the runs are over. On a check that finished without dying, the only
+	// such report in rapid v1.2.0 is the generation shortfall ("only generated
+	// N valid tests"): a generator that rejected too many draws. Anything else
+	// this channel carries is a wording Fails has no rule to attribute. A
+	// shortfall is a check that never got its look at the rule — the mutant
+	// test has no verdict either way — so it is recorded as a death, not as a
+	// rule caught.
+	r.recordDeath(fmt.Sprintf(format, args...))
 }
 func (r *recorder) Fatal(args ...any)                 { r.Error(args...); r.FailNow() }
 func (r *recorder) Fatalf(format string, args ...any) { r.Errorf(format, args...); r.FailNow() }
 func (r *recorder) Fail()                             { r.failed = true }
+func (r *recorder) FailNow()                          { r.failed = true; panic(errStop) }
+func (r *recorder) Failed() bool                      { return r.failed }
 
 // markViolation is a no-op for a plain testing.TB: only Fails' recorder needs
 // to record a check that failed for a reason its rule verdicts do not show —
@@ -126,5 +176,3 @@ func markViolation(t rapid.TB) {
 		m.markViolation()
 	}
 }
-func (r *recorder) FailNow()     { r.failed = true; panic(errStop) }
-func (r *recorder) Failed() bool { return r.failed }

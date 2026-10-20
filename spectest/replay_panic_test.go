@@ -43,9 +43,9 @@ func TestReplayFoldPanicNamesARule(t *testing.T) {
 		}}},
 	}
 
-	msg, failed := spectest.Fails(t, m.Check)
-	if !failed {
-		t.Fatal("the check must fail when Initial panics on the replay call")
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed {
+		t.Fatalf("the check must fail when Initial panics on the replay call, got err=%v", err)
 	}
 	if !strings.Contains(msg, "D2 violated") && !strings.Contains(msg, "D5 violated") {
 		t.Fatalf("a panic in the replay fold must be attributed to the rule it violates, got:\n%s", msg)

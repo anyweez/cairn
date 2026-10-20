@@ -32,7 +32,10 @@ func TestFreezeRuleCatchesOptionsChangedWhileLeavingOpen(t *testing.T) {
 		return decide(s, msg)
 	}
 
-	msg, caught := spectest.Fails(t, m.Check)
+	msg, caught, err := spectest.Fails(t, m.Check)
+	if err != nil {
+		t.Fatalf("the freeze mutant made the check die instead of %s catching it: %v", FreezeOnSettle.ID, err)
+	}
 	if !caught {
 		t.Fatal("a message that changed a decision's options while moving it out of open survived the spec; the freeze rule did not catch it")
 	}

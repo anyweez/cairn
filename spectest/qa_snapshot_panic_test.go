@@ -31,9 +31,9 @@ func TestAStateWhoseJSONEncodingPanicsNamesD7(t *testing.T) {
 		Messages:  func(t *rapid.T, _ boomState) int { return rapid.Int().Draw(t, "n") },
 		Snapshots: true,
 	}
-	msg, failed := spectest.Fails(t, m.Check)
-	if !failed || !strings.Contains(msg, spectest.Snapshottable.ID) {
-		t.Fatalf("a state whose JSON encoding panics must fail %s with its rule named, got failed=%v:\n%s",
-			spectest.Snapshottable.ID, failed, msg)
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, spectest.Snapshottable.ID) {
+		t.Fatalf("a state whose JSON encoding panics must fail %s with its rule named, got err=%v failed=%v:\n%s",
+			spectest.Snapshottable.ID, err, failed, msg)
 	}
 }
