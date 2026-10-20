@@ -88,9 +88,12 @@ func TestAnEmbeddedUnexportedPointerAliasKeepsItsTaggedShape(t *testing.T) {
 	}
 
 	// Why that matters: an entry written by the old shape no longer decodes.
+	// The embedded pointer starts non-nil because encoding/json cannot allocate
+	// an unexported embedded pointer itself; it panics on a nil one rather than
+	// reporting the unknown field this assertion is about.
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	var into aliasPointerOuterV2
+	into := aliasPointerOuterV2{aliasPointerV2: &aliasPointerMetaV2{}}
 	if err := dec.Decode(&into); err == nil {
 		t.Fatalf("the old entry %s decoded into the new type, so the change is not a wire break", raw)
 	}
