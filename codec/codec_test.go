@@ -2,9 +2,11 @@ package codec_test
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anyweez/cairn/codec"
 )
@@ -103,6 +105,39 @@ func TestCheckStorableRejectsTextTheLedgerCannotKeep(t *testing.T) {
 				t.Fatalf("CheckStorable accepted %#v", v)
 			}
 		})
+	}
+}
+
+// time.Time is a json.Marshaler, so the walk would otherwise trust it; its
+// MarshalJSON rejects a year outside [0,9999] after Decide has accepted the
+// message. CheckStorable must reject it, and leave the encodable edges alone.
+func TestCheckStorableRejectsATimeJSONCannotEncode(t *testing.T) {
+	type stamped struct {
+		At time.Time `json:"at"`
+	}
+	for name, at := range map[string]time.Time{
+		"a negative year": time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC),
+		"year 10000":      time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := codec.CheckStorable(stamped{At: at})
+			if err == nil {
+				t.Fatalf("CheckStorable accepted a time it cannot encode: %v", at)
+			}
+			var notStorable *codec.NotStorableError
+			if !errors.As(err, &notStorable) {
+				t.Fatalf("got %v, want a NotStorableError", err)
+			}
+		})
+	}
+	for _, at := range []time.Time{
+		{},
+		time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC),
+	} {
+		if err := codec.CheckStorable(stamped{At: at}); err != nil {
+			t.Fatalf("CheckStorable rejected an encodable time %v: %v", at, err)
+		}
 	}
 }
 

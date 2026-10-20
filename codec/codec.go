@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"time"
 
 	"github.com/anyweez/cairn"
 )
@@ -104,30 +105,65 @@ func (c *Codec[T]) Encode(v T) (Envelope, error) {
 	return Envelope{Type: e.name, Version: e.version, Data: data}, nil
 }
 
-// NotStorableError names the field of a value that carries text the ledger
-// cannot store. It is returned by Encode and reported by CheckStorable.
+// NotStorableError names the field of a value the ledger cannot store. It is
+// returned by Encode and reported by CheckStorable.
 type NotStorableError struct {
 	Path string
+	// Reason says why the value cannot be stored. An empty Reason means text
+	// that is not valid UTF-8 or contains a NUL.
+	Reason string
 }
 
 func (e *NotStorableError) Error() string {
-	return fmt.Sprintf("%s is not valid UTF-8 or contains a NUL, so it cannot be stored", e.Path)
+	reason := e.Reason
+	if reason == "" {
+		reason = "is not valid UTF-8 or contains a NUL"
+	}
+	return fmt.Sprintf("%s %s, so it cannot be stored", e.Path, reason)
 }
 
-// CheckStorable reports whether every string in v can be stored in the ledger
-// and read back unchanged. json.Marshal replaces a string that is not valid
-// UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
-// would silently store text the caller never wrote.
+// CheckStorable reports whether v can be stored in the ledger and read back
+// unchanged. json.Marshal replaces a string that is not valid UTF-8 with
+// U+FFFD, and Postgres jsonb cannot represent a NUL, so either would silently
+// store text the caller never wrote. A time.Time outside the years JSON can
+// encode would instead fail at Encode with time.Time's own marshal error.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalJSON
 // decides its own encoding and is not inspected, because those bytes are the
-// JSON. A type with its own MarshalText does not: json writes the text through
-// its own string encoder, so the bytes it returns are checked like any other
-// string. A MarshalText or MarshalJSON on the pointer to the value counts too
-// wherever json reaches the value addressably, which is a slice or array
-// element, or a field of a struct behind a pointer.
+// JSON — except time.Time, whose MarshalJSON rejects years outside [0,9999].
+// A type with its own MarshalText does not decide its encoding: json writes the
+// text through its own string encoder, so the bytes it returns are checked like
+// any other string. A MarshalText or MarshalJSON on the pointer to the value
+// counts too wherever json reaches the value addressably, which is a slice or
+// array element, or a field of a struct behind a pointer.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
+}
+
+var (
+	timeType      = reflect.TypeFor[time.Time]()
+	ptrToTimeType = reflect.PointerTo(timeType)
+)
+
+// checkStorableTime catches the one json.Marshaler whose encoding can fail for
+// a value a caller can construct: time.Time renders only years in [0,9999],
+// and json.Marshal rejects the rest. Returning false means v is not a time.
+func checkStorableTime(v reflect.Value, path string) (bool, error) {
+	switch v.Type() {
+	case timeType:
+	case ptrToTimeType:
+		if v.IsNil() {
+			return true, nil
+		}
+		v = v.Elem()
+	default:
+		return false, nil
+	}
+	t := v.Interface().(time.Time)
+	if y := t.Year(); y < 0 || y > 9999 {
+		return true, &NotStorableError{Path: path, Reason: fmt.Sprintf("has year %d, outside the range JSON can encode ([0,9999])", y)}
+	}
+	return true, nil
 }
 
 // visit identifies a pointer, map or slice on the walk's current path, so a
@@ -156,6 +192,9 @@ func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
 func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	if !v.IsValid() {
 		return nil
+	}
+	if ok, err := checkStorableTime(v, path); ok {
+		return err
 	}
 	// json.Marshal uses a pointer-receiver MarshalJSON or MarshalText whenever
 	// the value is addressable — a slice or array element, or a struct behind a
