@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -264,6 +265,25 @@ func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
 // not runes, because that is how Postgres measures UTF-8 text.
 const maxIndexedTextBytes = 1024
 
+// maxQuotedTextBytes bounds how much of a rejected value an error quotes. The
+// caller already has the value it sent, so echoing an 8KB one back costs it
+// 8KB of log or response and tells it nothing it did not know.
+const maxQuotedTextBytes = 64
+
+// quoteText renders v for an error message: all of it when it is short enough
+// to be worth reading, and otherwise at most maxQuotedTextBytes, cut on a rune
+// boundary, with an ellipsis showing the rest was left out.
+func quoteText(v string) string {
+	if len(v) <= maxQuotedTextBytes {
+		return fmt.Sprintf("%q", v)
+	}
+	cut := maxQuotedTextBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%q…", v[:cut])
+}
+
 // validStream refuses a stream whose name could be another's (the name joins
 // kind and ID with a slash, so a kind may not contain one), that Postgres
 // cannot store, or whose name is too long for the btree indexes that key on
@@ -276,8 +296,9 @@ func validStream(st Stream) error {
 	if !cairn.StorableText(st.Kind) || !cairn.StorableText(st.ID) {
 		return fmt.Errorf("cairn: invalid stream %q: the name is not valid UTF-8 or contains a NUL", st)
 	}
-	if len(st.String()) > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: invalid stream %q: the name is longer than %d bytes", st, maxIndexedTextBytes)
+	if n := len(st.String()); n > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: invalid stream %s: the name is %d bytes, longer than the %d-byte limit",
+			quoteText(st.String()), n, maxIndexedTextBytes)
 	}
 	return nil
 }
@@ -292,8 +313,9 @@ func validKind(kind string) error {
 	if !cairn.StorableText(kind) {
 		return fmt.Errorf("cairn: invalid stream kind %q: the name is not valid UTF-8 or contains a NUL", kind)
 	}
-	if len(kind) > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: invalid stream kind %q: the kind is longer than %d bytes", kind, maxIndexedTextBytes)
+	if n := len(kind); n > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: invalid stream kind %s: the kind is %d bytes, longer than the %d-byte limit",
+			quoteText(kind), n, maxIndexedTextBytes)
 	}
 	return nil
 }
@@ -372,8 +394,9 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if e.IdempotencyKey != "" {
 		key = &e.IdempotencyKey
 	}
-	if e.IdempotencyKey != "" && len(e.IdempotencyKey) > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: the idempotency key for %s is longer than %d bytes", stream, maxIndexedTextBytes)
+	if n := len(e.IdempotencyKey); e.IdempotencyKey != "" && n > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: the idempotency key %s for %s is %d bytes, longer than the %d-byte limit",
+			quoteText(e.IdempotencyKey), stream, n, maxIndexedTextBytes)
 	}
 	for _, text := range []struct {
 		name  string
@@ -387,8 +410,9 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 		if !cairn.StorableText(text.value) {
 			return fmt.Errorf("cairn: metadata %s for %s is not valid UTF-8 or contains a NUL", text.name, stream)
 		}
-		if len(text.value) > maxIndexedTextBytes {
-			return fmt.Errorf("cairn: metadata %s for %s is longer than %d bytes", text.name, stream, maxIndexedTextBytes)
+		if n := len(text.value); n > maxIndexedTextBytes {
+			return fmt.Errorf("cairn: metadata %s %s for %s is %d bytes, longer than the %d-byte limit",
+				text.name, quoteText(text.value), stream, n, maxIndexedTextBytes)
 		}
 	}
 	extra := []byte(`{}`)

@@ -66,7 +66,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Ki
 // method runs it first, so a mistake is an error rather than a nil-pointer
 // panic on the first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
-	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
+	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %s: %s", quoteText(a.Kind), what) }
 	switch {
 	case a.Store == nil:
 		return fail("Store is nil")
@@ -78,7 +78,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		// otherwise reach the driver and come back as a raw SQLSTATE.
 		return fail("Kind must be valid UTF-8 and contain no NUL")
 	case len(a.Kind) > maxIndexedTextBytes:
-		return fail(fmt.Sprintf("Kind must be at most %d bytes", maxIndexedTextBytes))
+		return fail(fmt.Sprintf("Kind is %d bytes, longer than the %d-byte limit", len(a.Kind), maxIndexedTextBytes))
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
@@ -178,8 +178,9 @@ func collect(opts []Option) (options, error) {
 	if !cairn.StorableText(o.key) {
 		return o, fmt.Errorf("cairn: the idempotency key is not valid UTF-8 or contains a NUL")
 	}
-	if len(o.key) > maxIndexedTextBytes {
-		return o, fmt.Errorf("cairn: the idempotency key is longer than %d bytes", maxIndexedTextBytes)
+	if n := len(o.key); n > maxIndexedTextBytes {
+		return o, fmt.Errorf("cairn: the idempotency key %s is %d bytes, longer than the %d-byte limit",
+			quoteText(o.key), n, maxIndexedTextBytes)
 	}
 	return o, nil
 }
