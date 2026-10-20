@@ -138,9 +138,34 @@ ORDER BY c.id`,
 	// Outcomes are recorded even when ctx is cancelled mid-batch, so an effect
 	// that was carried out is not carried out again after shutdown.
 	record := context.WithoutCancel(ctx)
+	// giveBack returns the effects the walk did not reach to the state the claim
+	// found them in: the claim counted an attempt against every row in the
+	// batch, but an attempt is spent by a delivery, so a dispatcher stopped
+	// mid-batch — the ordinary shutdown — must not leave the rows behind the one
+	// in flight counted, or the next drain gives up on them without ever
+	// handing them out. One round trip; fenced row by row against the claim's
+	// own attempt count, so an effect another dispatcher has since reclaimed is
+	// left with that dispatcher's count.
+	giveBack := func(rest []claimed) error {
+		if len(rest) == 0 {
+			return nil
+		}
+		ids := make([]int64, len(rest))
+		atts := make([]int, len(rest))
+		for i, r := range rest {
+			ids[i], atts[i] = r.id, r.attempts
+		}
+		_, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox o
+SET attempts = o.attempts - 1, available_at = now()
+FROM unnest($1::bigint[], $2::int[]) AS u(id, att)
+WHERE o.id = u.id AND o.attempts = u.att AND o.done_at IS NULL AND o.failed_at IS NULL`, ids, atts)
+		return err
+	}
 	const fenced = ` AND attempts = $2 AND done_at IS NULL AND failed_at IS NULL`
-	for _, c := range batch {
+	for i := range batch {
+		c := batch[i]
 		if ctx.Err() != nil {
+			giveBack(batch[i:]) // not the reason the walk stopped
 			return len(batch), ctx.Err()
 		}
 		// Claimed more times than allowed without an outcome being recorded:
@@ -157,6 +182,7 @@ last_error = coalesce(last_error, 'no outcome recorded after ' || $3::int || ' a
 		tag, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox
 SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id, c.attempts, cfg.lease.Seconds())
 		if err != nil {
+			giveBack(batch[i:]) // c's update failed, so it was not handed out either
 			return len(batch), err
 		}
 		if tag.RowsAffected() == 0 {
@@ -180,6 +206,7 @@ SET available_at = now() + make_interval(secs => $3), last_error = $4 WHERE id =
 				c.id, c.attempts, cfg.backoff(c.attempts).Seconds(), storableError(err))
 		}
 		if err != nil {
+			giveBack(batch[i+1:]) // c was handed out; the rows behind it were not
 			return len(batch), err
 		}
 	}
