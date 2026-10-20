@@ -37,6 +37,29 @@ func TestABatchThatCommittedBeforeACloseErrorSaysSo(t *testing.T) {
 // committed but before the server resynchronises.
 type closeFailsSender struct{}
 
+// A batch that queues no COMMIT has nothing send can vouch for when Close
+// fails: its statements may have rolled back, or a caller's transaction may
+// still be open. Only a batch that ended its own transaction has a commit to
+// report.
+func TestABatchThatDidNotCommitDoesNotSaySoWhenCloseFails(t *testing.T) {
+	t.Parallel()
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(execResult, `INSERT INTO recorded VALUES (1)`)
+	// The cached path used to send a batch that declared itself committing
+	// without queuing a COMMIT.
+	b.commits = true
+
+	err := b.send(context.Background(), closeFailsSender{})
+	if err == nil {
+		t.Fatal("send returned nil, want the lost connection's error")
+	}
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v, but the batch queued no COMMIT to have committed", err)
+	}
+}
+
 func (closeFailsSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
 	return &closeFailsResults{remaining: b.Len()}
 }
