@@ -582,23 +582,55 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 }
 
 // logFence measures the global log's read cutoff and stores it in the
-// transaction-local setting cairn.fence, for the read that follows it.
+// transaction-local setting cairn.fence, for the read that follows it in the
+// same batch.
 //
-// Transaction IDs are assigned by the cluster, so pg_snapshot_xmin is the
-// oldest transaction on the whole server: an idle transaction in another
-// database would hold this one's committed entries back. Only a transaction
-// in this database can write to cairn.entries here, so the fence is this
-// database's smallest in-flight transaction ID, not the cluster's.
+// Transaction IDs are assigned by the cluster, so a cutoff measured from the
+// snapshot views alone (pg_snapshot_xmin on the whole server) would let an
+// idle transaction in another database hold this one's committed entries
+// back. Only a transaction in this database can write to cairn.entries here,
+// so the fence is this database's smallest in-flight transaction ID, not the
+// cluster's. pg_stat_activity supplies the ordinary transactions and
+// pg_prepared_xacts the prepared ones — a prepared transaction has no
+// backend — and widenedXid widens both sources' 32-bit xids, which carry no
+// epoch, onto the xid8 scale cairn.entries.txid is stored and ordered on.
 //
-// Measuring the in-flight set in a statement of its own, before the read's
-// snapshot, is what makes the cutoff sound. A transaction that is in flight
-// when the read takes its snapshot either already existed at the measurement,
-// and is in the measured set, or was assigned its transaction ID after it,
-// and is at or above the measured pg_snapshot_xmax. LEAST of the two bounds
-// every such transaction. Measuring inside the read would be unsound: its
-// snapshot is taken before its own subqueries read pg_stat_activity, so a
-// transaction that commits in between is neither visible to the snapshot nor
-// counted in the in-flight set.
+// The reference the widening reads against is measured alongside: this
+// statement's own xid (pg_current_xact_id assigns one when the transaction
+// has none), plus one — the next xid the cluster will hand out, split into
+// its low 32 bits and its epoch. Every live transaction's ID was handed out
+// within one wrap of the next one to be assigned (Postgres's wraparound
+// handling refuses new xids long before a live transaction could fall two
+// wraps behind), so the widening is exact under that reference: an xid above
+// the reference's low half is the wrap it came from, so it belongs to the
+// previous epoch; anything else is the current one.
+//
+// pg_snapshot_xmax was the other candidate and is wrong: it is the latest
+// completed transaction plus one, not the next to assign, and a transaction
+// whose xid is ahead of that completion frontier (the newest assigned, still
+// in flight under any load) widens a wrap too low. The fence would sit
+// below every stored entry for as long as one of them is open — under write
+// load, always — which is what the epoch-less cast did to begin with.
+//
+// Measuring in a statement of its own, before the read's snapshot, is what
+// makes the cutoff sound. A transaction that is in flight when the read
+// takes its snapshot either already existed at the measurement, and is in
+// the measured set with its widened true value, or was assigned its
+// transaction ID after — that is, at or above this statement's own xid — and
+// the fence never rises above that. Measuring inside the read would be
+// unsound: its snapshot is taken before its own subqueries read
+// pg_stat_activity, so a transaction that commits in between is neither
+// visible to the snapshot nor counted in the in-flight set.
+//
+// The read's snapshot has to be taken after the fence statement's. Under
+// READ COMMITTED every statement gets its own, so the batch below holds.
+// Under REPEATABLE READ a transaction reuses the snapshot its first statement
+// took, and the first statement of CatchUp's transaction — its checkpoint
+// read — predates the fence, so a transaction that commits after the fence
+// but before the read would be invisible to the read while its cursor
+// position has already been passed. CatchUp's transactions are therefore
+// begun READ COMMITTED; a caller of the internal readAll that opens its own
+// transaction must do the same.
 //
 // The fence must also be the first read of pg_stat_activity in its
 // transaction: that view is cached for the transaction's lifetime, so a
@@ -607,35 +639,41 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // transaction that started since, skipping its entries. CatchUp opens one
 // transaction per batch to keep this true.
 //
-// A prepared transaction has no backend in pg_stat_activity, so pg_prepared_xacts
-// supplies it. The two minima are combined with LEAST, not COALESCE: an older
-// prepared transaction must bound the fence even while a newer ordinary one is
-// open, or its later commit would land behind a cursor that already passed it.
+// backend_xid is visible to every role on the servers this runs against:
+// PostgreSQL 17 made it unconditional, so a deployment with several writer
+// roles does not lose the guard and nothing here needs a fallback for a
+// privilege gap. (Verified against 17.11, as an unprivileged role watching a
+// transaction held open in another session.) On older servers the column is
+// hidden without pg_read_all_stats; such a deployment needs that privilege.
 //
-// pg_stat_activity.backend_xid is visible to every role in PostgreSQL 17, so a
-// deployment with several writer roles does not lose the guard. If a session
-// in this database holds a transaction but its backend_xid is hidden, the
-// reader lacks the privilege to see it; rather than silently drop that
-// transaction from the fence, fall back to the cluster-wide pg_snapshot_xmin,
-// which is conservative but sound.
-const logFence = `SELECT set_config('cairn.fence', (
-  CASE WHEN EXISTS (
-    SELECT 1 FROM pg_locks l
-    JOIN pg_stat_activity a ON a.pid = l.pid
-    WHERE l.locktype = 'transactionid' AND l.mode = 'ExclusiveLock' AND l.granted
-      AND a.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
-      AND a.backend_xid IS NULL
-  ) THEN pg_snapshot_xmin(pg_current_snapshot())
-  ELSE LEAST(
-    COALESCE((SELECT min(backend_xid::text::xid8) FROM pg_stat_activity
-              WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())),
-             '18446744073709551615'::xid8),
-    COALESCE((SELECT min(transaction::text::xid8) FROM pg_prepared_xacts
-              WHERE database = current_database()),
-             '18446744073709551615'::xid8),
-    pg_snapshot_xmax(pg_current_snapshot())
-  )
-  END)::text, true)`
+// One blind spot the widening cannot treat differently from the exact case:
+// a 32-bit xid carries no epoch, so nothing can say how many wraps an older
+// one is past. A live transaction is within one wrap by construction, but a
+// prepared one can sit across any number of them. A prepared transaction
+// still open after the cluster has consumed another 2^32 xids widens a wrap
+// too high, and a reader could pass its commit. pg_prepared_xacts is meant
+// to be emptied out — a prepared transaction is committed or rolled back in
+// ordinary operation, and cairn's own tests roll theirs back — so the fence
+// assumes nothing is still there across a wrap.
+const widenedXid = `CASE WHEN x.thumb > ref.low
+       THEN (ref.epoch - 1) * 4294967296::numeric + x.thumb
+       ELSE            ref.epoch * 4294967296::numeric + x.thumb
+  END::text::xid8`
+
+const fenceRef = `
+    (SELECT (own.xid + 1) % 4294967296::numeric AS low,
+            floor((own.xid + 1) / 4294967296::numeric) AS epoch
+       FROM (SELECT pg_current_xact_id()::text::numeric AS xid) AS own)`
+
+const logFence = `SELECT set_config('cairn.fence', COALESCE((
+  SELECT min(` + widenedXid + `)
+  FROM (SELECT backend_xid::text::numeric AS thumb FROM pg_stat_activity
+        WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        UNION ALL
+        SELECT transaction::text::numeric FROM pg_prepared_xacts
+        WHERE database = current_database()) AS x(thumb)
+  CROSS JOIN ` + fenceRef + ` AS ref
+), '18446744073709551615'::xid8)::text, true)`
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	for _, kind := range kinds {

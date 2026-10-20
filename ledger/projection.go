@@ -65,7 +65,13 @@ func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 	total := 0
 	for {
 		n := 0
-		err := pgx.BeginFunc(ctx, p.Store.pool, func(tx pgx.Tx) error {
+		// READ COMMITTED is required, not the default: under REPEATABLE READ the
+		// transaction's snapshot would be taken here, before readAll measures the
+		// log fence, and a transaction committing in between would be invisible
+		// to the read while the fence had already passed it. The fence has to be
+		// the batch's first pg_stat_activity read, so the isolation is set on the
+		// BEGIN, not with a SET inside it.
+		err := pgx.BeginTxFunc(ctx, p.Store.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 			// Read the batch before touching the checkpoint row: locking it gives
 			// this transaction an ID, and the log only shows entries older than
 			// every running transaction.
