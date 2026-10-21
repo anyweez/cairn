@@ -2,6 +2,10 @@ package codec_test
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"slices"
 	"strings"
 	"testing"
@@ -211,6 +215,99 @@ func TestRegistrationsNameADefinedCompositeAsGoTypesDoes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.sum(t); got != tc.want {
 				t.Errorf("sum: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+type hasM struct{}
+
+func (hasM) M() int { return 0 }
+
+type hasTwo struct{}
+
+func (hasTwo) M() int   { return 0 }
+func (hasTwo) N(string) {}
+
+// goTypesName type-checks a type expression the way cmd/cairn-manifest reads a
+// sum and returns the string it records for it.
+func goTypesName(t *testing.T, pkg, expr string) string {
+	t.Helper()
+	src := "package codec_test\n\ntype namedListing []string\n\ntype hasM struct{}\n\nfunc (hasM) M() int { return 0 }\n\nvar _ " + expr + "\n"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "sum.go", src, 0)
+	if err != nil {
+		t.Fatalf("parsing %q: %v", expr, err)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	if _, err := (&types.Config{}).Check(pkg, fset, []*ast.File{f}, info); err != nil {
+		t.Fatalf("type-checking %q: %v", expr, err)
+	}
+	vs := f.Decls[len(f.Decls)-1].(*ast.GenDecl).Specs[0].(*ast.ValueSpec)
+	return types.TypeString(types.Unalias(info.Types[vs.Type].Type), nil)
+}
+
+// sumName is the sum named by the runtime half of the manifest cross-check for
+// a codec that registers V as T.
+func sumName[V, T any](t *testing.T) string {
+	t.Helper()
+	c := codec.New[T]()
+	codec.Register[V](c, "test.value", 1)
+	rs := c.Registrations()
+	if len(rs) != 1 {
+		t.Fatalf("got %d registrations, want 1", len(rs))
+	}
+	return rs[0].Sum
+}
+
+// An unnamed type is named by go/types in its own spelling, which is not
+// reflect's: `any` not `interface {}`, `struct{X int}` not `struct { X int }`.
+// cmd/cairn-manifest records the sum with go/types, so the runtime half of the
+// cross-check has to produce the same string or one correct codec is reported
+// as both missing from the manifest and extra in the codecs. Each case below
+// compares against go/types' answer for the same source expression.
+func TestRegistrationsNameAnUnnamedTypeAsGoTypesDoes(t *testing.T) {
+	const pkg = "github.com/anyweez/cairn/codec_test"
+	const tag = "`json:\"n\"`"
+	for _, tc := range []struct {
+		name string
+		expr string
+		sum  func(*testing.T) string
+	}{
+		{"the empty interface", "any", sumName[struct{ N int }, any]},
+		{"an interface with a method", "interface{ M() int }", sumName[hasM, interface{ M() int }]},
+		{"an interface with two methods", "interface{ M() int; N(string) }", sumName[hasTwo, interface {
+			M() int
+			N(string)
+		}]},
+		{"a struct", "struct{ N int; S string }", sumName[struct {
+			N int
+			S string
+		}, struct {
+			N int
+			S string
+		}]},
+		{"a struct tag", "struct{ N int " + tag + " }", sumName[struct {
+			N int `json:"n"`
+		}, struct {
+			N int `json:"n"`
+		}]},
+		{"an embedded field", "struct{ hasM }", sumName[struct{ hasM }, struct{ hasM }]},
+		{"a slice", "[]string", sumName[[]string, []string]},
+		{"a map", "map[string]int", sumName[map[string]int, map[string]int]},
+		{"an array", "[2]int", sumName[[2]int, [2]int]},
+		{"a pointer", "*int", sumName[*int, *int]},
+		{"a send channel", "chan<- int", sumName[chan<- int, chan<- int]},
+		{"a receive channel", "<-chan int", sumName[<-chan int, <-chan int]},
+		{"a function", "func(int, ...string) (int, error)", sumName[func(int, ...string) (int, error), func(int, ...string) (int, error)]},
+		{"a slice of a defined type", "[]namedListing", sumName[[]namedListing, []namedListing]},
+		{"a slice of the empty interface", "[]any", sumName[[]any, []any]},
+		{"a map of an interface", "map[string]interface{ M() int }", sumName[map[string]interface{ M() int }, map[string]interface{ M() int }]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := goTypesName(t, pkg, tc.expr)
+			if got := tc.sum(t); got != want {
+				t.Errorf("sum: got %q, go/types says %q", got, want)
 			}
 		})
 	}

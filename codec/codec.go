@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -753,7 +754,13 @@ func sortRegistrations(rs []Registration) {
 }
 
 // goTypeString renders a runtime type as go/types does for the manifest: a
-// named type with its full import path, a basic type by name.
+// named type with its full import path, a basic type by name, an unnamed type
+// in go/types' own spelling. reflect's Type.String is not that spelling — it
+// writes `interface {}` and `struct { X int }` where go/types writes `any` and
+// `struct{X int}` — so an unnamed composite is built here rather than borrowed
+// from it. `cmd/cairn-manifest` renders the other half with types.TypeString,
+// and a sum type the two name differently fails codec.CheckRegistrations in
+// both directions for one correct codec.
 func goTypeString(t reflect.Type) string {
 	// A defined type is named however its kind looks: `type Listing []string`
 	// is example.com/x.Listing to go/types, not []string. Ask for the name
@@ -771,11 +778,86 @@ func goTypeString(t reflect.Type) string {
 	case reflect.Slice:
 		return "[]" + goTypeString(t.Elem())
 	case reflect.Array:
-		return fmt.Sprintf("[%d]%s", t.Len(), goTypeString(t.Elem()))
+		return "[" + strconv.Itoa(t.Len()) + "]" + goTypeString(t.Elem())
 	case reflect.Map:
 		return "map[" + goTypeString(t.Key()) + "]" + goTypeString(t.Elem())
+	case reflect.Chan:
+		switch t.ChanDir() {
+		case reflect.RecvDir:
+			return "<-chan " + goTypeString(t.Elem())
+		case reflect.SendDir:
+			return "chan<- " + goTypeString(t.Elem())
+		}
+		return "chan " + goTypeString(t.Elem())
+	case reflect.Func:
+		return goFuncString(t)
+	case reflect.Struct:
+		return goStructString(t)
+	case reflect.Interface:
+		return goInterfaceString(t)
 	}
 	return t.String()
+}
+
+// goInterfaceString writes an interface as `any` or `interface{M() int}`.
+// go/types spells the empty interface `any`, and the extractor unaliases a sum
+// written that way to it, so the empty interface is `any` here. reflect has one
+// type for `any` and a written `interface{}` and cannot tell them apart, so a
+// sum spelled `interface{}` still names differently in the two halves.
+func goInterfaceString(t reflect.Type) string {
+	if t.NumMethod() == 0 {
+		return "any"
+	}
+	methods := make([]string, 0, t.NumMethod())
+	for i := range t.NumMethod() {
+		m := t.Method(i)
+		methods = append(methods, m.Name+strings.TrimPrefix(goFuncString(m.Type), "func"))
+	}
+	return "interface{" + strings.Join(methods, "; ") + "}"
+}
+
+// goStructString writes a struct as `struct{X int; Y string}`, the field name
+// omitted for an embedded field and the tag quoted as go/types quotes it.
+func goStructString(t reflect.Type) string {
+	fields := make([]string, 0, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		field := goTypeString(f.Type)
+		if !f.Anonymous {
+			field = f.Name + " " + field
+		}
+		if f.Tag != "" {
+			field += " " + strconv.Quote(string(f.Tag))
+		}
+		fields = append(fields, field)
+	}
+	return "struct{" + strings.Join(fields, "; ") + "}"
+}
+
+// goFuncString writes a signature as `func(int, ...string) (int, error)`.
+func goFuncString(t reflect.Type) string {
+	params := make([]string, 0, t.NumIn())
+	for i := range t.NumIn() {
+		in := t.In(i)
+		if t.IsVariadic() && i == t.NumIn()-1 {
+			in = in.Elem()
+			params = append(params, "..."+goTypeString(in))
+			continue
+		}
+		params = append(params, goTypeString(in))
+	}
+	s := "func(" + strings.Join(params, ", ") + ")"
+	switch t.NumOut() {
+	case 0:
+		return s
+	case 1:
+		return s + " " + goTypeString(t.Out(0))
+	}
+	results := make([]string, 0, t.NumOut())
+	for i := range t.NumOut() {
+		results = append(results, goTypeString(t.Out(i)))
+	}
+	return s + " (" + strings.Join(results, ", ") + ")"
 }
 
 // Registrations returns the registrations of all four codecs, sorted.
