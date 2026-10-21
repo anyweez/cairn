@@ -70,7 +70,8 @@ type Edge struct {
 // Extract loads the packages matching patterns in dir, with their tests, and
 // returns their manifest. Anything the manifest can't state exactly is an
 // error rather than a guess: a rule, table or codec registration whose values
-// aren't constants, or a rule ID declared twice.
+// aren't constants, a registration whose type comes from a generic helper's
+// type parameter, or a rule ID declared twice.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -345,6 +346,13 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 	case isFunc(info, call, codecPath, "Register"):
 		inst := info.Instances[callee(call)]
 		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
+		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
+		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
+			return
+		}
+		if !x.concrete(p, call.Pos(), sum, subject, "the codec a stored entry names comes from the caller's type argument") {
+			return
+		}
 		name, okName := x.constant(p, call.Args[1])
 		version, okVersion := x.constant(p, call.Args[2])
 		if !okName || !okVersion {
@@ -379,6 +387,9 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			recv = types.Unalias(ptr.Elem())
 		}
 		sum := recv.(*types.Named).TypeArgs().At(0)
+		if !x.concrete(p, call.Pos(), sum, "Upcast", "the codec this upcaster belongs to comes from the caller's type argument") {
+			return
+		}
 		name, okName := x.constant(p, call.Args[0])
 		from, okFrom := x.constant(p, call.Args[1])
 		if !okName || !okFrom {
@@ -409,6 +420,77 @@ func (x *extractor) upcastsToCodecs() {
 func (x *extractor) constant(p *packages.Package, e ast.Expr) (constant.Value, bool) {
 	tv, ok := p.TypesInfo.Types[e]
 	return tv.Value, ok && tv.Value != nil
+}
+
+// concrete reports whether t may be recorded as a stored type, and records an
+// error when it comes from a generic helper's type parameter. subject names the
+// declaration, consequence what is recorded in the parameter's place.
+//
+// codecCall reads the type arguments written at the call site, and inside a
+// generic helper those are the helper's own parameters. A parameter's JSON shape
+// is its constraint's — "=: any" for an unconstrained one — so every
+// instantiation of the helper would be recorded with that same shape and a wire
+// change to the type the caller supplies would pass -base. The manifest states
+// what is stored or it is an error, so the registration is refused rather than
+// recorded under the parameter.
+func (x *extractor) concrete(p *packages.Package, pos token.Pos, t types.Type, subject, consequence string) bool {
+	param := typeParam(t)
+	if param == "" {
+		return true
+	}
+	x.errorf(p.Fset, pos, "%s: %s is a type parameter, so %s, not %s; register the concrete type where this helper is instantiated", subject, param, consequence, param)
+	return false
+}
+
+// typeParam names a type parameter that t is or contains, or "" when t is
+// concrete: Wrapper[V] and []V hold one without being one.
+func typeParam(t types.Type) string {
+	return typeParamIn(t, map[types.Type]bool{})
+}
+
+func typeParamIn(t types.Type, seen map[types.Type]bool) string {
+	t = types.Unalias(t)
+	if _, ok := t.(*types.TypeParam); ok {
+		return types.TypeString(t, nil)
+	}
+	if seen[t] {
+		return ""
+	}
+	seen[t] = true
+	for _, child := range typeChildren(t) {
+		if param := typeParamIn(child, seen); param != "" {
+			return param
+		}
+	}
+	return ""
+}
+
+// typeChildren lists the types t contains that could hold a type parameter.
+func typeChildren(t types.Type) []types.Type {
+	switch u := t.(type) {
+	case *types.Pointer:
+		return []types.Type{u.Elem()}
+	case *types.Slice:
+		return []types.Type{u.Elem()}
+	case *types.Array:
+		return []types.Type{u.Elem()}
+	case *types.Map:
+		return []types.Type{u.Key(), u.Elem()}
+	case *types.Named:
+		args := u.TypeArgs()
+		children := make([]types.Type, args.Len())
+		for i := range args.Len() {
+			children[i] = args.At(i)
+		}
+		return children
+	case *types.Struct:
+		children := make([]types.Type, u.NumFields())
+		for i := range u.NumFields() {
+			children[i] = u.Field(i).Type()
+		}
+		return children
+	}
+	return nil
 }
 
 func render(v constant.Value) string {

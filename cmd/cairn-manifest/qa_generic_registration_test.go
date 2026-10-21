@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -50,6 +51,11 @@ func TestQAGenericRegistrationShape(t *testing.T) {
 	newM, newErr := Extract(newDir, "./...")
 	if oldErr != nil || newErr != nil {
 		t.Logf("tool refused: old=%v new=%v", oldErr, newErr)
+		for _, err := range []error{oldErr, newErr} {
+			if err == nil || !strings.Contains(err.Error(), "type parameter") {
+				t.Fatalf("a generic registration must be refused as a type parameter, got old=%v new=%v", oldErr, newErr)
+			}
+		}
 		return
 	}
 	t.Logf("old codecs: %+v", oldM.Codecs)
