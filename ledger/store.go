@@ -575,7 +575,7 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 			e.Meta.OccurredAt = *occurred
 		}
 		if string(extra) != "{}" {
-			if err := json.Unmarshal(extra, &e.Meta.Extra); err != nil {
+			if err := decodeKeepingNumbers(extra, &e.Meta.Extra); err != nil {
 				return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
 			}
 		}

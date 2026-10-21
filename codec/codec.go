@@ -643,6 +643,8 @@ func (c *Codec[T]) upcast(env Envelope) (*entry, json.RawMessage, error) {
 }
 
 // Decode upcasts an envelope to its type's current version and unmarshals it.
+// A number in an any field comes back as a json.Number, not a float64, so it
+// is the number that was stored rather than one rounded to the nearest float.
 func (c *Codec[T]) Decode(env Envelope) (T, error) {
 	var zero T
 	e, data, err := c.upcast(env)
@@ -652,6 +654,11 @@ func (c *Codec[T]) Decode(env Envelope) (T, error) {
 	ptr := reflect.New(e.typ)
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
+	// encoding/json decodes a number into an any field as a float64: an
+	// integer past 2^53 comes back changed, and one outside float64's range
+	// fails to decode, which leaves the entry — and the stream holding it —
+	// unloadable. Keeping the literal makes the any field hold what was stored.
+	dec.UseNumber()
 	if err := dec.Decode(ptr.Interface()); err != nil {
 		return zero, fmt.Errorf("codec: decoding %s: %w", env.Type, err)
 	}
