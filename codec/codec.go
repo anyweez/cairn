@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -108,20 +109,31 @@ func (c *Codec[T]) Encode(v T) (Envelope, error) {
 	return Envelope{Type: e.name, Version: e.version, Data: data}, nil
 }
 
-// NotStorableError names the field of a value that carries text the ledger
-// cannot store. It is returned by Encode and reported by CheckStorable.
+// NotStorableError names the field of a value the ledger cannot store: text
+// jsonb would rewrite or reject, or a time its JSON encoding cannot carry as
+// the same instant. It is returned by Encode and reported by CheckStorable.
 type NotStorableError struct {
 	Path string
+	// Why says what makes the value unstorable, for a value refused for
+	// something other than its text. Empty for the text case.
+	Why string
 }
 
 func (e *NotStorableError) Error() string {
+	if e.Why != "" {
+		return fmt.Sprintf("%s cannot be stored: %s", e.Path, e.Why)
+	}
 	return fmt.Sprintf("%s is not valid UTF-8 or contains a NUL, so it cannot be stored", e.Path)
 }
 
-// CheckStorable reports whether every string in v can be stored in the ledger
+// CheckStorable reports whether every value in v can be stored in the ledger
 // and read back unchanged. json.Marshal replaces a string that is not valid
 // UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
-// would silently store text the caller never wrote.
+// would silently store text the caller never wrote. A time.Time is checked
+// through its JSON encoding, because json.Marshal reports a year it cannot
+// write only at encode time and rounds a zone offset with seconds in it to
+// the minute without reporting anything, storing an instant that was never
+// sent.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalText
 // is checked through the text it returns, because json writes it through its
@@ -495,19 +507,66 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 	return k.String(), nil
 }
 
+var timeType = reflect.TypeFor[time.Time]()
+
 // checkStorableMarshaler calls v's MarshalJSON and checks the bytes jsonb will
 // be handed. A nil pointer is storable because json writes null and never
 // calls the method, and a marshaller that fails is left to Encode's own
-// json.Marshal, which reports that failure once.
+// json.Marshal, which reports that failure once. A time.Time is the exception:
+// its marshaller both fails on a value json cannot write and silently moves
+// one whose zone offset it rounds, so it is checked by the round trip.
 func checkStorableMarshaler(v reflect.Value, path string) error {
 	if jsonNil(v) {
 		return nil
+	}
+	if t, ok := asTime(v); ok {
+		return checkStorableTime(t, path)
 	}
 	data, err := v.Interface().(json.Marshaler).MarshalJSON()
 	if err != nil {
 		return nil
 	}
 	return checkMarshalledJSON(data, path)
+}
+
+// asTime returns the time.Time v holds, for a value, a pointer to one, or
+// either of those behind an interface — the walk reaches a time held in an
+// `any`, as in Meta.Extra, as the interface value itself.
+func asTime(v reflect.Value) (time.Time, bool) {
+	for v.Kind() == reflect.Interface && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Type() == timeType {
+		return v.Interface().(time.Time), true
+	}
+	if v.Kind() == reflect.Pointer && v.Type().Elem() == timeType {
+		return v.Elem().Interface().(time.Time), true
+	}
+	return time.Time{}, false
+}
+
+// checkStorableTime reports whether t is stored as the instant it is. A
+// time.Time encodes itself, so the walk reaches it here rather than as a
+// struct, and the check is the encoding/json round trip rather than a copy of
+// its rules: MarshalJSON refuses a year outside [0,9999] and a timezone hour
+// outside [0,23], and writes a zone offset only to the minute, so an offset
+// with seconds in it (every tzdata zone before about 1900) comes back as a
+// different instant with no error at all.
+func checkStorableTime(t time.Time, path string) error {
+	data, err := t.MarshalJSON()
+	if err != nil {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot write (%v)", err)}
+	}
+	var back time.Time
+	if err := json.Unmarshal(data, &back); err != nil {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot read back (%v)", err)}
+	}
+	if !back.Equal(t) {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf(
+			"it is %s, whose zone offset JSON writes only to the minute, so it would be stored as %s",
+			t.Format(time.RFC3339Nano), back.Format(time.RFC3339Nano))}
+	}
+	return nil
 }
 
 // checkMarshalledJSON reports whether the JSON a MarshalJSON returned can be

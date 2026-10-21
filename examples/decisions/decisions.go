@@ -296,10 +296,43 @@ var Decider = cairn.Decider[State, Msg, Result, Event, Effect]{
 	Evolve:  evolve,
 }
 
+// withStorableTimes returns m with the times it carries in a form the codec
+// can store faithfully. time.Time.MarshalJSON writes a zone offset only to
+// the minute, so a zone whose offset has seconds in it (every tzdata zone
+// before about 1900) would be stored as a different instant. UTC keeps the
+// instant and is always writable, so only such a time is converted; a time
+// nothing can make storable, such as a year outside [0,9999], is left for
+// CheckStorable to refuse with the field it names.
+func withStorableTimes(m Msg) Msg {
+	switch m := m.(type) {
+	case Create:
+		m.At = storableTime(m.At)
+		return m
+	case RecordOutcome:
+		m.At = storableTime(m.At)
+		return m
+	}
+	return m
+}
+
+// storableTime returns t as the codec will carry it: unchanged when its own
+// zone offset is one JSON can write, and in UTC otherwise, which is the same
+// instant in a zone JSON writes exactly.
+func storableTime(t time.Time) time.Time {
+	if codec.CheckStorable(t) == nil {
+		return t
+	}
+	return t.UTC()
+}
+
 func decide(s State, m Msg) decision {
+	m = withStorableTimes(m)
 	// The ledger stores text as UTF-8 and jsonb, so text it cannot hold must be
 	// refused before the message is recorded. Otherwise the codec would replace
 	// the offending bytes with U+FFFD and the caller would be told it succeeded.
+	// A time it cannot carry as the same instant is refused here for the same
+	// reason: the codec reports it, and the caller gets a refusal rather than an
+	// encoding error after the decision.
 	if err := codec.CheckStorable(m); err != nil {
 		return refuse(Invalid, "%v", err)
 	}

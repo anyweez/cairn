@@ -1,8 +1,14 @@
 package decisions
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/anyweez/cairn"
+	"github.com/anyweez/cairn/ledger"
+	"github.com/anyweez/cairn/ledger/ledgertest"
 )
 
 // A time outside the range encoding/json can write is accepted by Decide and
@@ -32,5 +38,23 @@ func TestTimeOutsideJSONRangeIsRefusedByDecide(t *testing.T) {
 	outcome, _ := Decider.Step(state, RecordOutcome{By: "ana", At: at, Chosen: "o1", Rationale: "because"})
 	if !outcome.Refused() {
 		t.Fatalf("Decide accepted a RecordOutcome whose time cannot be encoded: %+v", outcome)
+	}
+}
+
+// The same value through the shell and a ledger. The caller gets the
+// register's refusal, not a codec error raised after Decide said yes, and the
+// refused message leaves no entry behind: it cannot be stored at all.
+func TestATimeOutsideJSONRangeIsRefusedThroughTheLedger(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ledgertest.NewStore(t, ledger.RequireActor(false)))
+	svc.Now = func() time.Time { return time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC) }
+
+	_, err := svc.Create(ctx, "ana", "ship?", "yes")
+	var refusal *cairn.Refusal
+	if !errors.As(err, &refusal) || refusal.Code != Invalid {
+		t.Fatalf("want the register's refusal, got %v", err)
+	}
+	if streams, err := svc.Register.Store.Streams(ctx, "decision"); err != nil || len(streams) != 0 {
+		t.Fatalf("a refused message left a stream: %v, %v", streams, err)
 	}
 }
