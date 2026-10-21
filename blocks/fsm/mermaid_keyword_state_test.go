@@ -20,20 +20,20 @@ import (
 // non-plain ids get — as long as the edge line does not begin with the bare
 // keyword.
 func TestMermaidStateCannotBeAMermaidKeyword(t *testing.T) {
-	reserved := map[string]bool{
-		"default":      true,
-		"style":        true,
-		"statediagram": true,
+	reserved := []string{
+		"default",
+		"style",
+		"stateDiagram",
 		// The ones the lexer also reserves, kept here so the test fails if the
 		// guard is widened to catch these but later narrowed again.
-		"state":     true,
-		"class":     true,
-		"classdef":  true,
-		"direction": true,
-		"scale":     true,
-		"hide":      true,
+		"state",
+		"class",
+		"classdef",
+		"direction",
+		"scale",
+		"hide",
 	}
-	for _, word := range []string{"default", "style", "stateDiagram"} {
+	for _, word := range reserved {
 		table := fsm.New(
 			fsm.Edge[string, string]{From: word, On: "go", To: "open"},
 			fsm.Edge[string, string]{From: "open", On: "close", To: "closed"},
@@ -44,7 +44,7 @@ func TestMermaidStateCannotBeAMermaidKeyword(t *testing.T) {
 				continue
 			}
 			from, _, _ := strings.Cut(line, "-->")
-			if reserved[strings.ToLower(strings.TrimSpace(from))] {
+			if strings.EqualFold(strings.TrimSpace(from), word) {
 				t.Fatalf("edge %q starts with the Mermaid keyword %q, which the state-diagram lexer reads as a directive, so the diagram does not parse", line, strings.TrimSpace(from))
 			}
 		}

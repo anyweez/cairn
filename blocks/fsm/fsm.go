@@ -167,19 +167,19 @@ func isMermaidID(s string) bool {
 }
 
 // mermaidLabel escapes text that Mermaid would otherwise read as diagram
-// syntax, or that would split the line. A numeric entity decodes back to the
-// original text in the renderer, so labels stay readable while a trigger
-// containing "-->" cannot introduce an edge; such a label is escaped whole so
-// the injected state's name does not appear in the diagram either. The colon
-// is escaped for the same reason: the lexer ends the label at the separator,
-// so a trigger like "set_status:open" would otherwise cut the line short and
-// make the whole diagram unparseable.
+// syntax, or that would split the line. Mermaid's entity syntax is "#NN;" (no
+// leading ampersand): the renderer decodes it back to the original character,
+// so labels stay readable while a trigger containing "-->" cannot introduce an
+// edge; such a label is escaped whole so the injected state's name does not
+// appear in the diagram either. The colon is escaped for the same reason: the
+// lexer ends the label at the separator, so a trigger like "set_status:open"
+// would otherwise cut the line short and make the whole diagram unparseable.
 func mermaidLabel(s string) string {
 	whole := strings.Contains(s, "-->")
 	var b strings.Builder
 	for _, r := range s {
 		if whole || mermaidSyntax(r) {
-			fmt.Fprintf(&b, "&#%d;", r)
+			fmt.Fprintf(&b, "#%d;", r)
 			continue
 		}
 		b.WriteRune(r)

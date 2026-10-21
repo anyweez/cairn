@@ -43,6 +43,46 @@ func TestMermaidNamesASourceForEveryEdge(t *testing.T) {
 	}
 }
 
+// Mermaid's entity syntax is "#NN;" without a leading ampersand. Emitting
+// "&#NN;" leaves that ampersand in the rendered text instead of producing the
+// intended character, so a trigger like "set_status:open" is displayed as
+// "set_status&:open". These labels are the characters mermaidLabel escapes,
+// with the exact diagram text expected for each; asserting on shape alone (a
+// colon count, no "-->") cannot see the stray ampersand.
+func TestMermaidLabelsAreEscapedWithoutAStrayAmpersand(t *testing.T) {
+	for _, tc := range []struct {
+		on   string
+		want string
+	}{
+		{"set_status:open", "set_status#58;open"},
+		{"semi;colon", "semi#59;colon"},
+		{"amp&ersand", "amp#38;ersand"},
+		{"a-->b", "#97;#45;#45;#62;#98;"},
+	} {
+		table := fsm.New(
+			fsm.Edge[string, string]{From: "open", On: tc.on, To: "closed"},
+		)
+		want := "stateDiagram-v2\n    open --> closed: " + tc.want + "\n"
+		if got := table.Mermaid(); got != want {
+			t.Errorf("trigger %q:\ngot:\n%s\nwant:\n%s", tc.on, got, want)
+		}
+	}
+}
+
+// A state that is not a plain Mermaid id keeps its text as an alias label, and
+// that label is escaped by the same function. The declaration has to use
+// Mermaid's entity syntax too, or the rendered state name carries the stray
+// ampersand.
+func TestMermaidStateLabelIsEscapedWithoutAStrayAmpersand(t *testing.T) {
+	table := fsm.New(
+		fsm.Edge[string, string]{From: "open:closed", On: "go", To: "open"},
+	)
+	want := "stateDiagram-v2\n    state \"open#58;closed\" as s0\n    s0 --> open: go\n"
+	if got := table.Mermaid(); got != want {
+		t.Fatalf("Mermaid:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestAmbiguousTablesPanic(t *testing.T) {
 	defer func() {
 		if recover() == nil {

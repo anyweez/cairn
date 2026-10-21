@@ -15,7 +15,7 @@ import (
 // and the promised review rendering produces nothing.
 //
 // A label's own colon therefore has to be escaped like the other syntax
-// characters `mermaidLabel` handles, e.g. as &#58;, which the renderer decodes
+// characters `mermaidLabel` handles, e.g. as #58;, which the renderer decodes
 // back to ":" in the label.
 func TestMermaidTriggerLabelCannotContainTheSeparator(t *testing.T) {
 	table := fsm.New(
