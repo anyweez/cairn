@@ -60,8 +60,9 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// is recorded only on that stream: a store that carries the same entity
 	// under two identifiers would otherwise let a message about one be recorded
 	// on another. Handle and Apply refuse the message with ErrStreamMismatch
-	// before it is decided, and nothing is recorded. A message that names no
-	// stream returns the empty string and may be recorded on any.
+	// before it is decided or answered from an idempotency key, and nothing is
+	// recorded. A message that names no stream returns the empty string and may
+	// be recorded on any.
 	StreamOf func(M) string
 }
 
@@ -359,14 +360,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			continue
 		// A retry gets its first answer even when it lost the request's
 		// metadata: the message was attributed when it was recorded. A
-		// request that names a different actor than the entry was recorded
-		// under is refused instead: the entry's answer is that actor's.
+		// request that an identity guard refuses is refused here too, rather
+		// than answered: the entry's answer belongs to the actor and stream
+		// that recorded it.
 		case dups[i] != nil && dups[i].found:
-			if err := mismatchedActor(r.meta, dups[i].entry); err != nil {
-				results[i].err = err
-				continue
-			}
-			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
+			results[i].h, results[i].err = a.duplicateAnswer(r.msg, r.meta, dups[i].entry, stream)
 			continue
 		case r.metaErr != nil:
 			results[i].err = r.metaErr
@@ -647,10 +645,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 			if !answeredFromFirstEntry(metaErr) {
 				return Handled[R]{}, metaErr
 			}
-			if err := mismatchedActor(meta, dup.entry); err != nil {
-				return Handled[R]{}, err
-			}
-			return a.duplicateOf(dup.entry)
+			return a.duplicateAnswer(msg, meta, dup.entry, at.Stream)
 		}
 	}
 	if metaErr != nil {
@@ -693,15 +688,25 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 // the one it is being recorded on. See Aggregate.StreamOf.
 var ErrStreamMismatch = errors.New("cairn: the message names a stream it is not recorded on")
 
+// streamMismatch returns ErrStreamMismatch when msg names a stream other than
+// stream. A message that names none may be recorded on any.
+func (a *Aggregate[S, M, R, Ev, Ef]) streamMismatch(msg M, stream Stream) error {
+	if a.StreamOf == nil {
+		return nil
+	}
+	if named := a.StreamOf(msg); named != "" && named != stream.ID {
+		return fmt.Errorf("%w: %s names %s", ErrStreamMismatch, stream, quoteText(named))
+	}
+	return nil
+}
+
 // queueEntry decides msg against at and queues recording the decision as an
 // entry recorded at now, with its effects. next is the stream's state after
 // it; finish returns what was recorded, once the batch has run. events are
 // the decision's.
 func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[R], next Loaded[S], entry *Entry, events []Ev, err error) {
-	if a.StreamOf != nil {
-		if named := a.StreamOf(msg); named != "" && named != at.Stream.ID {
-			return nil, at, nil, nil, fmt.Errorf("%w: %s names %s", ErrStreamMismatch, at.Stream, quoteText(named))
-		}
+	if err := a.streamMismatch(msg, at.Stream); err != nil {
+		return nil, at, nil, nil, err
 	}
 	decision := a.Decider.Decide(at.State, msg)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
@@ -820,6 +825,20 @@ func queueDuplicate(b *Batch, stream Stream, key string) *pendingDuplicate {
 		return nil
 	}, `SELECT `+entryColumns+` FROM cairn.entries WHERE stream = $1 AND idempotency_key = $2`, stream.String(), key)
 	return p
+}
+
+// duplicateAnswer answers a request from the entry its idempotency key holds,
+// unless an identity guard that would refuse the message refuses it first: the
+// entry's answer belongs to the actor and stream that recorded it, so a request
+// Handle or Apply would refuse is never answered from a key.
+func (a *Aggregate[S, M, R, Ev, Ef]) duplicateAnswer(msg M, meta Meta, e Entry, stream Stream) (Handled[R], error) {
+	if err := mismatchedActor(meta, e); err != nil {
+		return Handled[R]{}, err
+	}
+	if err := a.streamMismatch(msg, stream); err != nil {
+		return Handled[R]{}, err
+	}
+	return a.duplicateOf(e)
 }
 
 // duplicateOf answers a retry with the entry that first answered it.
