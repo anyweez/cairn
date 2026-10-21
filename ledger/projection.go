@@ -37,9 +37,10 @@ type Projection struct {
 }
 
 // Validate reports the first thing wrong with how the projection is set up: no
-// store, no Name, or no Apply function. The name keys its checkpoint, so an
-// unnamed projection has no place of its own in the log. CatchUp runs it
-// first, so call it at startup to fail before Run would.
+// store, no Name, a Name the ledger cannot store or index, or no Apply
+// function. The name keys its checkpoint, so an unnamed projection has no place
+// of its own in the log. CatchUp runs it first, so call it at startup to fail
+// before Run would.
 func (p *Projection) Validate() error {
 	fail := func(what string) error { return fmt.Errorf("cairn: projection %q: %s", p.Name, what) }
 	switch {
@@ -50,7 +51,11 @@ func (p *Projection) Validate() error {
 	case p.Apply == nil:
 		return fail("Apply is nil")
 	}
-	return nil
+	// Name is the primary key of cairn.checkpoints, so it is bounded like every
+	// other text value cairn puts in a btree index: a longer one, or one with a
+	// NUL, otherwise reaches Postgres and fails every CatchUp with a raw error
+	// about an index row.
+	return validIndexedText("the Name of projection "+quoteText(p.Name), p.Name)
 }
 
 // CatchUp applies every entry visible now, returning how many it applied.

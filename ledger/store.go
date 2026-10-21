@@ -288,6 +288,33 @@ func quoteText(v string) string {
 	return fmt.Sprintf("%q…", v[:cut])
 }
 
+// validStoredText refuses text a plain text column cannot keep, and is the one
+// rule every write path uses for one. Postgres raises an error for a NUL or
+// text that is not valid UTF-8, which would reach the caller as a raw SQLSTATE,
+// and json.Marshal would otherwise rewrite the same text as U+FFFD. what names
+// the value for the caller, who has to change it: "the idempotency key \"k\"
+// for counter/a" rather than "the key".
+func validStoredText(what, value string) error {
+	if !cairn.StorableText(value) {
+		return fmt.Errorf("cairn: %s is not valid UTF-8 or contains a NUL", what)
+	}
+	return nil
+}
+
+// validIndexedText refuses text a btree-indexed column cannot keep, which is
+// validStoredText plus the length bound (see maxIndexedTextBytes). It is what
+// every write path bounds an indexed value with, so a caller is told what to
+// shorten rather than a message about an index row size.
+func validIndexedText(what, value string) error {
+	if err := validStoredText(what, value); err != nil {
+		return err
+	}
+	if n := len(value); n > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: %s is %d bytes, longer than the %d-byte limit", what, n, maxIndexedTextBytes)
+	}
+	return nil
+}
+
 // validStream refuses a stream whose name could be another's (the name joins
 // kind and ID with a slash, so a kind may not contain one), or that Postgres
 // cannot store. A NUL or invalid UTF-8 would otherwise reach the driver as a
@@ -300,10 +327,9 @@ func validStream(st Stream) error {
 	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
 		return fmt.Errorf("cairn: invalid stream %q", st)
 	}
-	if !cairn.StorableText(st.Kind) || !cairn.StorableText(st.ID) {
-		return fmt.Errorf("cairn: invalid stream %q: the name is not valid UTF-8 or contains a NUL", st)
-	}
-	return nil
+	// The name is the kind and the ID joined by a slash, so it is valid UTF-8
+	// with no NUL exactly when both halves are.
+	return validStoredText("stream "+quoteText(st.String()), st.String())
 }
 
 // validNewStream refuses a stream name too long for the btree indexes that key
@@ -311,11 +337,7 @@ func validStream(st Stream) error {
 // is not bounded: Postgres stored it, so it fits, and its entries stay
 // recordable.
 func validNewStream(st Stream) error {
-	if n := len(st.String()); n > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: invalid stream %s: the name is %d bytes, longer than the %d-byte limit",
-			quoteText(st.String()), n, maxIndexedTextBytes)
-	}
-	return nil
+	return validIndexedText("stream "+quoteText(st.String()), st.String())
 }
 
 // validKind refuses a kind that could be another's, or that Postgres cannot
@@ -325,10 +347,7 @@ func validKind(kind string) error {
 	if kind == "" || strings.Contains(kind, "/") {
 		return fmt.Errorf("cairn: invalid stream kind %q", kind)
 	}
-	if !cairn.StorableText(kind) {
-		return fmt.Errorf("cairn: invalid stream kind %q: the name is not valid UTF-8 or contains a NUL", kind)
-	}
-	return nil
+	return validStoredText("stream kind "+quoteText(kind), kind)
 }
 
 // minTimestamptz and maxTimestamptz bound what Postgres's timestamptz can
@@ -415,9 +434,10 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	// A new key is written into a btree index, so its length is bounded here.
 	// The same check is not made when a key is looked up: a key stored before
 	// this bound existed must still answer its retry.
-	if n := len(e.IdempotencyKey); e.IdempotencyKey != "" && n > maxIndexedTextBytes {
-		return fmt.Errorf("cairn: the idempotency key %s for %s is %d bytes, longer than the %d-byte limit",
-			quoteText(e.IdempotencyKey), stream, n, maxIndexedTextBytes)
+	if e.IdempotencyKey != "" {
+		if err := validIndexedText("the idempotency key "+quoteText(e.IdempotencyKey)+" for "+stream.String(), e.IdempotencyKey); err != nil {
+			return err
+		}
 	}
 	for _, text := range []struct {
 		name    string
@@ -429,17 +449,15 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 		{"correlation ID", e.Meta.CorrelationID, true},
 		{"causation ID", e.Meta.CausationID, false},
 	} {
-		if !cairn.StorableText(text.value) {
-			return fmt.Errorf("cairn: metadata %s for %s is not valid UTF-8 or contains a NUL", text.name, stream)
-		}
+		what := "metadata " + text.name + " " + quoteText(text.value) + " for " + stream.String()
+		err := validStoredText(what, text.value)
 		// Via and causation ID are not indexed, so only the indexed fields have
 		// a btree entry whose size their length could exceed.
-		if !text.indexed {
-			continue
+		if err == nil && text.indexed {
+			err = validIndexedText(what, text.value)
 		}
-		if n := len(text.value); n > maxIndexedTextBytes {
-			return fmt.Errorf("cairn: metadata %s %s for %s is %d bytes, longer than the %d-byte limit",
-				text.name, quoteText(text.value), stream, n, maxIndexedTextBytes)
+		if err != nil {
+			return err
 		}
 	}
 	extra := []byte(`{}`)

@@ -254,7 +254,11 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   `StateVersion` that took it. That version must change when `Evolve` changes
   how it folds events, not only when the state type changes: otherwise a
   stream that has a snapshot keeps the old fold, while a stream rebuilt from
-  the same events gets the new one.
+  the same events gets the new one. A snapshot is stored as the bytes
+  `json.Marshal` wrote, so a load returns exactly the state that was
+  snapshotted; a state that could not be read back unchanged — text
+  `json.Marshal` would rewrite, or a NUL — is refused with a cairn error when
+  the snapshot is due, rather than stored as something else.
 - **Read your own writes.** An aggregate's `Views` are written from the
   stream's new state inside that transaction, so a caller that writes and then
   reads a view table sees its write. A view replaces a stream's rows from its
