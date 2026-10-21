@@ -46,8 +46,8 @@ func TestEmptyFailureDetailFailsTheCheck(t *testing.T) {
 	m.Invariants = []spec.Invariant[int]{{Rule: rule, Check: func(int) spec.Verdict {
 		return spec.Check(false, "")
 	}}}
-	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "C2 violated") {
-		t.Fatalf("an empty failure detail must fail the check, got %q", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || !failed || !strings.Contains(msg, "C2 violated") {
+		t.Fatalf("an empty failure detail must fail the check, got err=%v %q", err, msg)
 	}
 }
 
@@ -55,34 +55,32 @@ func TestVacuousEstablishedRuleFails(t *testing.T) {
 	if testing.Short() {
 		t.Skip("vacuity is only enforced on a full-length check")
 	}
-	msg, failed := spectest.Fails(t, counter(unreachable()).Check)
-	if !failed || !strings.Contains(msg, "C1 is vacuous") {
-		t.Fatalf("a rule that never applies must fail the check, got %q", msg)
+	msg, failed, err := spectest.Fails(t, counter(unreachable()).Check)
+	if err != nil || !failed || !strings.Contains(msg, "C1 is vacuous") {
+		t.Fatalf("a rule that never applies must fail the check, got err=%v %q", err, msg)
 	}
 }
 
 func TestAllowVacuous(t *testing.T) {
 	m := counter(unreachable())
 	m.AllowVacuous = []string{unreachable().ID}
-	if msg, failed := spectest.Fails(t, m.Check); failed {
-		t.Fatalf("an allowed vacuous rule must pass: %s", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || failed {
+		t.Fatalf("an allowed vacuous rule must pass: err=%v %s", err, msg)
 	}
 
 	m.AllowVacuous = []string{"C9"}
-	if msg, _ := spectest.Fails(t, m.Check); !strings.Contains(msg, "AllowVacuous names C9") {
+	if msg, _, err := spectest.Fails(t, m.Check); err != nil || !strings.Contains(msg, "AllowVacuous names C9") {
 		t.Fatalf("an unknown rule in AllowVacuous must be reported, got %q", msg)
 	}
 }
 
 // rapid's T.Skip rejects a draw that is not a valid input, and a generator
 // that rejects most draws makes rapid report that it generated too few valid
-// tests. That is the harness failing to generate, not a rule being violated,
-// so Fails must not report it. A mutant test written as
-//
-//	if _, failed := spectest.Fails(t, m.Check); !failed { t.Fatal("mutant survived") }
-//
-// otherwise passes without the rule ever being exercised.
-func TestFailsIgnoresAGeneratorThatRejectsMostDraws(t *testing.T) {
+// tests: the harness never got its look at the rule, so the check has no
+// verdict either way. That is a kill neither — counting one would let a
+// mutant test pass without the rule ever being exercised — and it is not a
+// survival either, so Fails reports it as inconclusive.
+func TestFailsReportsTooFewValidRunsAsInconclusive(t *testing.T) {
 	m := counter(unreachable())
 	m.AllowVacuous = []string{unreachable().ID}
 	m.Messages = func(t *rapid.T, _ int) int {
@@ -91,8 +89,12 @@ func TestFailsIgnoresAGeneratorThatRejectsMostDraws(t *testing.T) {
 		}
 		return rapid.IntRange(0, 1).Draw(t, "msg")
 	}
-	if msg, failed := spectest.Fails(t, m.Check); failed {
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if failed {
 		t.Fatalf("a rejected draw is not a rule violation: %s", msg)
+	}
+	if err == nil {
+		t.Fatalf("a check that never generated enough valid runs has no verdict: %s", msg)
 	}
 }
 
@@ -112,16 +114,16 @@ func TestFailsStillCatchesARuleViolationWhenTheGeneratorRejectsMostDraws(t *test
 		}
 		return 1
 	}
-	msg, failed := spectest.Fails(t, m.Check)
-	if !failed || !strings.Contains(msg, "C3 violated") {
-		t.Fatalf("a violated rule must fail even when the generator rejects most draws, got %q", msg)
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, "C3 violated") {
+		t.Fatalf("a violated rule must fail even when the generator rejects most draws, got err=%v %q", err, msg)
 	}
 }
 
 func TestVacuousProposedRulePasses(t *testing.T) {
 	proposed := unreachable()
 	proposed.Status = spec.Proposed
-	if msg, failed := spectest.Fails(t, counter(proposed).Check); failed {
-		t.Fatalf("a proposed rule only reports vacuity: %s", msg)
+	if msg, failed, err := spectest.Fails(t, counter(proposed).Check); err != nil || failed {
+		t.Fatalf("a proposed rule only reports vacuity: err=%v %s", err, msg)
 	}
 }

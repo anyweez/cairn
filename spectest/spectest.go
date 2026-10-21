@@ -143,8 +143,9 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 	rt.Fatalf("%s violated: %s\n  rule: %s", rule.ID, detail, rule.Statement)
 }
 
-// collectorStopped reports that Fails has already recorded a rule violation,
-// so the rest of the check proves nothing and can be skipped.
+// collectorStopped reports that Fails has already recorded a rule violation
+// or a check that died, so the rest of the check proves nothing and can be
+// skipped.
 func collectorStopped(t rapid.TB) bool {
 	if s, ok := t.(interface{ stopping() bool }); ok {
 		return s.stopping()

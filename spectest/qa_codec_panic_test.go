@@ -51,8 +51,8 @@ func TestQACodecPanicNamesTheRule(t *testing.T) {
 		Messages: func(t *rapid.T, _ struct{}) qaMsg { return qaPanicMsg{} },
 		Codecs:   qaCodecs(),
 	}
-	msg, failed := spectest.Fails(t, m.Check)
-	if !failed || !strings.Contains(msg, spectest.Encodable.ID+" violated") {
-		t.Fatalf("a panicking codec must be reported as %s, got failed=%v: %s", spectest.Encodable.ID, failed, msg)
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, spectest.Encodable.ID+" violated") {
+		t.Fatalf("a panicking codec must be reported as %s, got err=%v failed=%v: %s", spectest.Encodable.ID, err, failed, msg)
 	}
 }
