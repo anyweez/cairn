@@ -605,6 +605,15 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // the reference's low half is the wrap it came from, so it belongs to the
 // previous epoch; anything else is the current one.
 //
+// The fence is bounded above by that same statement's own xid, and has to be:
+// the in-flight set does not necessarily contain it. pg_stat_activity can be
+// read before pg_current_xact_id assigns this transaction its xid, so on a
+// database with nothing else open the set is empty and there is no minimum to
+// take. The sentinel stands in for that empty set, and
+// LEAST(<minimum, or the sentinel>, pg_current_xact_id()) holds the cutoff at
+// the measuring transaction: its own xid8 is exact, no widening needed, and
+// every transaction assigned after it is above it.
+//
 // pg_snapshot_xmax was the other candidate and is wrong: it is the latest
 // completed transaction plus one, not the next to assign, and a transaction
 // whose xid is ahead of that completion frontier (the newest assigned, still
@@ -616,8 +625,8 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // makes the cutoff sound. A transaction that is in flight when the read
 // takes its snapshot either already existed at the measurement, and is in
 // the measured set with its widened true value, or was assigned its
-// transaction ID after — that is, at or above this statement's own xid — and
-// the fence never rises above that. Measuring inside the read would be
+// transaction ID after — that is, at or above this statement's own xid, which
+// the fence is LEAST'd with. Measuring inside the read would be
 // unsound: its snapshot is taken before its own subqueries read
 // pg_stat_activity, so a transaction that commits in between is neither
 // visible to the snapshot nor counted in the in-flight set.
@@ -665,7 +674,7 @@ const fenceRef = `
             floor((own.xid + 1) / 4294967296::numeric) AS epoch
        FROM (SELECT pg_current_xact_id()::text::numeric AS xid) AS own)`
 
-const logFence = `SELECT set_config('cairn.fence', COALESCE((
+const logFence = `SELECT set_config('cairn.fence', LEAST(COALESCE((
   SELECT min(` + widenedXid + `)
   FROM (SELECT backend_xid::text::numeric AS thumb FROM pg_stat_activity
         WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())
@@ -673,7 +682,7 @@ const logFence = `SELECT set_config('cairn.fence', COALESCE((
         SELECT transaction::text::numeric FROM pg_prepared_xacts
         WHERE database = current_database()) AS x(thumb)
   CROSS JOIN ` + fenceRef + ` AS ref
-), '18446744073709551615'::xid8)::text, true)`
+), '18446744073709551615'::xid8), pg_current_xact_id())::text, true)`
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	for _, kind := range kinds {

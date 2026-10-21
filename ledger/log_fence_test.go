@@ -54,6 +54,50 @@ func TestWidenedXidsHitTheWrapBoundaryOnBothSides(t *testing.T) {
 	}
 }
 
+// With nothing else in flight in the database, the in-flight set is empty —
+// pg_stat_activity is read before this statement is assigned its own xid, so
+// its own backend_xid is not in it — and the fence has to bound itself with
+// the measuring transaction's own xid rather than fall back to the sentinel.
+// At the sentinel there is no cutoff at all: a transaction assigned an xid
+// after the fence can have a later-assigned, already-committed transaction's
+// entries returned ahead of it, so the cursor passes it and its own entry is
+// skipped when it commits.
+func TestAFenceOnAnIdleDatabaseIsTheMeasuringTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The fence goes first, while this transaction has no xid yet. Read after
+	// a statement that already assigned one, it would be in the in-flight set
+	// and the empty case would never be reached.
+	var fence string
+	if err := tx.QueryRow(ctx, logFence).Scan(&fence); err != nil {
+		t.Fatal(err)
+	}
+	if fence == "18446744073709551615" {
+		t.Fatalf("the fence is the sentinel with no other transaction open: no cutoff, so entries committed ahead of a transaction assigned after the fence are returned past its cursor and its own entry is skipped")
+	}
+
+	var xid string
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&xid); err != nil {
+		t.Fatal(err)
+	}
+	if fence != xid {
+		t.Fatalf("the fence is %s on an otherwise idle database, want the measuring transaction's own %s", fence, xid)
+	}
+}
+
 // At epoch 0 the widening must agree digit for digit with the transaction ID
 // Postgres itself assigns, so a live transaction in this database widens to
 // itself and the fence sits on it. This wires the widening into the fence —
