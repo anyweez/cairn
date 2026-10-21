@@ -167,19 +167,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) storedResult(e Entry) (json.RawMessage, err
 // coversJSON reports whether now agrees with every field stored carries.
 func coversJSON(stored, now []byte) bool {
 	var x, y any
-	if !decodeNumbers(stored, &x) || !decodeNumbers(now, &y) {
+	if decodeKeepingNumbers(stored, &x) != nil || decodeKeepingNumbers(now, &y) != nil {
 		return bytes.Equal(stored, now)
 	}
 	return covers(x, y)
-}
-
-// decodeNumbers decodes one JSON value into v, keeping every number a
-// json.Number. A plain json.Unmarshal into any rounds a number to float64, so
-// two int64 results past 2^53 decode to the same value and compare equal.
-func decodeNumbers(data []byte, v any) bool {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	return dec.Decode(v) == nil
 }
 
 // covers compares decoded JSON. A key missing from a stored object is a field
