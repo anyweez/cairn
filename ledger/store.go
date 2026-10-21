@@ -526,13 +526,8 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 			return nil, err
 		}
 		e.Stream = parseStream(name, kind)
-		if occurred != nil {
-			e.Meta.OccurredAt = *occurred
-		}
-		if string(extra) != "{}" {
-			if err := json.Unmarshal(extra, &e.Meta.Extra); err != nil {
-				return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
-			}
+		if err := decodeMetaTail(&e.Meta, occurred, extra); err != nil {
+			return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
 		}
 		var err error
 		if e.TxID, err = strconv.ParseUint(txid, 10, 64); err != nil {

@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -30,6 +31,22 @@ type Meta struct {
 	OccurredAt time.Time
 	// Extra holds anything else worth keeping, stored as JSON.
 	Extra map[string]any
+}
+
+// decodeMetaTail fills m's OccurredAt and Extra from an entry's occurred_at
+// and extra columns, as a row selects them: a NULL occurred_at is the zero
+// time, and extra is decoded unless it is the empty object. The error is the
+// bare unmarshal error, for the caller to place in its own context.
+func decodeMetaTail(m *Meta, occurred *time.Time, extra []byte) error {
+	if occurred != nil {
+		m.OccurredAt = *occurred
+	}
+	if string(extra) != "{}" {
+		if err := json.Unmarshal(extra, &m.Extra); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // over returns m with every field set in o replacing m's, and Extra merged

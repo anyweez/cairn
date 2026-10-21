@@ -131,14 +131,9 @@ ORDER BY c.id`,
 			return 0, err
 		}
 		c.stream = parseStream(name, kind)
-		if occurred != nil {
-			c.meta.OccurredAt = *occurred
-		}
-		if string(extra) != "{}" {
-			if err := json.Unmarshal(extra, &c.meta.Extra); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("cairn: %s#%d metadata: %w", c.stream, c.seq, err)
-			}
+		if err := decodeMetaTail(&c.meta, occurred, extra); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("cairn: %s#%d metadata: %w", c.stream, c.seq, err)
 		}
 		batch = append(batch, c)
 	}
