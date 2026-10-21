@@ -191,6 +191,46 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	}
 }
 
+// A registration reached through a generic helper writes the helper's type
+// parameter, whose JSON shape is its constraint ("=: any"), so every
+// instantiation of the helper looked alike and -base missed a wire change to the
+// type the caller supplies. The extractor states what is stored or refuses, so
+// the parameter must be an error rather than a recorded shape.
+func TestExtractRefusesGenericRegistrations(t *testing.T) {
+	_, err := Extract("testdata/genericregister", "./...")
+	if err == nil {
+		t.Fatal("a registration through a type parameter must be refused, not recorded as its constraint")
+	}
+	for _, want := range []string{
+		"genericregister.go:18: codec.Register[V]: V is a type parameter, so the stored shape comes from the caller's type argument, not V",
+		"genericregister.go:22: codec.Register[example.com/genericregister.Event]: T is a type parameter, so the codec a stored entry names comes from the caller's type argument, not T",
+		"genericregister.go:26: Upcast: T is a type parameter, so the codec this upcaster belongs to comes from the caller's type argument, not T",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in:\n%v", want, err)
+		}
+	}
+	if n := strings.Count(err.Error(), "\n") + 1; n != 3 {
+		t.Errorf("got %d errors, want 3:\n%v", n, err)
+	}
+}
+
+// Generics that do not choose what is stored are ordinary code: the module must
+// load, and a concrete registration records its shape as before.
+func TestExtractReadsAModuleThatUsesGenericsElsewhere(t *testing.T) {
+	m, err := Extract("testdata/genericok", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	c := m.Codecs[0]
+	if c.Sum != "example.com/genericok.Msg" || c.Type != "example.com/genericok.Event" || !slices.Equal(c.Fields, []string{"v: int"}) {
+		t.Errorf("codec: %+v", c)
+	}
+}
+
 // A module whose packages go list refuses to load. It is the state a module is
 // in right after someone adds an import and before `go mod tidy`, and x/tools
 // reports it as zero packages and a nil error -- which reads as a module that

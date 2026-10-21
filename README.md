@@ -362,10 +362,13 @@ is declared, whether or not a test uses it. It reads:
   only production code writes to the ledger.
 
 Each of these must be stated with constants. A rule, table or registration
-the tool can't read exactly is an error, not a guess. So is a module it can't
-load at all — a `go.mod` that needs tidying, say: the tool fails with go's own
-message rather than writing a manifest that says the module declares nothing.
-Declare a fixture rule inside a function to keep it out of the manifest.
+the tool can't read exactly is an error, not a guess. So is a registration
+inside a generic helper: its type argument is the helper's parameter, not the
+type the caller supplies, so the tool refuses it — register the concrete type
+where the helper is instantiated. And so is a module it can't load at all — a
+`go.mod` that needs tidying, say: the tool fails with go's own message rather
+than writing a manifest that says the module declares nothing. Declare a
+fixture rule inside a function to keep it out of the manifest.
 
 Reading codecs from source can still be fooled: an `Upcast` inside a helper
 that never runs looks like an upcaster, and a `Register` taken as a function
