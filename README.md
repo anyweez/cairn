@@ -274,15 +274,17 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   `Aggregate.RebuildEntries` replays every entry through it.
 - **Every entry is attributed.** Each entry records who sent the message
   (`Actor`), through what (`Via`), the flow it belongs to (`CorrelationID`),
-  what directly caused it (`CausationID`) and when the producer says it
-  happened (`OccurredAt`). Metadata comes from the context, set once per
-  request, or `WithMeta` for one message. A message with no actor is refused
-  unless the store is built with `RequireActor(false)`. Set `Aggregate.Actor`
-  when messages name their own sender, and a request whose metadata names
-  someone else is refused. A message recorded while carrying out an effect is
-  caused by that delivery, in the same flow. `Decide` never sees metadata:
-  what a decision depends on belongs in the message, where `Verify` can
-  replay it.
+  what directly caused it (`CausationID`), when the producer says it
+  happened (`OccurredAt`) and anything else worth keeping (`Extra`, stored as
+  JSON). A number in `Extra` comes back as a `json.Number`, not a `float64`,
+  so it is the number that was stored whatever its size. Metadata comes from
+  the context, set once per request, or `WithMeta` for one message. A message
+  with no actor is refused unless the store is built with
+  `RequireActor(false)`. Set `Aggregate.Actor` when messages name their own
+  sender, and a request whose metadata names someone else is refused. A
+  message recorded while carrying out an effect is caused by that delivery,
+  in the same flow. `Decide` never sees metadata: what a decision depends on
+  belongs in the message, where `Verify` can replay it.
 - **No interleaving within a stream.** `Transact` takes every stream lock a
   transaction needs in one sorted call, before anything else, so overlapping
   transactions cannot deadlock. Locking a stream doesn't create it: a stream exists once its first
@@ -297,6 +299,13 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   included. A stored result is decoded through the `Results` codec's
   upcasters, so a retry gets the current shape; a field added since it was
   recorded comes back as its zero value unless the upcaster fills it in.
+- **Numbers are the numbers that were stored.** A JSON number in `Meta.Extra`,
+  or in any field typed `any` (`map[string]any` and `[]any` included) of a
+  message, result, event or effect, decodes as a `json.Number` rather than a
+  `float64`, small numbers included. A large identifier, a nanosecond
+  timestamp or a monetary amount in minor units therefore comes back exactly
+  as it was written, and a number too large for a `float64` no longer makes
+  the entry — or the stream and global log around it — unreadable.
 - **Told when a message was recorded.** Every statement in a write batch runs
   before the caller reads any result, so a handler can fail in Go — a scan or
   a parse — after the transaction has committed. And even when every result is
@@ -327,6 +336,12 @@ Every machine is held to the framework's rules (D1–D7) in addition to its own:
 | D5 | Folding a run's events from the initial state reproduces the run. |
 | D6 | Messages, accepted results, events and effects survive their codecs (when codecs are given). |
 | D7 | State survives a JSON snapshot round trip (when `Snapshots` is set). |
+
+D6 compares with `reflect.DeepEqual`, so the Go type a number comes back as
+matters. Because a number in an `any` field decodes as a `json.Number`, a
+machine that stores an `int` or `float64` there fails D6; store a
+`json.Number` in such a field, or use a typed field. `Meta.Extra` decodes the
+same way, though it is not a codec and so is not covered by D6.
 
 Established rules fail the test with a shrunk counterexample. Proposed rules
 are reported with the shortest trace found. The rule-health table shows how
