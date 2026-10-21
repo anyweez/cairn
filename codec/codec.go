@@ -509,6 +509,11 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 
 var timeType = reflect.TypeFor[time.Time]()
 
+// offsetSecondsLayout is RFC 3339 with the zone offset in seconds. time's own
+// layouts carry an offset only to the minute, which would print the instant
+// that moves and the one it moves to as if they were the same.
+const offsetSecondsLayout = "2006-01-02T15:04:05.999999999-07:00:00"
+
 // checkStorableMarshaler calls v's MarshalJSON and checks the bytes jsonb will
 // be handed. A nil pointer is storable because json writes null and never
 // calls the method, and a marshaller that fails is left to Encode's own
@@ -564,7 +569,7 @@ func checkStorableTime(t time.Time, path string) error {
 	if !back.Equal(t) {
 		return &NotStorableError{Path: path, Why: fmt.Sprintf(
 			"it is %s, whose zone offset JSON writes only to the minute, so it would be stored as %s",
-			t.Format(time.RFC3339Nano), back.Format(time.RFC3339Nano))}
+			t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
 	}
 	return nil
 }

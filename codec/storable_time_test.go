@@ -3,6 +3,7 @@ package codec_test
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,22 @@ func TestATimeTheJSONCodecCarriesIsStorable(t *testing.T) {
 	}
 }
 
+// The refusal prints the instant sent and the one it would be stored as, with
+// the offset in seconds so the two do not look identical.
+func TestTheRefusalShowsTheOffsetSecondsThatWouldGoMissing(t *testing.T) {
+	at := time.Date(1900, time.January, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32))
+	err := codec.CheckStorable(stamped{At: at})
+	var notStorable *codec.NotStorableError
+	if !errors.As(err, &notStorable) {
+		t.Fatalf("CheckStorable(%v) = %v, want a NotStorableError", at, err)
+	}
+	for _, want := range []string{"+00:19:32", "+00:19:00"} {
+		if !strings.Contains(notStorable.Why, want) {
+			t.Fatalf("the refusal %q does not show %s", notStorable.Why, want)
+		}
+	}
+}
+
 // Encode refuses the same values the walk does, so a decider that does not
 // call CheckStorable itself still fails with a NotStorableError rather than
 // json's own error after it has said yes.
@@ -108,8 +125,8 @@ func TestEncodeRefusesATimeItCannotCarry(t *testing.T) {
 		t.Fatalf("Encode(%v) = %v, want a NotStorableError", at, err)
 	}
 
-	// The same instant in UTC is what a decider normalises an offset JSON
-	// rounds to, and it round-trips through the codec.
+	// The same instant in a zone JSON writes exactly, so it round-trips through
+	// the codec.
 	moved := time.Date(1900, time.January, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32))
 	env, err := times.Encode(stamped{At: moved.UTC()})
 	if err != nil {
