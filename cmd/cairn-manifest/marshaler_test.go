@@ -105,3 +105,31 @@ type T struct {
 		})
 	}
 }
+
+// The ",string" option is ignored on a type that marshals itself: the field
+// is written by its marshaler, which never wraps its output in a string. The
+// manifest rendered string(type) instead, disagreeing with what is stored.
+type marshalerString string
+
+func (marshalerString) MarshalText() ([]byte, error) { return []byte("Ts"), nil }
+
+type stringOptionMarshaler struct {
+	F marshalerString `json:"f,string"`
+}
+
+func TestAStringOptionOnAMarshalerTypeIsIgnored(t *testing.T) {
+	// Reference: the marshaler's output is written as-is, not quoted again.
+	raw, err := json.Marshal(stringOptionMarshaler{"x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"f":"Ts"}` {
+		t.Fatalf("reference: encoding/json wrote %s, want {\"f\":\"Ts\"}", raw)
+	}
+
+	got := fields(lookedUpType(t, "stringOptionMarshaler"))
+	want := []string{"f: " + types.TypeString(lookedUpType(t, "marshalerString"), nil)}
+	if !slices.Equal(got, want) {
+		t.Errorf("fields() = %q; the option is ignored, so want %q", got, want)
+	}
+}

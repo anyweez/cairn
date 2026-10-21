@@ -338,12 +338,13 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		n, _ := constant.Int64Val(version)
 		c := &Codec{
 			// reflect resolves an alias, so the runtime names the aliased type;
-			// resolve it here or a registration through an alias is recorded
-			// under a name the running program does not have.
+			// resolve both here or a registration through an alias is recorded
+			// under a name the running program does not have, and Sum and Type
+			// disagree about which one it is.
 			Sum:     types.TypeString(types.Unalias(sum), nil),
 			Name:    constant.StringVal(name),
 			Version: int(n),
-			Type:    types.TypeString(v, nil),
+			Type:    types.TypeString(types.Unalias(v), nil),
 			Fields:  fields(v),
 		}
 		at := x.position(p.Fset, call.Pos())
