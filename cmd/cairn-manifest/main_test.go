@@ -191,6 +191,29 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	}
 }
 
+// A module whose packages go list refuses to load. It is the state a module is
+// in right after someone adds an import and before `go mod tidy`, and x/tools
+// reports it as zero packages and a nil error -- which reads as a module that
+// declares nothing, so the tool wrote an empty manifest and exited 0. The
+// fixture declares a table and a rule, so an empty manifest says the load read
+// nothing rather than that the module has nothing to say.
+func TestExtractRefusesALoadThatReadNothing(t *testing.T) {
+	_, err := Extract("testdata/unloadable", "./...")
+	if err == nil {
+		t.Fatal("a load that read no packages must be an error, not an empty manifest")
+	}
+	if !strings.Contains(err.Error(), "updates to go.mod needed") {
+		t.Errorf("the loader's own message must be reported, got: %v", err)
+	}
+
+	// go list succeeds here and reports no packages, so there is no loader
+	// message to pass on; the tool still must not call the module empty.
+	_, err = Extract("testdata/nopackages", "./...")
+	if err == nil || !strings.Contains(err.Error(), "no packages match ./...") {
+		t.Errorf("a module with no packages must be an error, got: %v", err)
+	}
+}
+
 // A rule whose literal names an alias of spec.Rule is legal Go. It must be
 // read like any other rule rather than crashing the extractor on a type
 // assertion that assumes the literal's type is a *types.Named.

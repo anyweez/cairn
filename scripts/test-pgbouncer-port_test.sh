@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# A reproduction: scripts/test-pgbouncer.sh reuses a running container by name
-# and then prints the port it would have published, not the one the container
-# actually publishes. A caller who exports the printed URL reaches nothing.
-#
-# Fails today; passes once the script either restarts the container to match
-# the requested port or prints the port the container is really on.
+# Checks that scripts/test-pgbouncer.sh prints a URL on the port the container
+# it uses actually publishes, and that asking for one port does not remove the
+# container another session is using on a different port.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 name=cairn-test-pgbouncer
 custom_port=56073
+custom_name=${name}-${custom_port}
 
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$name" "$custom_name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 
@@ -28,4 +26,11 @@ if [[ "$url" != *"@127.0.0.1:${published}/"* ]]; then
   echo "FAIL: the printed URL does not point at the port the container publishes" >&2
   exit 1
 fi
-echo "ok: the printed URL points at the container's published port"
+
+running=$(docker inspect -f '{{.State.Running}}' "$custom_name" 2>/dev/null || true)
+if [ "$running" != true ]; then
+  echo "FAIL: asking for the default port removed the container on ${custom_port}" >&2
+  exit 1
+fi
+echo "ok: the printed URL points at the container's published port,"
+echo "    and the container on ${custom_port} is still running"

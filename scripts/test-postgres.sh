@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Starts (or reuses) a throwaway Postgres for the ledger tests and prints the
-# URL to export. Each test creates and drops its own database inside it.
+# URL to export. Each test creates and drops its own database inside it. A
+# changed CAIRN_TEST_PORT gets its own container, so sessions on different
+# ports do not disturb each other.
 #
 #   export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 set -euo pipefail
 
 source "$(dirname "$0")/containers.sh"
 
-name=cairn-test-postgres
 port=${CAIRN_TEST_PORT:-55871}
+name=$(fixture_name cairn-test-postgres 55871 "$port")
 
 if ! container_publishes "$name" 5432 "$port"; then
   docker rm -f "$name" >/dev/null 2>&1 || true

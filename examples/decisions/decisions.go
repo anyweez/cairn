@@ -13,6 +13,10 @@
 // Everything nondeterministic arrives in the message: the actor, the time, the
 // IDs of new options, and — for Supersede — what the replacing decision looked
 // like when it was read under lock.
+//
+// A decision is identified by the stream it is recorded on: a Create names that
+// stream, and the ledger refuses it anywhere else, so State.ID and the stream
+// are one identifier rather than two that happen to agree.
 package decisions
 
 import (
@@ -121,8 +125,9 @@ type SetStatus struct {
 // Supersede marks this decision replaced by another. The shell locks both
 // streams and copies what it read of the replacement into the message, so the
 // decision is made — and replayed — from facts in the ledger. With is the
-// replacement decision's ID, the identity the self-supersede guard and DR3
-// compare against.
+// replacement decision's ID, which is the stream it is recorded on, so the
+// self-supersede guard and DR3 compare it against this decision's ID like for
+// like.
 type Supersede struct {
 	By               string `json:"by"`
 	With             string `json:"with"`

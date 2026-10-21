@@ -338,7 +338,10 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 			m := machine()
 			m.Decider.Decide = mut.decide
 			m.Messages = aimed(mut.target, mut.trigger)
-			msg, failed := spectest.Fails(t, m.Check)
+			msg, failed, err := spectest.Fails(t, m.Check)
+			if err != nil {
+				t.Fatalf("the %q mutant made the check die instead of %s catching it: %v", name, mut.rule, err)
+			}
 			if !strings.Contains(msg, mut.rule+" violated") {
 				t.Fatalf("the %q mutant must be caught by %s; failed %v: %s", name, mut.rule, failed, firstLine(msg))
 			}
@@ -357,7 +360,10 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 			}
 			return evolve(s, e)
 		}
-		msg, _ := spectest.Fails(t, m.Check)
+		msg, _, err := spectest.Fails(t, m.Check)
+		if err != nil {
+			t.Fatalf("the aliasing Evolve made the check die instead of %s catching it: %v", spectest.Isolated.ID, err)
+		}
 		if !strings.Contains(msg, spectest.Isolated.ID+" violated") {
 			t.Fatalf("aliasing Evolve must be caught by %s: %s", spectest.Isolated.ID, firstLine(msg))
 		}

@@ -37,7 +37,7 @@ func TestProposedModelPanicIsReportedNotFatal(t *testing.T) {
 			Agree: func(impl, model int) spec.Verdict { panic("model agrees exploded") },
 		})},
 	}
-	if msg, failed := spectest.Fails(t, m.Check); failed {
-		t.Fatalf("a Proposed model that panics must be reported, not fail the check: %s", msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || failed {
+		t.Fatalf("a Proposed model that panics must be reported, not fail the check: err=%v %s", err, msg)
 	}
 }

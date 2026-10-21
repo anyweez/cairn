@@ -85,6 +85,22 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(pkgs) == 0 {
+		// go list can fail with its message on stderr and nothing on stdout,
+		// and x/tools reports that as no packages and a nil error: a module
+		// that declares nothing is indistinguishable from a load that read
+		// nothing. A manifest is an error rather than a guess, so ask again
+		// in a mode that surfaces the command's error and report its cause.
+		_, cause := packages.Load(&packages.Config{
+			Mode:  packages.NeedName | packages.NeedFiles,
+			Dir:   dir,
+			Tests: true,
+		}, patterns...)
+		if cause == nil {
+			cause = fmt.Errorf("no packages match %s in %s", strings.Join(patterns, " "), dir)
+		}
+		return nil, fmt.Errorf("loading packages: %w", cause)
+	}
 	var loadErrs []string
 	packages.Visit(pkgs, nil, func(p *packages.Package) {
 		for _, e := range p.Errors {
@@ -338,12 +354,13 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		n, _ := constant.Int64Val(version)
 		c := &Codec{
 			// reflect resolves an alias, so the runtime names the aliased type;
-			// resolve it here or a registration through an alias is recorded
-			// under a name the running program does not have.
+			// resolve both here or a registration through an alias is recorded
+			// under a name the running program does not have, and Sum and Type
+			// disagree about which one it is.
 			Sum:     types.TypeString(types.Unalias(sum), nil),
 			Name:    constant.StringVal(name),
 			Version: int(n),
-			Type:    types.TypeString(v, nil),
+			Type:    types.TypeString(types.Unalias(v), nil),
 			Fields:  fields(v),
 		}
 		at := x.position(p.Fset, call.Pos())
