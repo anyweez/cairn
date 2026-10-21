@@ -28,7 +28,11 @@ type Meta struct {
 	// OccurredAt is when the producer says this happened, which can be well
 	// before it was recorded. Zero when unknown.
 	OccurredAt time.Time
-	// Extra holds anything else worth keeping, stored as JSON.
+	// Extra holds anything else worth keeping, stored as JSON. A number is
+	// stored exactly as written, and when an entry is read back every JSON
+	// number in Extra is a json.Number rather than a float64, so it keeps its
+	// exact value; callers should read one with its Int64, Float64 or String
+	// method.
 	Extra map[string]any
 }
 
