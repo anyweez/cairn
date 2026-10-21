@@ -2,7 +2,9 @@
 # Starts (or reuses) a throwaway Postgres for the ledger tests and prints the
 # URL to export. Each test creates and drops its own database inside it. A
 # changed CAIRN_TEST_PORT gets its own container, so sessions on different
-# ports do not disturb each other.
+# ports do not disturb each other. Starting or reusing it rolls back prepared
+# transactions a killed test run left behind, which would otherwise hold the
+# server's max_prepared_transactions slots.
 #
 #   export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 set -euo pipefail
@@ -30,6 +32,29 @@ done
 if [ -z "${ready:-}" ]; then
   echo "postgres in $name did not become ready" >&2
   exit 1
+fi
+
+# A run killed between PREPARE TRANSACTION and COMMIT PREPARED leaves its
+# prepared transaction behind, and each one holds a slot of
+# max_prepared_transactions, so a reused container carries them into every
+# later run until no slot is left. This suite names the prepared transactions
+# it creates cairn_test_prepared*, so clear those. Postgres finishes a prepared
+# transaction only from the database that prepared it, so each is rolled back
+# over its own connection. A database with another live connection belongs to
+# a test still running, and is left alone.
+cleared=0
+while IFS=$'\t' read -r db gid; do
+  [ -n "${db:-}" ] || continue
+  printf "ROLLBACK PREPARED :'gid';\n" |
+    docker exec -i "$name" psql -U cairn -d "$db" -v gid="$gid" -At >/dev/null 2>&1 || continue
+  cleared=$((cleared + 1))
+done < <(docker exec "$name" psql -U cairn -d postgres -At -F $'\t' -c "
+  SELECT p.database, p.gid FROM pg_prepared_xacts p
+  WHERE p.gid LIKE 'cairn_test_prepared%'
+    AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a
+                    WHERE a.datname = p.database AND a.pid <> pg_backend_pid())")
+if [ "$cleared" -gt 0 ]; then
+  echo "cleared $cleared prepared transaction(s) left by interrupted runs" >&2
 fi
 
 echo "postgres://cairn:cairn@127.0.0.1:${port}/postgres?sslmode=disable"
