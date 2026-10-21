@@ -58,3 +58,43 @@ func TestAMessageNamingAnotherStreamIsNotAnsweredAsADuplicate(t *testing.T) {
 		})
 	}
 }
+
+// Apply has the same ordering, and the same promise ("Handle and Apply refuse
+// the message with ErrStreamMismatch before it is decided, and nothing is
+// recorded"): a composed transaction answered the duplicate before it checked
+// the stream the message names.
+func TestAMessageNamingAnotherStreamIsNotAnsweredByApply(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	agg.Store = ledgertest.NewStore(t, ledger.RequireActor(false))
+	agg.StreamOf = func(m msg) string {
+		if m.(add).Cap == 1 {
+			return "a"
+		}
+		return "b"
+	}
+
+	ctx := context.Background()
+	if _, err := agg.Handle(ctx, "a", add{1, 1}, ledger.IdempotencyKey("k")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := agg.Store.Transact(ctx, []ledger.Stream{agg.Stream("a")}, func(tx *ledger.Tx) error {
+		at, err := agg.LoadLocked(ctx, tx, "a")
+		if err != nil {
+			return err
+		}
+		_, err = agg.Apply(ctx, tx, &at, add{2, 2}, ledger.IdempotencyKey("k"))
+		return err
+	})
+	if !errors.Is(err, ledger.ErrStreamMismatch) {
+		t.Fatalf("Apply answered a message naming stream %q as a duplicate: %v", "b", err)
+	}
+	entries, err := agg.Store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("the mismatched message was recorded: %d entries", len(entries))
+	}
+}

@@ -296,7 +296,9 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
 - **Safe retries.** `IdempotencyKey` returns the first answer, refusals
   included. A stored result is decoded through the `Results` codec's
   upcasters, so a retry gets the current shape; a field added since it was
-  recorded comes back as its zero value unless the upcaster fills it in.
+  recorded comes back as its zero value unless the upcaster fills it in. A
+  request that names an actor or a stream the ledger would refuse is refused
+  rather than answered: a key never stands in for an identity check.
 - **Told when a message was recorded.** Every statement in a write batch runs
   before the caller reads any result, so a handler can fail in Go — a scan or
   a parse — after the transaction has committed. And even when every result is
