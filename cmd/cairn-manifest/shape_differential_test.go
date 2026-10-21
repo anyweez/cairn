@@ -78,6 +78,42 @@ type DiffPtrEmbedded struct {
 	*DiffPlain
 }
 
+// An embedded unexported alias of a pointer to a struct, with a JSON tag:
+// encoding/json writes the pointed-to struct as a named object even though the
+// field is unexported, so a change to the nested struct is a wire change the
+// manifest has to show.
+type aliasPointerMetaV1 struct {
+	Old string `json:"old"`
+}
+
+type aliasPointerMetaV2 struct {
+	New string `json:"new"`
+}
+
+type aliasPointerV1 = *aliasPointerMetaV1
+type aliasPointerV2 = *aliasPointerMetaV2
+
+type aliasPointerOuterV1 struct {
+	aliasPointerV1 `json:"meta"`
+	Y              int `json:"y"`
+}
+
+type aliasPointerOuterV2 struct {
+	aliasPointerV2 `json:"meta"`
+	Y              int `json:"y"`
+}
+
+// The same declaration without an alias: an embedded unexported pointer to a
+// struct, with a JSON tag.
+type diffUnexportedMeta struct {
+	Old string `json:"old"`
+}
+
+type DiffUnexportedPtrEmbedded struct {
+	*diffUnexportedMeta `json:"meta"`
+	Y                   int `json:"y"`
+}
+
 // A json.Number field is a bare number, not the string its kind suggests.
 type DiffNumber struct {
 	N json.Number `json:"n"`
@@ -152,6 +188,9 @@ var diffFixtures = []any{
 	DiffAddrOuter{},
 	DiffShadow{},
 	DiffPtrEmbedded{},
+	DiffUnexportedPtrEmbedded{},
+	aliasPointerOuterV1{},
+	aliasPointerOuterV2{},
 	DiffNumber{},
 	DiffNumberQuoted{},
 	DiffMapKey{},
@@ -205,7 +244,7 @@ func TestFieldsMatchesEncodingJSONForEveryFixture(t *testing.T) {
 				if raw, ok := written[key]; !ok {
 					t.Errorf("fields() names %q but encoding/json writes %s", entry, raw)
 				} else if kind := jsonKind(shape); kind != "" {
-					if got := jsonRawKind(raw); got != kind {
+					if got := jsonRawKind(raw); got != kind && !populateLeavesItNil(rt, key, shape, got) {
 						t.Errorf("fields() renders %q, %s; encoding/json writes %s, %s", entry, kind, raw, got)
 					}
 				}
@@ -217,6 +256,41 @@ func TestFieldsMatchesEncodingJSONForEveryFixture(t *testing.T) {
 			}
 		})
 	}
+}
+
+// populateLeavesItNil reports whether the null encoding/json wrote for a field
+// is the harness's own doing rather than a divergence: reflection cannot set
+// an unexported field, so an unexported embedded pointer stays nil and
+// encoding/json writes null for it, however the shape describes what it points
+// at. Only that exact case is excused, so a pointer the harness populated is
+// still held to the kind its shape names.
+func populateLeavesItNil(rt reflect.Type, key, shape, got string) bool {
+	return got == "null" && strings.HasPrefix(shape, "*") && unexportedField(rt, key)
+}
+
+// unexportedField reports whether rt declares a field that the JSON key names
+// and reflection cannot set. Untagged embedded structs are searched through,
+// as their fields are promoted; a field behind an unexported field is not,
+// since populate never reaches it either.
+func unexportedField(rt reflect.Type, key string) bool {
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if f.Anonymous && name == "" {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct && unexportedField(ft, key) {
+				return true
+			}
+			continue
+		}
+		if name == key && !f.IsExported() {
+			return true
+		}
+	}
+	return false
 }
 
 // splitEntry splits a rendered entry into its JSON key and its shape. A
