@@ -36,7 +36,9 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// new one. Snapshots of any other version are ignored and state is rebuilt
 	// from events. Each version keeps its own snapshot, so processes running
 	// different versions side by side don't evict each other's; those of
-	// retired versions can be deleted. Empty disables snapshots.
+	// retired versions can be deleted. Empty disables snapshots. It keys
+	// snapshots together with the stream name, so it must be text the ledger
+	// can store and at most 1024 bytes; Validate refuses anything else.
 	StateVersion string
 	// SnapshotEvery is how many entries may accumulate past the last snapshot
 	// before another is taken. Defaults to 100.
@@ -69,9 +71,10 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Kind: a.Kind, ID: id} }
 
 // Validate reports the first thing wrong with how the aggregate is set up: no
-// store, a kind that is empty, contains a slash or cannot be stored, a Decider
-// missing a function, a codec missing from Codecs, or a view or entry view
-// whose name is empty or repeats another's, or whose Write is nil. Every other
+// store, a kind that is empty, contains a slash or cannot be stored, a state
+// version the ledger cannot store or index, a Decider missing a function, a
+// codec missing from Codecs, or a view or entry view whose name is empty or
+// repeats another's, or whose Write is nil. Every other
 // method runs it first, so a mistake is an error rather than a nil-pointer
 // panic on the first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
@@ -85,7 +88,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		// Rebuild, RebuildEntries, Streams and ReadAll pass the Kind to a text
 		// parameter without building a stream name, so an unstorable one would
 		// otherwise reach the driver and come back as a raw SQLSTATE.
-		return fail("Kind must be valid UTF-8 and contain no NUL")
+		return validStoredText(fmt.Sprintf("aggregate %s's Kind", quoteText(a.Kind)), a.Kind)
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
@@ -98,6 +101,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 		return fail("Codecs.Events is nil")
 	case a.Codecs.Effects == nil:
 		return fail("Codecs.Effects is nil")
+	}
+	// The version is half the primary key of cairn.state_snapshots, so it is
+	// bounded like every other text value cairn puts in a btree index. It is
+	// also written into every snapshot row and read back to find them, so a
+	// NUL or invalid UTF-8 is refused here rather than by the driver.
+	if a.StateVersion != "" {
+		if err := validIndexedText(fmt.Sprintf("the snapshot state version %s of aggregate %s", quoteText(a.StateVersion), quoteText(a.Kind)), a.StateVersion); err != nil {
+			return err
+		}
 	}
 	// Batch attributes a failing statement to the view that queued it by name,
 	// so a view needs one of its own.
@@ -185,8 +197,10 @@ func collect(opts []Option) (options, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	if !cairn.StorableText(o.key) {
-		return o, fmt.Errorf("cairn: the idempotency key is not valid UTF-8 or contains a NUL")
+	if o.key != "" {
+		if err := validStoredText("the idempotency key "+quoteText(o.key), o.key); err != nil {
+			return o, err
+		}
 	}
 	return o, nil
 }
@@ -850,6 +864,17 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueSnapshot(b *Batch, at *Loaded[S]) erro
 	}
 	if at.Seq-at.snapshotSeq < every {
 		return nil
+	}
+	if a.StateVersion == "" {
+		return nil
+	}
+	// A snapshot is read back with json.Unmarshal, so it must hold exactly the
+	// state that was stored. CheckStorable refuses the text json.Marshal would
+	// otherwise rewrite - a string that is not valid UTF-8 becomes U+FFFD, and
+	// a NUL cannot be stored at all - so a state that would come back different
+	// is refused here, naming the field, instead of being recorded.
+	if err := codec.CheckStorable(at.State); err != nil {
+		return fmt.Errorf("cairn: the snapshot state of %s cannot be stored: %w", at.Stream, err)
 	}
 	data, err := json.Marshal(at.State)
 	if err != nil {

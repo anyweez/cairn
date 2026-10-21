@@ -192,6 +192,16 @@ BEGIN
     END IF;
 END $$;
 `}},
+
+	// 2: a snapshot keeps the bytes json.Marshal wrote. jsonb parses a state and
+	// re-serialises it, reordering object keys, reformatting numbers and
+	// normalising whitespace, so a state loaded from a snapshot could differ
+	// from the one that was stored. json stores the text as written and returns
+	// it unchanged; every reader and writer of this column already treats it as
+	// text, so a process on an earlier release keeps working across the change
+	// and after a rollback.
+	{Statements: []string{`
+ALTER TABLE cairn.state_snapshots ALTER COLUMN state TYPE json USING state::json`}},
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every

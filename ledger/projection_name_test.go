@@ -2,6 +2,7 @@ package ledger_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/anyweez/cairn/ledger"
@@ -76,5 +77,33 @@ func TestAnUnnamedProjectionDoesNotSilentlyShareACheckpoint(t *testing.T) {
 	}
 	if applied != 2 {
 		t.Fatalf("the second unnamed projection applied %d of 2 entries: it shared the first's checkpoint", applied)
+	}
+}
+
+// A projection's Name is the primary key of cairn.checkpoints, so it is held to
+// the same storability and length rules as every other text value cairn puts in
+// a btree index. Otherwise every CatchUp fails on an index row instead of
+// telling the caller what to change, and a name with a NUL comes back as a raw
+// SQLSTATE.
+func TestAProjectionNameTheLedgerCannotIndexIsRefused(t *testing.T) {
+	t.Parallel()
+	for name, pname := range map[string]string{
+		"NUL":      "read\x00models",
+		"too long": strings.Repeat("r", 1025),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			p := ledger.Projection{
+				Store: ledger.New(nil), Name: pname,
+				Apply: func(context.Context, *ledger.Batch, ledger.Entry) error { return nil },
+			}
+			err := p.Validate()
+			if err == nil {
+				t.Fatal("Validate accepted a projection name the checkpoint index cannot hold")
+			}
+			if !strings.Contains(err.Error(), "Name") {
+				t.Fatalf("the error does not name the projection: %v", err)
+			}
+		})
 	}
 }

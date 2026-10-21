@@ -59,7 +59,7 @@ func TestQASnapshotStateVersionIsBounded(t *testing.T) {
 	agg.SnapshotEvery = 3
 
 	var (
-		version error
+		version  error
 		recorded int
 	)
 	for i := range 4 {

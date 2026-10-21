@@ -60,7 +60,7 @@ func TestValidateRefusesAnUnstorableKind(t *testing.T) {
 			t.Parallel()
 			agg := counterOn(ledger.New(nil))
 			agg.Kind = kind
-			if err := agg.Validate(); err == nil || !strings.Contains(err.Error(), "Kind must be valid UTF-8") {
+			if err := agg.Validate(); err == nil || !strings.Contains(err.Error(), "Kind is not valid UTF-8") {
 				t.Fatalf("Validate: %v", err)
 			}
 		})
@@ -80,5 +80,30 @@ func TestMethodsValidateBeforeTouchingTheDatabase(t *testing.T) {
 	}
 	if _, err := agg.VerifyAll(ctx); err == nil || !strings.Contains(err.Error(), "Codecs.Messages is nil") {
 		t.Fatalf("VerifyAll: %v", err)
+	}
+}
+
+// A StateVersion is half the primary key of cairn.state_snapshots. An
+// unstorable or over-long one fails the snapshot write with a raw SQLSTATE, and
+// since a snapshot comes due again on every later message the stream then
+// records nothing more. Validate refuses it up front, naming the value.
+func TestValidateRefusesAStateVersionTheLedgerCannotIndex(t *testing.T) {
+	t.Parallel()
+	for name, version := range map[string]string{
+		"NUL":      "v\x00",
+		"too long": strings.Repeat("v", 1025),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			agg := counterOn(ledger.New(nil))
+			agg.StateVersion = version
+			err := agg.Validate()
+			if err == nil {
+				t.Fatal("Validate accepted a state version the snapshot index cannot hold")
+			}
+			if msg := err.Error(); !strings.Contains(msg, "version") || !strings.Contains(msg, "snapshot") {
+				t.Fatalf("the error does not name the state version: %v", err)
+			}
+		})
 	}
 }
