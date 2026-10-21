@@ -50,6 +50,17 @@ func run(dir, out, base string, patterns []string) error {
 	if err != nil {
 		return err
 	}
+	// Read the base before writing: -o defaults to spec.manifest.yaml in
+	// -dir, so a local run that checks the committed manifest names the same
+	// file for both. Read after the write and the check compares the manifest
+	// with the copy it just produced.
+	var raw []byte
+	if base != "" {
+		raw, err = os.ReadFile(base)
+		if err != nil {
+			return err
+		}
+	}
 	if out == "-" {
 		_, err = os.Stdout.Write(data)
 	} else {
@@ -59,10 +70,6 @@ func run(dir, out, base string, patterns []string) error {
 		return err
 	}
 
-	raw, err := os.ReadFile(base)
-	if err != nil {
-		return err
-	}
 	// YAML is a superset of the JSON the manifest used to be written as, so
 	// a base from before the switch still reads.
 	var old Manifest
