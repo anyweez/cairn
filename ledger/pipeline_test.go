@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -104,7 +105,8 @@ func TestAViewIsToldWhenItsEntryWasRecorded(t *testing.T) {
 		cause = c
 		return nil
 	}}}
-	h, err := agg.Handle(ctx, "a", add{1, 10})
+	occurred := time.Date(2026, time.March, 4, 5, 6, 7, 123456789, time.UTC)
+	h, err := agg.Handle(ledger.ContextWithMeta(ctx, ledger.Meta{OccurredAt: occurred}), "a", add{1, 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +118,13 @@ func TestAViewIsToldWhenItsEntryWasRecorded(t *testing.T) {
 	if !cause.RecordedAt.Equal(stored.RecordedAt) || !h.Entry.RecordedAt.Equal(stored.RecordedAt) {
 		t.Fatalf("recorded at %v; the view was told %v and Handle returned %v",
 			stored.RecordedAt, cause.RecordedAt, h.Entry.RecordedAt)
+	}
+	// occurred_at keeps microseconds, so the entry a view is handed live and
+	// the one Handle returns must be the stored entry's instant, or a rebuilt
+	// row differs from the live one.
+	if !cause.Meta.OccurredAt.Equal(stored.Meta.OccurredAt) || !h.Entry.Meta.OccurredAt.Equal(stored.Meta.OccurredAt) {
+		t.Fatalf("occurred at %v; the view was told %v and Handle returned %v",
+			stored.Meta.OccurredAt, cause.Meta.OccurredAt, h.Entry.Meta.OccurredAt)
 	}
 	if cause.Position != 0 || cause.TxID != 0 {
 		t.Fatalf("the view was told a position %d and transaction %d not yet known", cause.Position, cause.TxID)

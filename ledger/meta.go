@@ -27,7 +27,9 @@ type Meta struct {
 	// effect delivery's Key. It is not indexed.
 	CausationID string
 	// OccurredAt is when the producer says this happened, which can be well
-	// before it was recorded. Zero when unknown.
+	// before it was recorded. Zero when unknown. It is cut to the microseconds
+	// the occurred_at column keeps, so the entry a view is handed live is the
+	// one a rebuild is handed.
 	OccurredAt time.Time
 	// Extra holds anything else worth keeping, stored as JSON.
 	Extra map[string]any
@@ -121,6 +123,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) meta(ctx context.Context, msg M, o options)
 			}
 			m.Actor = named
 		}
+	}
+	if !m.OccurredAt.IsZero() {
+		// occurred_at is a timestamptz, which keeps microseconds, and pgx
+		// encodes a time.Time as whole microseconds. Cut the value here, where
+		// the entry is built, so the entry a view is handed live, the one
+		// Handle returns and the one stored are the same instant; RecordedAt is
+		// cut the same way by recordingTime.
+		m.OccurredAt = m.OccurredAt.Truncate(time.Microsecond)
 	}
 	if m.Actor == "" && a.Store.requireActor {
 		return Meta{}, fmt.Errorf("%w (%s); set one with ContextWithMeta or WithMeta", ErrNoActor, a.Kind)

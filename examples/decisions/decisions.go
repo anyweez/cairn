@@ -300,6 +300,12 @@ func decide(s State, m Msg) decision {
 	// The ledger stores text as UTF-8 and jsonb, so text it cannot hold must be
 	// refused before the message is recorded. Otherwise the codec would replace
 	// the offending bytes with U+FFFD and the caller would be told it succeeded.
+	// A time it cannot carry as the same instant is refused for the same
+	// reason: time.Time.MarshalJSON writes a zone offset only to the minute, so
+	// an offset with seconds in it (every tzdata zone before about 1900) would
+	// store a different instant, and a year outside [0,9999] cannot be written
+	// at all. The ledger encodes the message the caller sent, not this copy, so
+	// the check is on the message as sent rather than on a normalised one.
 	if err := codec.CheckStorable(m); err != nil {
 		return refuse(Invalid, "%v", err)
 	}
