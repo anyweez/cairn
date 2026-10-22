@@ -2,16 +2,17 @@ package ledger
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // widenedXid renumbers the 32-bit xids the fence reads (a live one's in
 // pg_stat_activity.backend_xid, a prepared one's in pg_prepared_xacts.transaction)
 // onto the 64-bit scale cairn.entries.txid is stored and ordered on, against
-// the measuring transaction's own xid, because those columns carry only the
-// low 32 bits of the transaction ID.
+// the reading statement's snapshot frontier, because those columns carry only
+// the low 32 bits of the transaction ID.
 //
 // CI's clusters are fresh, so the epoch is always 0 there and no integration
 // test can tell wrong widening from right. This one crafts the reference and
@@ -21,147 +22,161 @@ func TestWidenedXidsHitTheWrapBoundaryOnBothSides(t *testing.T) {
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 
-	// crafted names the 32-bit xid (thumb), the measuring xid8 it widens
-	// against (own), and the xid8 the widening has to produce (want).
+	// crafted names the 32-bit xid (thumb), the xid8 frontier it widens
+	// against (xmax), and the xid8 the widening has to produce (want).
 	cases := []struct {
 		thumb int64
-		own   int64
+		xmax  int64
 		want  string
 		what  string
 	}{
-		{50, 4294967396, "4294967346", "below the measuring xid: same epoch"},
+		{50, 4294967396, "4294967346", "below the frontier: same epoch"},
 		{4294967290, 4294967396, "4294967290", "far above its low half: previous epoch"},
-		{100, 4294967396, "4294967396", "at the boundary: the measuring xid itself"},
+		{100, 4294967396, "4294967396", "at the boundary: the frontier itself"},
 		{4294967295, 4294967296, "4294967295", "one below across the wrap: previous epoch"},
 		{0, 8589934591, "8589934592", "one above across the wrap: next epoch"},
-		// The fence reads the view after own was assigned, so it can hold xids a
-		// few newer than own. Those must stay above own, not wrap back 2^32.
-		// Both of these widened a whole epoch too low before the signed
-		// distance, and the first of them did so at epoch 0 too.
-		{105, 4294967396, "4294967401", "a few above its low half: still its epoch, not the previous one"},
+		// The frontier is the latest completed transaction plus one, so the
+		// newest assigned transactions — in flight under any load — sit just
+		// above it. Those must widen to themselves, not to the previous
+		// epoch: read low they would drop the cutoff 2^32, and a transaction
+		// committing in that window could be read past.
+		{300, 250, "300", "the newest in-flight xid, just above the frontier"},
+		{105, 4294967396, "4294967401", "a few above its low half past epoch 0: still its epoch"},
 		{3, 4294967296, "4294967299", "a few above its low half at the wrap boundary"},
-		{105, 100, "105", "a few above at epoch 0: still this epoch"},
 	}
 	const check = `(SELECT ` + widenedXid + `
         FROM (SELECT c.thumb::numeric AS thumb) AS x
-        CROSS JOIN (SELECT c.own::numeric AS own) AS ref)
+        CROSS JOIN (SELECT c.xmax::numeric AS xmax) AS ref)
       = c.want::text::xid8`
 	for _, c := range cases {
 		var ok bool
 		if err := pool.QueryRow(ctx,
-			`WITH crafted(thumb, own, want) AS
+			`WITH crafted(thumb, xmax, want) AS
              (VALUES ($1::numeric, $2::numeric, $3::bigint))
              SELECT `+check+` FROM crafted AS c`,
-			c.thumb, c.own, c.want).Scan(&ok); err != nil {
+			c.thumb, c.xmax, c.want).Scan(&ok); err != nil {
 			t.Fatal(err)
 		}
 		if !ok {
 			t.Fatalf("widening %d against %d: want %s — %s",
-				c.thumb, c.own, c.want, c.what)
+				c.thumb, c.xmax, c.want, c.what)
 		}
 	}
 }
 
-// readAll assigns the measuring transaction's xid in a statement of its own,
-// ahead of the fence, so that every transaction the fence's view holds was
-// assigned its xid before or after own, never in between. The statements have
-// to be one transaction, and they have to run in that order. This runs the
-// pair in readAll's shape — one batch on the pool, ended by a single Sync —
-// and asserts the fence is the xid the first statement assigned: in separate
-// transactions the fence would measure the later one.
-func TestAFenceIsTheXidItsBatchAssigned(t *testing.T) {
+// A standalone ReadAll is a pure read, and it has to stay one. Assigning the
+// reading transaction a transaction ID would use one up on every poll — which
+// hastens the epoch rollover the fence's widening exists to cross — write a
+// commit WAL record for a read, and fail outright on a hot standby, where no
+// transaction may be assigned an ID. The fence takes its reference from the
+// statement's own snapshot instead. A caller's transaction is where that is
+// observable: run the read on one and it must come back with no ID assigned.
+func TestReadAllTakesNoTransactionID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
+	if err := New(pool, RequireActor(false)).Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
 
-	var b pgx.Batch
-	b.Queue(`SELECT pg_current_xact_id()`)
-	b.Queue(logFence)
-	results := pool.SendBatch(ctx, &b)
-	var assigned, fence string
-	if err := results.QueryRow().Scan(&assigned); err != nil {
-		t.Fatal(err)
-	}
-	if err := results.QueryRow().Scan(&fence); err != nil {
-		_ = results.Close()
-		t.Fatal(err)
-	}
-	if err := results.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if fence != assigned {
-		t.Fatalf("the fence is %s after a batch that assigned %s: the statements did not share a transaction, so the fence was measured after an xid later than the one the view was read after", fence, assigned)
-	}
-}
-
-// The view is read after the measuring transaction's xid was assigned, so it
-// can hold transactions assigned a few xids after own and still in flight.
-// Widening one of those against a reference derived from own used to put it a
-// whole 2^32 below — the previous epoch — and the fence went with it, so a
-// transaction committing in that window could be read past.
-//
-// On a fresh cluster (epoch 0) the old code's off-by-one wrapped the negative
-// result to a huge xid8 instead of going low, so this test only catches the
-// regression on a cluster past epoch 0; the crafted cases above are the guard
-// CI can see.
-func TestAFenceIsNotDroppedByTransactionsAssignedAfterTheMeasuringOne(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	pool := emptyDatabase(t)
-
-	measuring, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer measuring.Release()
-	tx, err := measuring.Begin(ctx)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var own string
-	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&own); err != nil {
+	if _, err := readAll(ctx, tx, Cursor{}, 10, nil); err != nil {
 		t.Fatal(err)
 	}
+	var assigned *string
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id_if_assigned()::text`).Scan(&assigned); err != nil {
+		t.Fatal(err)
+	}
+	if assigned != nil {
+		t.Fatalf("readAll assigned transaction %s: every poll of the log would use up an xid and write a commit record, and a hot standby could not run it", *assigned)
+	}
+}
 
-	// Two transactions that take their xids after own and stay open, so the
-	// fence's view holds thumbs newer than the xid it widens against.
+// The fence is capped by the snapshot frontier, which sits at or below the
+// newest assigned transactions: those took their xids after the last commit
+// and are still in flight. Widening one of them with "above the reference's
+// low half is the previous epoch" put it — and the cutoff — a whole 2^32 low,
+// and a transaction committing in that window could be read past. Read by
+// signed distance the thumb stays just above the frontier, and the LEAST holds
+// the fence there.
+//
+// On a fresh cluster (epoch 0) that mis-widen wrapped the negative result to a
+// huge xid8 instead of going low, so this test only catches the regression on
+// a cluster past epoch 0; the crafted cases above are the guard CI can see.
+func TestTheFenceHoldsNewerTransactionsWithoutDroppingAnEpoch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+
+	// Transactions that take their xids after the frontier and stay open, so
+	// the fence's view holds thumbs above the number it widens against.
+	var held []uint64
 	for range 2 {
 		conn, err := pool.Acquire(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Release()
-		newer, err := conn.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = newer.Rollback(ctx) }()
-		var after bool
-		if err := newer.QueryRow(ctx,
-			`SELECT pg_current_xact_id()::text::numeric > $1::text::numeric`, own).Scan(&after); err != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
+		var xid string
+		if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&xid); err != nil {
 			t.Fatal(err)
 		}
-		if !after {
-			t.Fatalf("a held transaction took an xid at or below the measuring %s", own)
+		v, err := strconv.ParseUint(xid, 10, 64)
+		if err != nil {
+			t.Fatal(err)
 		}
+		held = append(held, v)
 	}
+	oldest := min(held[0], held[1])
 
-	var fence string
-	if err := tx.QueryRow(ctx, logFence).Scan(&fence); err != nil {
+	fence, err := readXid8(ctx, pool, logFence)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if fence != own {
-		t.Fatalf("the fence is %s while %s and newer transactions are in flight: it dropped below the measuring xid, so a transaction committing in the window can be read past", fence, own)
+	// A later statement's frontier is at least the fence statement's: it can
+	// only have risen, when another database committed in between.
+	frontier, err := readXid8(ctx, pool, `SELECT pg_snapshot_xmax(pg_current_snapshot())::text`)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if fence > frontier {
+		t.Fatalf("the fence is %d, above the snapshot frontier %d that caps it", fence, frontier)
+	}
+	if fence > oldest {
+		t.Fatalf("the fence is %d while transaction %d is in flight: it passed a transaction that had not finished, so an entry committing late can be read past", fence, oldest)
+	}
+	if oldest-fence >= 1<<31 {
+		t.Fatalf("the fence is %d while the oldest in-flight transaction is %d: a whole epoch low, so this database's entries are held back until it finishes", fence, oldest)
+	}
+}
+
+// readXid8 runs a single-column xid8 query and returns its value as a number.
+func readXid8(ctx context.Context, pool *pgxpool.Pool, sql string) (uint64, error) {
+	var text string
+	if err := pool.QueryRow(ctx, sql).Scan(&text); err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(text, 10, 64)
 }
 
 // At epoch 0 the widening must agree digit for digit with the transaction ID
 // Postgres itself assigns, so a live transaction in this database widens to
-// itself and the fence sits on it. This wires the widening into the fence —
-// the aliases, the cross join, the LEAST — not just the arithmetic above.
-func TestAFenceOnAFreshClusterSitsOnLiveTransactionIds(t *testing.T) {
+// itself and cannot be mistaken for one a wrap away. This wires the widening
+// into the fence — the aliases, the cross join, the LEAST — not just the
+// arithmetic above. The fence it produces sits at the snapshot frontier, at or
+// below the live transaction and in the same epoch, so its entries wait for it
+// to finish instead of being skipped or held back indefinitely.
+func TestALiveTransactionWidensToItselfAndTheFenceHoldsIt(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
@@ -195,11 +210,22 @@ func TestAFenceOnAFreshClusterSitsOnLiveTransactionIds(t *testing.T) {
 		t.Fatalf("live transaction %s widened to %s, want itself; a fence reading it lower stalls every read", xid, widened)
 	}
 
-	var fence string
-	if err := pool.QueryRow(ctx, logFence).Scan(&fence); err != nil {
+	var fenceText string
+	if err := pool.QueryRow(ctx, logFence).Scan(&fenceText); err != nil {
 		t.Fatal(err)
 	}
-	if fence != xid {
-		t.Fatalf("the fence is %s while this database holds transaction %s open; want %s", fence, xid, xid)
+	fence, err := strconv.ParseUint(fenceText, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := strconv.ParseUint(xid, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence > live {
+		t.Fatalf("the fence is %d while this database holds transaction %d open: it would return entries from beyond a transaction still in flight", fence, live)
+	}
+	if live-fence >= 1<<31 {
+		t.Fatalf("the fence is %d while the newest live transaction here is %d: a whole epoch low, so every entry waits for it to finish", fence, live)
 	}
 }

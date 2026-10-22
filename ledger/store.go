@@ -595,49 +595,48 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // backend — and widenedXid widens both sources' 32-bit xids, which carry no
 // epoch, onto the xid8 scale cairn.entries.txid is stored and ordered on.
 //
-// The reference the widening reads against is this transaction's own xid.
-// readAll assigns it in an earlier statement of the same transaction, before
-// the fence, so by the time the fence runs own is fixed: every transaction in
-// the view it reads was assigned its xid either before own (below it) or
-// after own (above it), never in between. That ordering is what closes the
-// window. Left to the fence statement's own pg_current_xact_id(), it would be
-// something SQL evaluation order has to promise and does not: the planner can
-// pull the call up into the aggregate and read pg_stat_activity first, and a
-// transaction assigned an xid in between would be below this statement's own
-// yet absent from the measured set. The cutoff could then sit above a
-// transaction still in flight, a later-assigned transaction could commit and
-// be read past it, and its entry skipped when it commits.
+// The reference the widening reads against is the fence statement's own
+// snapshot frontier, pg_snapshot_xmax(pg_current_snapshot()) — an xid8, so it
+// carries the epoch the 32-bit columns drop. Postgres hands out transaction
+// IDs from one counter and refuses a new one once the oldest live transaction
+// would fall 2^31 behind, so every live transaction is within 2^31 of that
+// frontier in either direction. The signed distance below is therefore exact
+// for every thumb the fence can read.
 //
-// Widening is a signed distance. own minus the shortest signed distance from
-// own's low 32 bits to the thumb is exact for any xid within 2^31 of own in
-// either direction. The thumb can also be a few xids above own's low half —
-// the view is read after own was assigned, so transactions that took an xid
-// in between are in it — so the distance has to go positive as well as
-// negative; reading such a thumb as the previous epoch would drop the cutoff
-// a whole 2^32.
+// That frontier is the statement's snapshot, not one taken wherever the
+// function is evaluated: Postgres takes a statement's snapshot before the
+// executor runs, so it is fixed before the view is read. A transaction
+// assigned after that point has an ID at or above the frontier, and the LEAST
+// with the frontier keeps the cutoff at or below it — no transaction of our
+// own is needed to hold that line.
 //
-// pg_snapshot_xmax was the other candidate and is wrong: it is the latest
-// completed transaction plus one, not the next to assign, and a transaction
-// whose xid is ahead of that completion frontier (the newest assigned, still
-// in flight under any load) widens a wrap too low. The fence would sit
-// below every stored entry for as long as one of them is open — under write
-// load, always — which is what the epoch-less cast did to begin with.
+// Nothing in the read path assigns a transaction ID, and nothing should. A
+// standalone ReadAll is a pure read: assigning an xid uses one up on every
+// poll, hastening the epoch rollover this widening exists to cross, writes a
+// commit WAL record for a read, and fails outright on a hot standby.
 //
-// The LEAST with pg_current_xact_id() keeps the cutoff at or below this
-// transaction even if the in-flight set did not contain it. It always should
-// now: own is assigned, and the view is read after that. It is kept so a
-// caller that measured with a stats snapshot from an earlier statement — as
-// the first-read rule below forbids — still cannot lift the cutoff above its
-// own xid.
+// Widening is a signed distance: the frontier minus the shortest signed
+// distance from the frontier's low 32 bits to the thumb is exact for any xid
+// within 2^31 of the frontier in either direction.
+//
+// pg_snapshot_xmax was rejected once, and the widening was why. It is the
+// latest completed transaction plus one, not the newest assigned one, so under
+// any write load the newest assigned transaction — still in flight — sits
+// above it. A widening that read a thumb above the reference's low half as the
+// previous epoch put that thumb a whole 2^32 low, and the cutoff with it: the
+// same stall as the epoch-less cast, at every epoch past 0. Read by signed
+// distance the thumb stays just above the frontier, and the LEAST keeps the
+// cutoff at the frontier and no lower.
 //
 // Measuring before the read's snapshot is what makes the cutoff sound. A
 // transaction that is in flight when the read takes its snapshot either was
 // in flight when the fence read the view, and is in the measured set with
-// its widened true value, or was assigned its transaction ID after own, and
-// so is above the cutoff, which sits at or below own. Measuring inside the
-// read would be unsound: its snapshot is taken before its own subqueries read
-// pg_stat_activity, so a transaction that commits in between is neither
-// visible to the snapshot nor counted in the in-flight set.
+// its widened true value, or was assigned its transaction ID after the
+// fence's snapshot, and so is at or above the frontier the cutoff is capped
+// by. Measuring inside the read would be unsound: its snapshot is taken
+// before its own subqueries read pg_stat_activity, so a transaction that
+// commits in between is neither visible to the snapshot nor counted in the
+// in-flight set.
 //
 // The read's snapshot has to be taken after the fence statement's. Under
 // READ COMMITTED every statement gets its own, so the batch below holds:
@@ -668,26 +667,26 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 //
 // One blind spot the widening cannot treat differently from the exact case:
 // a 32-bit xid carries no epoch, so nothing can say how many wraps an older
-// one is past. The signed distance is exact within 2^31 of own in either
-// direction, which covers every live transaction — Postgres refuses new xids
-// before a running one can fall that far behind — but not a prepared one. A
-// prepared transaction still open after the cluster has consumed another 2^31
-// xids widens above own instead of below it, and a reader could pass its
-// commit. pg_prepared_xacts is meant to be emptied out — a prepared
-// transaction is committed or rolled back in ordinary operation, and cairn's
-// own tests roll theirs back — so the fence assumes nothing is still there
-// across a wrap.
+// one is past. The signed distance is exact within 2^31 of the frontier in
+// either direction, which covers every live transaction — Postgres refuses
+// new xids before a running one can fall that far behind — but not a prepared
+// one. A prepared transaction still open after the cluster has consumed
+// another 2^31 xids widens above the frontier instead of below it, and a
+// reader could pass its commit. pg_prepared_xacts is meant to be emptied
+// out — a prepared transaction is committed or rolled back in ordinary
+// operation, and cairn's own tests roll theirs back — so the fence assumes
+// nothing is still there across a wrap.
 //
 // Postgres's mod() takes the dividend's sign, so 2^32 is added before the mod
-// below to keep the argument non-negative: own's low half less a thumb just
-// under 2^32 is still negative after 2^31 is added.
-const widenedXid = `(ref.own - (
-      ((ref.own % 4294967296::numeric) - x.thumb + 2147483648::numeric
+// below to keep the argument non-negative: the frontier's low half less a
+// thumb just under 2^32 is still negative after 2^31 is added.
+const widenedXid = `(ref.xmax - (
+      ((ref.xmax % 4294967296::numeric) - x.thumb + 2147483648::numeric
        + 4294967296::numeric) % 4294967296::numeric
       - 2147483648::numeric))::text::xid8`
 
 const fenceRef = `
-    (SELECT pg_current_xact_id()::text::numeric AS own)`
+    (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::numeric AS xmax)`
 
 const logFence = `SELECT set_config('cairn.fence', LEAST(COALESCE((
   SELECT min(` + widenedXid + `)
@@ -697,7 +696,7 @@ const logFence = `SELECT set_config('cairn.fence', LEAST(COALESCE((
         SELECT transaction::text::numeric FROM pg_prepared_xacts
         WHERE database = current_database()) AS x(thumb)
   CROSS JOIN ` + fenceRef + ` AS ref
-), '18446744073709551615'::xid8), pg_current_xact_id())::text, true)`
+), '18446744073709551615'::xid8), pg_snapshot_xmax(pg_current_snapshot()))::text, true)`
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	for _, kind := range kinds {
@@ -720,23 +719,14 @@ WHERE (txid, position) > ($1::text::xid8, $2)
 
 	// The fence and the read go out together, in one round trip, so CatchUp
 	// stays within its budget. pgx runs a batch in an implicit transaction and
-	// ends it with a single Sync, so all three statements share it and run in
-	// order: the first assigns this transaction's xid, the second measures the
-	// fence against it, and the read sees the setting the second made. The
-	// assignment is a statement of its own so that it happens before the fence
-	// reads pg_stat_activity as a matter of statement order, rather than being
-	// something the fence's own plan would have to evaluate in the right order.
+	// ends it with a single Sync, so both statements share it and run in order:
+	// the fence measures the cutoff, and the read sees the setting it made.
+	// Neither statement takes a transaction ID; see logFence for why the read
+	// path must not.
 	var b pgx.Batch
-	b.Queue(`SELECT pg_current_xact_id()`)
 	b.Queue(logFence)
 	b.Queue(sql, args...)
 	results := q.SendBatch(ctx, &b)
-	// Consume the assignment: its value is not needed, only that it was made
-	// before the fence runs.
-	if _, err := results.Exec(); err != nil {
-		_ = results.Close()
-		return nil, fmt.Errorf("cairn: assigning the log fence's xid: %w", err)
-	}
 	var fence string
 	if err := results.QueryRow().Scan(&fence); err != nil {
 		_ = results.Close()
