@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -139,10 +140,91 @@ func Incompatible(old, m *Manifest) []string {
 }
 
 // sameFields compares shapes by field, not by order: decoding matches JSON
-// keys by name, so moving a field changes nothing that is stored.
+// keys by name, so moving a field changes nothing that is stored. A struct
+// nested in a field is rendered inline in the one string for that field, so
+// this must hold at every depth: canonicalFields sorts the members of each
+// nested struct before the two lists are compared.
 func sameFields(a, b []string) bool {
-	a, b = slices.Clone(a), slices.Clone(b)
+	a, b = canonicalFields(a), canonicalFields(b)
 	slices.Sort(a)
 	slices.Sort(b)
 	return slices.Equal(a, b)
+}
+
+// canonicalFields sorts the members of every struct in each rendered shape, so
+// two manifests written by different field orders compare equal.
+func canonicalFields(fields []string) []string {
+	out := make([]string, len(fields))
+	for i, f := range fields {
+		out[i] = canonicalShape(f)
+	}
+	return out
+}
+
+// canonicalShape returns shape with the members of every struct it holds
+// sorted, so reordering a nested struct's fields leaves it unchanged. The
+// walk is recursive because a member's shape may hold structs of its own, and
+// it counts brackets rather than searching for ", " because a generic type
+// name or a function signature holds commas that do not separate members.
+func canonicalShape(shape string) string {
+	open := strings.IndexByte(shape, '{')
+	if open < 0 {
+		return shape
+	}
+	close, ok := matchingClose(shape, open)
+	if !ok {
+		// A shape the shaper does not normally produce: a JSON tag may hold "{",
+		// which makes the rendering ambiguous. Compare it as it is rather than
+		// risk folding two shapes that are not the same one.
+		return shape
+	}
+	members := splitMembers(shape[open+1 : close])
+	for i, m := range members {
+		members[i] = canonicalShape(m)
+	}
+	slices.Sort(members)
+	return shape[:open] + "{" + strings.Join(members, ", ") + "}" + canonicalShape(shape[close+1:])
+}
+
+// matchingClose returns the index of the bracket that closes the one at open.
+func matchingClose(s string, open int) (int, bool) {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// splitMembers splits a struct's rendered body at the commas that separate its
+// fields, ignoring the commas nested in a member's own shape. Exactly the one
+// space the shaper writes after a comma is dropped, so a JSON name that begins
+// with a space keeps it.
+func splitMembers(body string) []string {
+	var members []string
+	depth, start := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				members = append(members, body[start:i])
+				start = i + 1
+				if start < len(body) && body[start] == ' ' {
+					start++
+				}
+			}
+		}
+	}
+	return append(members, body[start:])
 }
