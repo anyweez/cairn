@@ -102,7 +102,8 @@ WITH claimed AS (
         LIMIT $2)
     RETURNING id, stream, kind, seq, idx, effect, attempts)
 SELECT c.id, c.stream, c.kind, c.seq, c.idx, c.effect, c.attempts,
-    coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, '')
+    coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, ''),
+    e.occurred_at, e.extra
 FROM claimed c JOIN cairn.entries e ON e.stream = c.stream AND e.seq = c.seq
 ORDER BY c.id`,
 		d.Kind, cfg.batch, cfg.lease.Seconds())
@@ -122,12 +123,18 @@ ORDER BY c.id`,
 	for rows.Next() {
 		var c claimed
 		var name, kind string
+		var occurred *time.Time
+		var extra []byte
 		if err := rows.Scan(&c.id, &name, &kind, &c.seq, &c.idx, &c.effect, &c.attempts,
-			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID); err != nil {
+			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID, &occurred, &extra); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		c.stream = parseStream(name, kind)
+		if err := decodeMetaTail(&c.meta, occurred, extra); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("cairn: %s#%d metadata: %w", c.stream, c.seq, err)
+		}
 		batch = append(batch, c)
 	}
 	rows.Close()
