@@ -243,12 +243,12 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 					// anonymous field whose type is a struct; such a field
 					// reaches here only when its tag names it (an untagged
 					// embedded struct was flattened above), and encoding/json
-					// marshals it as a named object.
-					innerType := f.Type()
-					if ptr, ok := innerType.(*types.Pointer); ok {
-						innerType = ptr.Elem()
-					}
-					if _, ok := innerType.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
+					// marshals it as a named object. Test the resolved type
+					// above rather than f.Type(), so `type A = *T` is seen as
+					// the struct encoding/json's reflect sees: an alias is a
+					// *types.Alias whose underlying type is a pointer, not the
+					// *types.Pointer a field's declaration spells.
+					if _, ok := typ.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
 						continue
 					}
 				}
