@@ -3,12 +3,15 @@ package ledger
 import (
 	"context"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // widenedXid renumbers the 32-bit xids the fence reads (a live one's in
 // pg_stat_activity.backend_xid, a prepared one's in pg_prepared_xacts.transaction)
-// onto the 64-bit scale cairn.entries.txid is stored and ordered on, because
-// those columns carry only the low 32 bits of the transaction ID.
+// onto the 64-bit scale cairn.entries.txid is stored and ordered on, against
+// the measuring transaction's own xid, because those columns carry only the
+// low 32 bits of the transaction ID.
 //
 // CI's clusters are fresh, so the epoch is always 0 there and no integration
 // test can tell wrong widening from right. This one crafts the reference and
@@ -18,83 +21,139 @@ func TestWidenedXidsHitTheWrapBoundaryOnBothSides(t *testing.T) {
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 
-	// crafted names the 32-bit xid (thumb), the reference it widens under
-	// (ref_low = the low 32 bits of the next xid, ref_epoch its epoch), and
-	// the xid8 the widening has to produce (want).
+	// crafted names the 32-bit xid (thumb), the measuring xid8 it widens
+	// against (own), and the xid8 the widening has to produce (want).
 	cases := []struct {
-		thumb    int64
-		refLow   int64
-		refEpoch int64
-		want     string
-		what     string
+		thumb int64
+		own   int64
+		want  string
+		what  string
 	}{
-		{50, 100, 1, "4294967346", "same epoch as the next xid"},
-		{4294967290, 100, 1, "4294967290", "above the next xid's low half: previous epoch"},
-		{100, 100, 1, "4294967396", "at the boundary: same epoch (no transaction can carry the next-to-assign xid)"},
-		{4294967295, 0, 1, "4294967295", "just below the reference's low half: previous epoch"},
-		{4294967294, 4294967295, 0, "4294967294", "epoch 0 left alone: the previous epoch does not exist"},
+		{50, 4294967396, "4294967346", "below the measuring xid: same epoch"},
+		{4294967290, 4294967396, "4294967290", "far above its low half: previous epoch"},
+		{100, 4294967396, "4294967396", "at the boundary: the measuring xid itself"},
+		{4294967295, 4294967296, "4294967295", "one below across the wrap: previous epoch"},
+		{0, 8589934591, "8589934592", "one above across the wrap: next epoch"},
+		// The fence reads the view after own was assigned, so it can hold xids a
+		// few newer than own. Those must stay above own, not wrap back 2^32.
+		// Both of these widened a whole epoch too low before the signed
+		// distance, and the first of them did so at epoch 0 too.
+		{105, 4294967396, "4294967401", "a few above its low half: still its epoch, not the previous one"},
+		{3, 4294967296, "4294967299", "a few above its low half at the wrap boundary"},
+		{105, 100, "105", "a few above at epoch 0: still this epoch"},
 	}
 	const check = `(SELECT ` + widenedXid + `
         FROM (SELECT c.thumb::numeric AS thumb) AS x
-        CROSS JOIN (SELECT c.ref_low::numeric AS low, c.ref_epoch::numeric AS epoch) AS ref)
+        CROSS JOIN (SELECT c.own::numeric AS own) AS ref)
       = c.want::text::xid8`
 	for _, c := range cases {
 		var ok bool
 		if err := pool.QueryRow(ctx,
-			`WITH crafted(thumb, ref_low, ref_epoch, want) AS
-             (VALUES ($1::numeric, $2::numeric, $3::numeric, $4::bigint))
+			`WITH crafted(thumb, own, want) AS
+             (VALUES ($1::numeric, $2::numeric, $3::bigint))
              SELECT `+check+` FROM crafted AS c`,
-			c.thumb, c.refLow, c.refEpoch, c.want).Scan(&ok); err != nil {
+			c.thumb, c.own, c.want).Scan(&ok); err != nil {
 			t.Fatal(err)
 		}
 		if !ok {
-			t.Fatalf("widening %d under (low %d, epoch %d): want %s — %s",
-				c.thumb, c.refLow, c.refEpoch, c.want, c.what)
+			t.Fatalf("widening %d against %d: want %s — %s",
+				c.thumb, c.own, c.want, c.what)
 		}
 	}
 }
 
-// With nothing else in flight in the database, the in-flight set is empty —
-// pg_stat_activity is read before this statement is assigned its own xid, so
-// its own backend_xid is not in it — and the fence has to bound itself with
-// the measuring transaction's own xid rather than fall back to the sentinel.
-// At the sentinel there is no cutoff at all: a transaction assigned an xid
-// after the fence can have a later-assigned, already-committed transaction's
-// entries returned ahead of it, so the cursor passes it and its own entry is
-// skipped when it commits.
-func TestAFenceOnAnIdleDatabaseIsTheMeasuringTransaction(t *testing.T) {
+// readAll assigns the measuring transaction's xid in a statement of its own,
+// ahead of the fence, so that every transaction the fence's view holds was
+// assigned its xid before or after own, never in between. The statements have
+// to be one transaction, and they have to run in that order. This runs the
+// pair in readAll's shape — one batch on the pool, ended by a single Sync —
+// and asserts the fence is the xid the first statement assigned: in separate
+// transactions the fence would measure the later one.
+func TestAFenceIsTheXidItsBatchAssigned(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := emptyDatabase(t)
 
-	conn, err := pool.Acquire(ctx)
+	var b pgx.Batch
+	b.Queue(`SELECT pg_current_xact_id()`)
+	b.Queue(logFence)
+	results := pool.SendBatch(ctx, &b)
+	var assigned, fence string
+	if err := results.QueryRow().Scan(&assigned); err != nil {
+		t.Fatal(err)
+	}
+	if err := results.QueryRow().Scan(&fence); err != nil {
+		_ = results.Close()
+		t.Fatal(err)
+	}
+	if err := results.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fence != assigned {
+		t.Fatalf("the fence is %s after a batch that assigned %s: the statements did not share a transaction, so the fence was measured after an xid later than the one the view was read after", fence, assigned)
+	}
+}
+
+// The view is read after the measuring transaction's xid was assigned, so it
+// can hold transactions assigned a few xids after own and still in flight.
+// Widening one of those against a reference derived from own used to put it a
+// whole 2^32 below — the previous epoch — and the fence went with it, so a
+// transaction committing in that window could be read past.
+//
+// On a fresh cluster (epoch 0) the old code's off-by-one wrapped the negative
+// result to a huge xid8 instead of going low, so this test only catches the
+// regression on a cluster past epoch 0; the crafted cases above are the guard
+// CI can see.
+func TestAFenceIsNotDroppedByTransactionsAssignedAfterTheMeasuringOne(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+
+	measuring, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Release()
-	tx, err := conn.Begin(ctx)
+	defer measuring.Release()
+	tx, err := measuring.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// The fence goes first, while this transaction has no xid yet. Read after
-	// a statement that already assigned one, it would be in the in-flight set
-	// and the empty case would never be reached.
+	var own string
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&own); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two transactions that take their xids after own and stay open, so the
+	// fence's view holds thumbs newer than the xid it widens against.
+	for range 2 {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		newer, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = newer.Rollback(ctx) }()
+		var after bool
+		if err := newer.QueryRow(ctx,
+			`SELECT pg_current_xact_id()::text::numeric > $1::text::numeric`, own).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if !after {
+			t.Fatalf("a held transaction took an xid at or below the measuring %s", own)
+		}
+	}
+
 	var fence string
 	if err := tx.QueryRow(ctx, logFence).Scan(&fence); err != nil {
 		t.Fatal(err)
 	}
-	if fence == "18446744073709551615" {
-		t.Fatalf("the fence is the sentinel with no other transaction open: no cutoff, so entries committed ahead of a transaction assigned after the fence are returned past its cursor and its own entry is skipped")
-	}
-
-	var xid string
-	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()::text`).Scan(&xid); err != nil {
-		t.Fatal(err)
-	}
-	if fence != xid {
-		t.Fatalf("the fence is %s on an otherwise idle database, want the measuring transaction's own %s", fence, xid)
+	if fence != own {
+		t.Fatalf("the fence is %s while %s and newer transactions are in flight: it dropped below the measuring xid, so a transaction committing in the window can be read past", fence, own)
 	}
 }
 
