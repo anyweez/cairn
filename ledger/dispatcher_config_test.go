@@ -2,9 +2,11 @@ package ledger_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/anyweez/cairn/codec"
 	"github.com/anyweez/cairn/ledger"
 )
 
@@ -16,6 +18,43 @@ func panicked(f func() error) (err error, panicked bool) {
 		}
 	}()
 	return f(), false
+}
+
+// Validate is what Run and DrainOnce consult, and it names the field that is
+// missing rather than leaving the mistake to the first dereference.
+func TestADispatcherNamesTheMissingField(t *testing.T) {
+	t.Parallel()
+	complete := func() *ledger.Dispatcher[effect] {
+		return &ledger.Dispatcher[effect]{
+			Store: &ledger.Store{}, Kind: "counter", Effects: codec.New[effect](),
+			Handle: func(context.Context, ledger.Delivery[effect]) error { return nil },
+		}
+	}
+	if err := complete().Validate(); err != nil {
+		t.Fatalf("a complete dispatcher: %v", err)
+	}
+	cases := map[string]func(*ledger.Dispatcher[effect]){
+		"Store is nil":           func(d *ledger.Dispatcher[effect]) { d.Store = nil },
+		"Kind must be non-empty": func(d *ledger.Dispatcher[effect]) { d.Kind = "" },
+		"Effects is nil":         func(d *ledger.Dispatcher[effect]) { d.Effects = nil },
+		"Handle is nil":          func(d *ledger.Dispatcher[effect]) { d.Handle = nil },
+	}
+	for want, breakIt := range cases {
+		d := complete()
+		breakIt(d)
+		if err := d.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate with %s: got %v", want, err)
+		}
+		if _, err := d.DrainOnce(context.Background()); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("DrainOnce with %s: got %v", want, err)
+		}
+		// A configuration mistake is not retried: Run reports it even with
+		// OnError set, and before it would wait for the interval.
+		d.OnError = func(error) { t.Error("Run reported a configuration mistake to OnError") }
+		if err := d.Run(context.Background(), time.Hour); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Run with %s: got %v", want, err)
+		}
+	}
 }
 
 // A Dispatcher is configured like an Aggregate or a Projection, by a struct

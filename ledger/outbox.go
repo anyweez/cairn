@@ -59,6 +59,26 @@ type Dispatcher[Ef any] struct {
 	OnError func(error)
 }
 
+// Validate reports the first thing wrong with how the dispatcher is set up: no
+// store, no Kind, no Effects codec, or no Handle. DrainOnce runs it before
+// claiming anything, so a wiring mistake is an error rather than a nil-pointer
+// panic, or a nil handler recorded as a failed attempt and retried for ever;
+// call it at startup to fail before then.
+func (d *Dispatcher[Ef]) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: dispatcher %s: %s", quoteText(d.Kind), what) }
+	switch {
+	case d.Store == nil:
+		return fail("Store is nil")
+	case d.Kind == "":
+		return fail("Kind must be non-empty")
+	case d.Effects == nil:
+		return fail("Effects is nil")
+	case d.Handle == nil:
+		return fail("Handle is nil")
+	}
+	return nil
+}
+
 type dispatchConfig struct {
 	batch   int
 	lease   time.Duration
@@ -90,6 +110,9 @@ func (d *Dispatcher[Ef]) config() dispatchConfig {
 // ran out, and whose effect another dispatcher has since claimed, therefore
 // cannot mark it done or failed.
 func (d *Dispatcher[Ef]) DrainOnce(ctx context.Context) (int, error) {
+	if err := d.Validate(); err != nil {
+		return 0, err
+	}
 	cfg := d.config()
 	rows, err := d.Store.pool.Query(ctx, `
 WITH claimed AS (
@@ -245,8 +268,17 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byt
 }
 
 // Run drains the outbox every interval until ctx is done. An error ends it
-// unless OnError is set. The interval must be positive.
+// unless OnError is set. The interval must be positive. A dispatcher that is
+// not configured is reported before the first interval: retrying it cannot fix
+// the mistake.
 func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error {
+	// poll rejects a non-positive interval, and does so before OnError can
+	// swallow it, so keep that the first thing Run reports.
+	if interval > 0 {
+		if err := d.Validate(); err != nil {
+			return err
+		}
+	}
 	return poll(ctx, interval, d.OnError, func(ctx context.Context) (bool, error) {
 		n, err := d.DrainOnce(ctx)
 		return n > 0, err
