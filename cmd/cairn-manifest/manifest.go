@@ -379,19 +379,26 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		x.codecAt[c.key()] = at
 		x.codecs[c.key()] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
-		// The codec can be named through an alias of *codec.Codec[T], which
-		// go/types keeps as an *types.Alias until it is resolved; unalias before
-		// and after the pointer test so the receiver is *codec.Codec[T].
-		recv := types.Unalias(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv())
-		if ptr, ok := recv.(*types.Pointer); ok {
-			recv = types.Unalias(ptr.Elem())
+		// The declaring receiver is *codec.Codec[T] whether the caller names it
+		// directly, through an alias, or promotes it from an embedded codec;
+		// the selection's own receiver is only whatever the caller spelled.
+		recv, _ := methodRecv(info, call)
+		named, ok := recv.(*types.Named)
+		if !ok || named.TypeArgs().Len() != 1 {
+			x.errorf(p.Fset, call.Pos(), "Upcast: cannot read which codec this call registers on")
+			return
 		}
-		sum := recv.(*types.Named).TypeArgs().At(0)
+		sum := named.TypeArgs().At(0)
 		if !x.concrete(p, call.Pos(), sum, "Upcast", "the codec this upcaster belongs to comes from the caller's type argument") {
 			return
 		}
-		name, okName := x.constant(p, call.Args[0])
-		from, okFrom := x.constant(p, call.Args[1])
+		// A method expression passes the codec as its first argument.
+		first := 0
+		if info.Selections[call.Fun.(*ast.SelectorExpr)].Kind() == types.MethodExpr {
+			first = 1
+		}
+		name, okName := x.constant(p, call.Args[first])
+		from, okFrom := x.constant(p, call.Args[first+1])
 		if !okName || !okFrom {
 			x.errorf(p.Fset, call.Pos(), "Upcast: the name and version must be constants")
 			return
@@ -403,6 +410,8 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			from: int(n),
 			pos:  x.position(p.Fset, call.Pos()),
 		})
+	case unattributedUpcast(info, call):
+		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
 	}
 }
 
@@ -535,22 +544,104 @@ func isFunc(info *types.Info, call *ast.CallExpr, pkg, name string) bool {
 		fn.Type().(*types.Signature).Recv() == nil
 }
 
+// methodRecv returns the receiver type a selected method declares, with an
+// alias and a pointer resolved. A selection's receiver is the type the caller
+// wrote -- an alias, or the outer type of a promoted method -- so it names a
+// codec only for the forms the extractor anticipates. The method's own
+// receiver names the same codec however the call is written.
+func methodRecv(info *types.Info, call *ast.CallExpr) (types.Type, bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil, false
+	}
+	s, ok := info.Selections[sel]
+	if !ok {
+		return nil, false
+	}
+	fn, ok := s.Obj().(*types.Func)
+	if !ok {
+		return nil, false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return nil, false
+	}
+	r := types.Unalias(sig.Recv().Type())
+	if ptr, ok := r.(*types.Pointer); ok {
+		r = types.Unalias(ptr.Elem())
+	}
+	return r, true
+}
+
 func isMethod(info *types.Info, call *ast.CallExpr, pkg, recv, name string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
 	s, ok := info.Selections[sel]
-	if !ok || s.Kind() != types.MethodVal {
+	if !ok {
 		return false
 	}
-	fn := s.Obj().(*types.Func)
-	// The receiver can be named through an alias of *codec.Codec[T], which
-	// go/types keeps as an *types.Alias; unalias before and after the pointer
-	// test, or the pointer never matches and isNamed sees the alias.
-	r := types.Unalias(s.Recv())
-	if ptr, ok := r.(*types.Pointer); ok {
-		r = types.Unalias(ptr.Elem())
+	fn, ok := s.Obj().(*types.Func)
+	if !ok {
+		return false
 	}
-	return fn.Pkg() != nil && fn.Pkg().Path() == pkg && fn.Name() == name && isNamed(r, pkg, recv)
+	r, ok := methodRecv(info, call)
+	return ok && fn.Pkg() != nil && fn.Pkg().Path() == pkg && fn.Name() == name && isNamed(r, pkg, recv)
+}
+
+// unattributedUpcast reports a call to an Upcast method on a type that embeds a
+// codec but does not use the codec's method. A promoted call is the codec's own
+// method and was read above. A wrapper that declares its own Upcast hides the
+// codec's, and only that method knows what it does with the name and version,
+// so the extractor refuses rather than silently records nothing.
+func unattributedUpcast(info *types.Info, call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	s, ok := info.Selections[sel]
+	if !ok {
+		return false
+	}
+	fn, ok := s.Obj().(*types.Func)
+	if !ok || fn.Name() != "Upcast" {
+		return false
+	}
+	if fn.Pkg() != nil && fn.Pkg().Path() == codecPath {
+		return false
+	}
+	return embedsCodec(s.Recv())
+}
+
+// embedsCodec reports whether t carries a *codec.Codec in an embedded field, at
+// any depth. It tells a wrapper that declares its own Upcast apart from an
+// unrelated type that happens to have a method of that name.
+func embedsCodec(t types.Type) bool {
+	return embedsCodecIn(t, map[types.Type]bool{})
+}
+
+func embedsCodecIn(t types.Type, seen map[types.Type]bool) bool {
+	t = types.Unalias(t)
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(ptr.Elem())
+	}
+	if isNamed(t, codecPath, "Codec") {
+		return true
+	}
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	for i := range st.NumFields() {
+		f := st.Field(i)
+		if f.Embedded() && embedsCodecIn(f.Type(), seen) {
+			return true
+		}
+	}
+	return false
 }
