@@ -332,6 +332,22 @@ func TestRunChecksTheBase(t *testing.T) {
 	}
 }
 
+// A platform's own file must not read as a removal: the base was written by a
+// host that built a different set of files, and the tree is correct on both.
+func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
+	dir := constrainedModule(t)
+
+	t.Setenv("GOOS", "linux")
+	if err := run(dir, "linux.yaml", "", []string{"./..."}); err != nil {
+		t.Fatalf("writing the base on linux: %v", err)
+	}
+
+	t.Setenv("GOOS", "darwin")
+	if err := run(dir, "darwin.yaml", filepath.Join(dir, "linux.yaml"), []string{"./..."}); err != nil {
+		t.Fatalf("the manifest generated on darwin reports the base's stored types as broken: %v", err)
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}
