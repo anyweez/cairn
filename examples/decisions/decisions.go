@@ -84,7 +84,28 @@ func (s State) option(id string) bool {
 
 // ---- messages ----------------------------------------------------------------
 
-type Msg interface{ trigger() string }
+// Trigger names what a message asks of the lifecycle. The messages and the
+// table's edges are written from the same constants, so the word a message
+// asks with and the word an edge answers to cannot drift apart.
+type Trigger string
+
+const (
+	onCreate        Trigger = "create"
+	onEdit          Trigger = "edit"
+	onAddOption     Trigger = "add_option"
+	onSavePosition  Trigger = "save_position"
+	onRecordOutcome Trigger = "record_outcome"
+	onSetStatus     Trigger = "set_status"
+	onSupersede     Trigger = "supersede"
+	onAcknowledge   Trigger = "acknowledge"
+)
+
+// setStatusTrigger is the trigger a move to a status asks for. A status change
+// is one message for several edges, so the trigger carries the destination,
+// and Lifecycle spells those edges as the same expression.
+func setStatusTrigger(to Status) Trigger { return onSetStatus + ":" + Trigger(to) }
+
+type Msg interface{ trigger() Trigger }
 
 type Create struct {
 	ID      string    `json:"id"`
@@ -140,17 +161,17 @@ type Acknowledge struct {
 	Committed bool   `json:"committed"`
 }
 
-func (Create) trigger() string        { return "create" }
-func (Edit) trigger() string          { return "edit" }
-func (AddOption) trigger() string     { return "add_option" }
-func (SavePosition) trigger() string  { return "save_position" }
-func (RecordOutcome) trigger() string { return "record_outcome" }
-func (m SetStatus) trigger() string   { return "set_status:" + string(m.To) }
-func (Supersede) trigger() string     { return "supersede" }
-func (Acknowledge) trigger() string   { return "acknowledge" }
+func (Create) trigger() Trigger        { return onCreate }
+func (Edit) trigger() Trigger          { return onEdit }
+func (AddOption) trigger() Trigger     { return onAddOption }
+func (SavePosition) trigger() Trigger  { return onSavePosition }
+func (RecordOutcome) trigger() Trigger { return onRecordOutcome }
+func (m SetStatus) trigger() Trigger   { return setStatusTrigger(m.To) }
+func (Supersede) trigger() Trigger     { return onSupersede }
+func (Acknowledge) trigger() Trigger   { return onAcknowledge }
 
-// Trigger names what a message asks of the lifecycle.
-func Trigger(m Msg) string { return m.trigger() }
+// TriggerOf names what a message asks of the lifecycle.
+func TriggerOf(m Msg) Trigger { return m.trigger() }
 
 // ---- events and effects --------------------------------------------------------
 
@@ -237,17 +258,17 @@ type Result struct {
 // Lifecycle is every status change the register allows. A settled decision
 // moves only by being superseded or explicitly reopened.
 var Lifecycle = fsm.New(
-	fsm.Edge[Status, string]{From: Uncreated, On: "create", To: Open},
-	fsm.Edge[Status, string]{From: Open, On: "record_outcome", To: Decided},
-	fsm.Edge[Status, string]{From: Open, On: "set_status:deferred", To: Deferred},
-	fsm.Edge[Status, string]{From: Open, On: "set_status:dropped", To: Dropped},
-	fsm.Edge[Status, string]{From: Deferred, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Deferred, On: "set_status:dropped", To: Dropped},
-	fsm.Edge[Status, string]{From: Dropped, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Dropped, On: "set_status:deferred", To: Deferred},
-	fsm.Edge[Status, string]{From: Decided, On: "supersede", To: Superseded},
-	fsm.Edge[Status, string]{From: Decided, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Superseded, On: "set_status:open", To: Open},
+	fsm.Edge[Status, Trigger]{From: Uncreated, On: onCreate, To: Open},
+	fsm.Edge[Status, Trigger]{From: Open, On: onRecordOutcome, To: Decided},
+	fsm.Edge[Status, Trigger]{From: Open, On: onSetStatus + ":" + Trigger(Deferred), To: Deferred},
+	fsm.Edge[Status, Trigger]{From: Open, On: onSetStatus + ":" + Trigger(Dropped), To: Dropped},
+	fsm.Edge[Status, Trigger]{From: Deferred, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Deferred, On: onSetStatus + ":" + Trigger(Dropped), To: Dropped},
+	fsm.Edge[Status, Trigger]{From: Dropped, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Dropped, On: onSetStatus + ":" + Trigger(Deferred), To: Deferred},
+	fsm.Edge[Status, Trigger]{From: Decided, On: onSupersede, To: Superseded},
+	fsm.Edge[Status, Trigger]{From: Decided, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Superseded, On: onSetStatus + ":" + Trigger(Open), To: Open},
 )
 
 // ---- the decider ---------------------------------------------------------------
