@@ -157,7 +157,6 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 	if collectorStopped(outer) {
 		return
 	}
-	rep.ran()
 	var trace []string
 	j := func(rule spec.Rule, v spec.Verdict) {
 		if collectorStopped(outer) {
@@ -273,6 +272,7 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		return
 	}
 	j(Replayable, spec.Check(same.value, "folded %+v, ran to %+v", replayed.value, state))
+	rep.ran()
 }
 
 // checkState checks every invariant against one state.
@@ -553,15 +553,23 @@ type tally struct {
 	firstFailureTrace []string
 }
 
+// report keys a tally by the whole rule value rather than by its ID. Two
+// different rules that share an ID are then separate rules, so a vacuous one is
+// reported even when the other applies; the same rule value used by more than
+// one check still shares one tally, because it is the same rule.
 type report struct {
 	mu    sync.Mutex
 	runs  int
-	order []string
-	rules map[string]*tally
+	order []spec.Rule
+	rules map[spec.Rule]*tally
 }
 
-func newReport() *report { return &report{rules: map[string]*tally{}} }
+func newReport() *report { return &report{rules: map[spec.Rule]*tally{}} }
 
+// ran records a run rapid completed. A draw rejected with rapid.T.Skip unwinds
+// the generator before this, so the count matches rapid's valid runs rather
+// than its attempts; a short check therefore stays under vacuityRuns however
+// many draws the generator rejects.
 func (r *report) ran() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -569,17 +577,17 @@ func (r *report) ran() {
 }
 
 func (r *report) declare(rule spec.Rule) {
-	if _, ok := r.rules[rule.ID]; ok {
+	if _, ok := r.rules[rule]; ok {
 		return
 	}
-	r.order = append(r.order, rule.ID)
-	r.rules[rule.ID] = &tally{rule: rule}
+	r.order = append(r.order, rule)
+	r.rules[rule] = &tally{rule: rule}
 }
 
 func (r *report) count(rule spec.Rule, v spec.Verdict) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.rules[rule.ID]
+	t := r.rules[rule]
 	t.judged++
 	if v.Applies() {
 		t.applied++
@@ -589,7 +597,7 @@ func (r *report) count(rule spec.Rule, v spec.Verdict) {
 func (r *report) proposed(rule spec.Rule, detail string, trace []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.rules[rule.ID]
+	t := r.rules[rule]
 	t.failures++
 	if !t.haveFailure || len(trace) < len(t.firstFailureTrace) {
 		t.haveFailure = true
@@ -602,10 +610,10 @@ func (r *report) log(t rapid.TB) {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("rule health (applied / judged):\n")
-	ids := append([]string(nil), r.order...)
-	sort.SliceStable(ids, func(i, j int) bool { return r.rules[ids[i]].rule.Status < r.rules[ids[j]].rule.Status })
-	for _, id := range ids {
-		tl := r.rules[id]
+	rules := append([]spec.Rule(nil), r.order...)
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Status < rules[j].Status })
+	for _, rule := range rules {
+		tl := r.rules[rule]
 		note := ""
 		switch {
 		case tl.applied == 0:
@@ -613,17 +621,17 @@ func (r *report) log(t rapid.TB) {
 		case tl.failures > 0:
 			note = fmt.Sprintf("  %d violations", tl.failures)
 		}
-		fmt.Fprintf(&b, "  %-6s %-11s %7d / %-7d%s\n", id, tl.rule.Status, tl.applied, tl.judged, note)
+		fmt.Fprintf(&b, "  %-6s %-11s %7d / %-7d%s\n", rule.ID, tl.rule.Status, tl.applied, tl.judged, note)
 	}
 	t.Log(b.String())
 
-	for _, id := range ids {
-		tl := r.rules[id]
+	for _, rule := range rules {
+		tl := r.rules[rule]
 		if tl.failures == 0 {
 			continue
 		}
 		t.Logf("proposed rule %s would fail: %s\n  rule: %s\n  shortest trace seen:\n    %s",
-			id, tl.firstFailure, tl.rule.Statement, strings.Join(tl.firstFailureTrace, "\n    "))
+			rule.ID, tl.firstFailure, tl.rule.Statement, strings.Join(tl.firstFailureTrace, "\n    "))
 	}
 }
 
@@ -659,20 +667,30 @@ func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
 	return ok
 }
 
+// declares reports whether the machine declares any rule with this ID.
+func (r *report) declares(id string) bool {
+	for _, rule := range r.order {
+		if rule.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // gateVacuity fails t for every established rule that never applied, unless
 // allowed names it. Proposed rules only report, so their vacuity does too.
 func (r *report) gateVacuity(t rapid.TB, allowed []string) {
 	t.Helper()
 	for _, id := range allowed {
-		if _, ok := r.rules[id]; !ok {
+		if !r.declares(id) {
 			markViolation(t)
 			t.Errorf("AllowVacuous names %s, which is not one of the machine's rules", id)
 		}
 	}
 	var vacuous []*tally
-	for _, id := range r.order {
-		tl := r.rules[id]
-		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, id) {
+	for _, rule := range r.order {
+		tl := r.rules[rule]
+		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, rule.ID) {
 			vacuous = append(vacuous, tl)
 		}
 	}
@@ -719,8 +737,8 @@ func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	rep.gateVacuity(t, m.AllowVacuous)
 
 	var out []Violation
-	for _, id := range rep.order {
-		tl := rep.rules[id]
+	for _, rule := range rep.order {
+		tl := rep.rules[rule]
 		if tl.failures > 0 {
 			out = append(out, Violation{Rule: tl.rule, Detail: tl.firstFailure, Trace: tl.firstFailureTrace})
 		}
