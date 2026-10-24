@@ -28,7 +28,8 @@ func (d Delivery[Ef]) Key() string { return fmt.Sprintf("%s#%d.%d", d.Stream, d.
 
 // Dispatcher carries out one kind's effects from the outbox, at least once
 // each. Effects are claimed with a lease, so several dispatchers can share
-// the work; order between effects is not guaranteed.
+// the work; order between effects is not guaranteed. A handler must be
+// idempotent and must not depend on delivery order; see docs/EFFECTS.md.
 type Dispatcher[Ef any] struct {
 	Store   *Store
 	Kind    string

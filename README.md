@@ -249,6 +249,11 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   snapshot and its views commit together, or none of them do. Messages that
   arrive together for one stream may share a transaction; each caller returns
   once its own message has committed.
+- **Effects are delivered at least once, in no guaranteed order.** An effect
+  is queued in the transaction that records it and carried out by a
+  dispatcher, which claims it with a lease and retries a failure. A handler
+  must be idempotent and must not depend on delivery order; `Delivery.Key()`
+  names an effect across retries. See [docs/EFFECTS.md](docs/EFFECTS.md).
 - **Snapshots are a fold, and the version names it.** A snapshot holds the
   state `Evolve` produced at a seq, and it is reused only under the
   `StateVersion` that took it. That version must change when `Evolve` changes
