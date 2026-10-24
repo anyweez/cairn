@@ -72,6 +72,11 @@ type Edge struct {
 // error rather than a guess: a rule, table or codec registration whose values
 // aren't constants, a registration whose type comes from a generic helper's
 // type parameter, or a rule ID declared twice.
+//
+// A file the current build context excludes is read in a build that includes it,
+// so the manifest is the whole module's spec and not the spec of the platform
+// the tool happens to run on. A file no build this tool can load includes is an
+// error naming the file and its constraint.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -113,22 +118,17 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	}
 
 	x := &extractor{
-		dir: dir, seen: map[string]bool{},
+		dir: dir, seen: map[string]bool{}, loaded: map[string]bool{},
 		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
 	}
-	for _, p := range pkgs {
-		if strings.HasSuffix(p.PkgPath, ".test") {
-			continue // the generated test main
-		}
-		for _, f := range p.Syntax {
-			// A package's files appear again in its test variant.
-			name := p.Fset.File(f.Pos()).Name()
-			if x.seen[name] {
-				continue
-			}
-			x.seen[name] = true
-			x.file(p, f, name)
-		}
+	x.extract(pkgs)
+	if len(x.errs) == 0 {
+		// A file the inherited build context left out declares nothing the
+		// manifest can see, so the build-constrained half of the module is
+		// read separately. Skipped when the load already found a declaration
+		// it cannot read: the error is the answer, and a second load only
+		// spends time on it.
+		x.readBuilds(dir, patterns)
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
@@ -160,9 +160,37 @@ type upcast struct {
 	pos       string
 }
 
+// extract adds the declarations in pkgs to x. A package's files appear again in
+// its test variant, so each file is read once, and the files its build context
+// left out are remembered for readBuilds.
+func (x *extractor) extract(pkgs []*packages.Package) {
+	for _, p := range pkgs {
+		if strings.HasSuffix(p.PkgPath, ".test") {
+			continue // the generated test main
+		}
+		for _, name := range p.IgnoredFiles {
+			if strings.HasSuffix(name, ".go") {
+				x.ignored = append(x.ignored, name)
+			}
+		}
+		for _, f := range p.Syntax {
+			name := p.Fset.File(f.Pos()).Name()
+			if x.seen[name] {
+				continue
+			}
+			x.seen[name] = true
+			x.file(p, f, name)
+		}
+	}
+}
+
 type extractor struct {
 	dir     string
 	seen    map[string]bool
+	ignored []string
+	// loaded keys the builds already read, so two files in one package under
+	// one constraint cost one load.
+	loaded  map[string]bool
 	rules   []Rule
 	ruleAt  map[string]string
 	tables  []Table
@@ -178,10 +206,15 @@ func (x *extractor) errorf(fset *token.FileSet, pos token.Pos, format string, ar
 
 func (x *extractor) position(fset *token.FileSet, pos token.Pos) string {
 	p := fset.Position(pos)
-	if rel, err := filepath.Rel(x.dir, p.Filename); err == nil {
-		p.Filename = rel
+	return fmt.Sprintf("%s:%d", x.rel(p.Filename), p.Line)
+}
+
+// rel names path the way the module's own files are named in errors.
+func (x *extractor) rel(path string) string {
+	if rel, err := filepath.Rel(x.dir, path); err == nil {
+		return rel
 	}
-	return fmt.Sprintf("%s:%d", p.Filename, p.Line)
+	return path
 }
 
 func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
