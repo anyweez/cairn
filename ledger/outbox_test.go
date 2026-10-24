@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -10,9 +11,9 @@ import (
 	"github.com/anyweez/cairn/ledger"
 )
 
-// Two dispatchers over one outbox must claim disjoint effects. Effects are
-// claimed with a lease, so the second dispatcher's SKIP LOCKED sees nothing of
-// what the first claimed and each effect is delivered once.
+// An effect's row is removed once its delivery is recorded: the row exists to
+// hand the effect out, and a delivered effect has nothing left to read. If the
+// row stayed, every delivered effect would sit in the outbox for ever.
 func TestTwoDispatchersDeliverEachEffectOnce(t *testing.T) {
 	t.Parallel()
 	agg := newCounter(t)
@@ -39,6 +40,11 @@ func TestTwoDispatchersDeliverEachEffectOnce(t *testing.T) {
 			delivered[d.Key()]++
 			counts[id]++
 			mu.Unlock()
+			// Each effect is claimed once, so the attempt a handler sees is
+			// its first; a row reclaimed while in flight would be seen twice.
+			if d.Attempt != 1 {
+				t.Errorf("%s handed out on attempt %d, want 1", d.Key(), d.Attempt)
+			}
 			first.Do(func() {
 				claimed.Done()
 				<-release
@@ -93,14 +99,12 @@ func TestTwoDispatchersDeliverEachEffectOnce(t *testing.T) {
 			t.Errorf("%s was delivered %d times", key, n)
 		}
 	}
-	var pending, attempts int
-	if err := agg.Store.Pool().QueryRow(ctx,
-		`SELECT count(*) FILTER (WHERE done_at IS NULL), coalesce(max(attempts), 0) FROM cairn.outbox`).
-		Scan(&pending, &attempts); err != nil {
+	var left int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM cairn.outbox`).Scan(&left); err != nil {
 		t.Fatal(err)
 	}
-	if pending != 0 || attempts != 1 {
-		t.Fatalf("%d effects unfinished with a top attempt count of %d; want 0 and 1", pending, attempts)
+	if left != 0 {
+		t.Fatalf("%d delivered effects left rows in the outbox; want none", left)
 	}
 }
 
@@ -114,11 +118,13 @@ func TestAPanickingHandlerIsRetried(t *testing.T) {
 	}
 
 	var calls int
+	var attempts []int
 	d := &ledger.Dispatcher[effect]{
 		Store: agg.Store, Kind: "counter", Effects: agg.Codecs.Effects,
 		Backoff: func(int) time.Duration { return 0 },
-		Handle: func(context.Context, ledger.Delivery[effect]) error {
+		Handle: func(_ context.Context, d ledger.Delivery[effect]) error {
 			calls++
+			attempts = append(attempts, d.Attempt)
 			if calls == 1 {
 				panic("downstream exploded")
 			}
@@ -134,19 +140,15 @@ func TestAPanickingHandlerIsRetried(t *testing.T) {
 			break
 		}
 	}
-	if calls != 2 {
-		t.Fatalf("the handler ran %d times, want 2: a panic must be retried", calls)
+	if calls != 2 || fmt.Sprint(attempts) != "[1 2]" {
+		t.Fatalf("the handler ran %d times on attempts %v, want 2 on [1 2]: a panic must be retried", calls, attempts)
 	}
-	var done bool
-	var lastError *string
-	var attempts int
-	if err := agg.Store.Pool().QueryRow(ctx,
-		`SELECT done_at IS NOT NULL, last_error, attempts FROM cairn.outbox`).
-		Scan(&done, &lastError, &attempts); err != nil {
+	var left int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM cairn.outbox`).Scan(&left); err != nil {
 		t.Fatal(err)
 	}
-	if !done || attempts != 2 || lastError != nil {
-		t.Fatalf("done %v, attempts %d, last error %v; want delivery to finish on attempt 2", done, attempts, lastError)
+	if left != 0 {
+		t.Fatalf("%d rows left in the outbox after delivery; want none", left)
 	}
 }
 

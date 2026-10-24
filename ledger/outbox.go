@@ -226,8 +226,16 @@ SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id
 		cancel()
 		switch {
 		case err == nil:
+			// The row exists to hand the effect out; once that is recorded there
+			// is nothing left to read from it. Deleting it as the delivery is
+			// marked keeps a busy outbox from growing without bound, and it is
+			// the only outcome that would set an indexed column: done_at is
+			// part of outbox_pending's predicate, so marking it done rewrites
+			// that index for every effect. A row an earlier release already
+			// marked done is still treated as finished below, because a
+			// rolling deploy runs both.
 			_, err = d.Store.pool.Exec(record,
-				`UPDATE cairn.outbox SET done_at = now(), last_error = NULL WHERE id = $1`+fenced, c.id, c.attempts)
+				`DELETE FROM cairn.outbox WHERE id = $1`+fenced, c.id, c.attempts)
 		case d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts:
 			_, err = d.Store.pool.Exec(record,
 				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, c.attempts, storableError(err))

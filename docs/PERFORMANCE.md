@@ -183,6 +183,10 @@ Ordered by payoff.
   `Handle` also updates its `cairn.streams` row. A lower `fillfactor` on
   `cairn.streams` and `cairn.state_snapshots` lets those updates stay on the
   same page, which writes less.
+- **The outbox is a queue, not a log.** A dispatcher deletes an effect's row
+  as it records the delivery, so the table holds only work outstanding or
+  failed; a failed row stays with its error for an operator to look at. Without
+  that, every effect ever produced would stay in the table and in its indexes.
 
 ## Running several instances
 
