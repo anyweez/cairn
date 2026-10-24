@@ -46,6 +46,11 @@ var qaJSONDecider = cairn.Decider[qaJSONState, qaJSONMsg, qaJSON, qaJSONEvent, q
 
 func qaJSONAggregate(t *testing.T) *ledger.Aggregate[qaJSONState, qaJSONMsg, qaJSON, qaJSONEvent, qaJSONEffect] {
 	t.Helper()
+	return qaJSONAggregateOn(t, ledgertest.NewStore(t))
+}
+
+func qaJSONAggregateOn(t *testing.T, store *ledger.Store) *ledger.Aggregate[qaJSONState, qaJSONMsg, qaJSON, qaJSONEvent, qaJSONEffect] {
+	t.Helper()
 	messages := codec.New[qaJSONMsg]()
 	codec.Register[qaJSONMsg](messages, "qa.json.message", 1)
 	results := codec.New[qaJSON]()
@@ -55,7 +60,7 @@ func qaJSONAggregate(t *testing.T) *ledger.Aggregate[qaJSONState, qaJSONMsg, qaJ
 	effects := codec.New[qaJSONEffect]()
 	codec.Register[qaJSONEffect](effects, "qa.json.effect", 1)
 	return &ledger.Aggregate[qaJSONState, qaJSONMsg, qaJSON, qaJSONEvent, qaJSONEffect]{
-		Store: ledgertest.NewStore(t), Kind: "qa-json", Decider: qaJSONDecider,
+		Store: store, Kind: "qa-json", Decider: qaJSONDecider,
 		Codecs: &codec.Set[qaJSONMsg, qaJSON, qaJSONEvent, qaJSONEffect]{
 			Messages: messages, Results: results, Events: events, Effects: effects,
 		},
@@ -78,10 +83,37 @@ func TestAnIdempotentRetryReturnsTheResultTheFirstCallDid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkQARetryResult(t, first, retry, sent)
+}
+
+// A retry is answered from the stored result, not from anything the process
+// that made the first call still holds, so a new process over the same
+// database must return the same bytes.
+func TestARetryAfterARestartReturnsTheResultTheFirstCallDid(t *testing.T) {
+	agg := qaJSONAggregate(t)
+	sent := qaJSON{
+		Raw: json.RawMessage(`{"b":2,"a":1}`),
+		Num: json.Number("1e2"),
+		Neg: math.Copysign(0, -1),
+	}
+
+	first, err := agg.Handle(ctx, "a", qaJSONMsg{Payload: sent}, ledger.IdempotencyKey("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := qaJSONAggregateOn(t, ledger.New(agg.Store.Pool(), ledger.RequireActor(false)))
+	retry, err := restarted.Handle(ctx, "a", qaJSONMsg{Payload: sent}, ledger.IdempotencyKey("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkQARetryResult(t, first, retry, sent)
+}
+
+func checkQARetryResult(t *testing.T, first, retry ledger.Handled[qaJSON], sent qaJSON) {
+	t.Helper()
 	if !retry.Duplicate {
 		t.Fatalf("the second call was not answered from the first entry: %+v", retry)
 	}
-
 	if got := string(first.Result.Raw); got != string(sent.Raw) {
 		t.Fatalf("the first call's result is %s, not the payload the decider returned (%s)", got, sent.Raw)
 	}
