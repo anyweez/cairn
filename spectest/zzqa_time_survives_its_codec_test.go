@@ -158,3 +158,33 @@ func TestAMessageFieldTheCodecDropsStillFailsD6(t *testing.T) {
 			spectest.Encodable.ID, err, failed, msg)
 	}
 }
+
+// The check's teeth, on the other side of the same comparison: a zone offset
+// with seconds in it is written only to the minute, so JSON stores a different
+// instant with no error at all. Accepting a time whose instant is kept must not
+// accept one that moved.
+func TestASnapshotThatMovesAnInstantStillFailsD7(t *testing.T) {
+	at := time.Date(2026, time.March, 4, 5, 6, 7, 0, time.FixedZone("LMT", -(5*60*60+53*60+7)))
+	if err := codec.CheckStorable(zzqaStampState{At: at}); err == nil {
+		t.Fatalf("the ledger stores %v unchanged, so it is not the case under test", at)
+	}
+	m := spectest.Machine[zzqaStampState, int, int, int, struct{}]{
+		Decider: cairn.Decider[zzqaStampState, int, int, int, struct{}]{
+			Initial: func() zzqaStampState { return zzqaStampState{} },
+			Decide: func(s zzqaStampState, msg int) cairn.Decision[int, int, struct{}] {
+				return cairn.Accept[int, int, struct{}](msg, []int{msg})
+			},
+			Evolve: func(s zzqaStampState, _ int) zzqaStampState {
+				s.At = at
+				return s
+			},
+		},
+		Messages:  func(t *rapid.T, _ zzqaStampState) int { return 0 },
+		Snapshots: true,
+	}
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, spectest.Snapshottable.ID+" violated") {
+		t.Fatalf("a snapshot that stores a different instant must fail %s, got err=%v failed=%v:\n%s",
+			spectest.Snapshottable.ID, err, failed, msg)
+	}
+}
