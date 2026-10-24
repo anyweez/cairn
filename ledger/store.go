@@ -550,8 +550,9 @@ func nonNil(envs []codec.Envelope) []codec.Envelope {
 // the column in ORDER BY txid, which would then sort the log as text ("1000"
 // before "999").
 const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, message, result, refusal, events, effects,
-coalesce(idempotency_key, ''), recorded_at,
-coalesce(actor, ''), coalesce(via, ''), coalesce(correlation_id, ''), coalesce(causation_id, ''), occurred_at, extra`
+coalesce(idempotency_key, '') AS idempotency_key, recorded_at,
+coalesce(actor, '') AS actor, coalesce(via, '') AS via,
+coalesce(correlation_id, '') AS correlation_id, coalesce(causation_id, '') AS causation_id, occurred_at, extra`
 
 func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	defer rows.Close()
@@ -738,24 +739,62 @@ const logFence = `SELECT set_config('cairn.fence', LEAST(COALESCE((
   CROSS JOIN ` + fenceRef + ` AS ref
 ), '18446744073709551615'::xid8), pg_snapshot_xmax(pg_current_snapshot()))::text, true)`
 
+// readAllSQL builds the read of the global log after a cursor. With kinds, it
+// reads each kind's own range of entries_kind_log and merges the results: one
+// statement with a kind list cannot use (kind, txid, position) in log order
+// for more than one kind, so the planner falls back to walking entries_log and
+// filtering by kind. A reader for a kind that is rare in the log would then
+// scan every entry the fence lets it see, on every poll. Each branch is capped
+// at limit entries because the union's first limit are drawn from the kinds'
+// own first limit: an entry in the answer has at most limit-1 entries ahead of
+// it in the log, all of them ahead of it in its kind too.
+func readAllSQL(after Cursor, limit int, kinds []string) (string, []any) {
+	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
+	if len(kinds) == 0 {
+		return `SELECT ` + entryColumns + ` FROM cairn.entries
+WHERE (txid, position) > ($1::text::xid8, $2)
+  AND txid < current_setting('cairn.fence')::xid8` +
+			fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit), args
+	}
+	// kind = ANY treats a repeated kind as a set; a branch per kind would read
+	// and return its entries twice.
+	seen := make(map[string]struct{}, len(kinds))
+	unique := kinds[:0:0]
+	for _, kind := range kinds {
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		unique = append(unique, kind)
+	}
+	kinds = unique
+	branches := make([]string, len(kinds))
+	for i, kind := range kinds {
+		args = append(args, kind)
+		branches[i] = fmt.Sprintf(`(SELECT `+entryColumns+`, txid
+FROM cairn.entries
+WHERE (txid, position) > ($1::text::xid8, $2)
+  AND txid < current_setting('cairn.fence')::xid8
+  AND kind = $%d
+ORDER BY txid, position
+LIMIT %d)`, i+3, limit)
+	}
+	return `SELECT ` + entryColumns + `
+FROM (` + strings.Join(branches, "\nUNION ALL\n") + `) AS log
+ORDER BY txid, position
+LIMIT ` + strconv.Itoa(limit), args
+}
+
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	for _, kind := range kinds {
 		if err := validKind(kind); err != nil {
 			return nil, err
 		}
 	}
-	sql := `SELECT ` + entryColumns + ` FROM cairn.entries
-WHERE (txid, position) > ($1::text::xid8, $2)
-  AND txid < current_setting('cairn.fence')::xid8`
-	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
-	if len(kinds) > 0 {
-		sql += ` AND kind = ANY($3)`
-		args = append(args, kinds)
-	}
 	if limit <= 0 {
 		limit = 100
 	}
-	sql += fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit)
+	sql, args := readAllSQL(after, limit, kinds)
 
 	// The fence and the read go out together, in one round trip, so CatchUp
 	// stays within its budget. pgx runs a batch in an implicit transaction and
