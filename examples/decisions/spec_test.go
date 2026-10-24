@@ -180,7 +180,7 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 			}},
 		},
 		Changes: []spec.Change[State, Msg]{
-			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, Trigger),
+			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, TriggerOf),
 			{Rule: FreezeOnSettle, Check: func(before State, m Msg, after State) spec.Verdict {
 				// Options and positions are free only while the decision stays
 				// open; creation is the one message that fills them on its way
@@ -232,6 +232,25 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 					"%s endorsed the winning option %s, yet answered committed=%v", ack.By, p.Option, ack.Committed)
 			}},
 		},
+	}
+}
+
+// Every edge on Lifecycle answers a trigger some message asks for. The table
+// is data and the triggers are methods, so a word written in only one of them
+// leaves an edge nothing can follow.
+func TestEveryLifecycleEdgeIsAskedForByAMessage(t *testing.T) {
+	asked := map[Trigger]bool{}
+	for _, m := range []Msg{
+		Create{}, Edit{}, AddOption{}, SavePosition{}, RecordOutcome{},
+		SetStatus{To: Open}, SetStatus{To: Deferred}, SetStatus{To: Dropped},
+		Supersede{}, Acknowledge{},
+	} {
+		asked[TriggerOf(m)] = true
+	}
+	for _, e := range Lifecycle.Edges() {
+		if !asked[e.On] {
+			t.Errorf("Lifecycle has %s → %s on %q, which no message asks for", e.From, e.To, e.On)
+		}
 	}
 }
 
