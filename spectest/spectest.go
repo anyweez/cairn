@@ -157,7 +157,6 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 	if collectorStopped(outer) {
 		return
 	}
-	rep.ran()
 	var trace []string
 	j := func(rule spec.Rule, v spec.Verdict) {
 		if collectorStopped(outer) {
@@ -273,6 +272,7 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		return
 	}
 	j(Replayable, spec.Check(same.value, "folded %+v, ran to %+v", replayed.value, state))
+	rep.ran()
 }
 
 // checkState checks every invariant against one state.
@@ -566,6 +566,10 @@ type report struct {
 
 func newReport() *report { return &report{rules: map[spec.Rule]*tally{}} }
 
+// ran records a run rapid completed. A draw rejected with rapid.T.Skip unwinds
+// the generator before this, so the count matches rapid's valid runs rather
+// than its attempts; a short check therefore stays under vacuityRuns however
+// many draws the generator rejects.
 func (r *report) ran() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
