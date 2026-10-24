@@ -722,22 +722,41 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 	if err := a.streamMismatch(msg, at.Stream); err != nil {
 		return nil, at, nil, nil, err
 	}
-	decision := a.Decider.Decide(at.State, msg)
+	// The entry is the record of what the caller sent, so the message is
+	// encoded before Decide sees it: Go copies the message by value, but a
+	// slice, map or pointer field is a header shared with the caller, so a
+	// decider that normalises one in place — sort.Ints(m.Order), say — would
+	// otherwise change both the bytes this entry stores and the caller's own
+	// value.
+	stored, encodeErr := a.Codecs.Messages.Encode(msg)
+	// Decide is given the message decoded back from that envelope, which is the
+	// message a replay reads: Verify decodes the entry and re-decides it, so a
+	// decision and its replay cannot disagree about the message they were made
+	// against. A message that cannot be encoded has no such copy; Decide is
+	// then given it as it was handed over, and nothing is recorded (see
+	// below), so a write through a field reaches no entry.
+	decided := msg
+	if encodeErr == nil {
+		if decided, err = a.Codecs.Messages.Decode(stored); err != nil {
+			return nil, at, nil, nil, err
+		}
+	}
+	decision := a.Decider.Decide(at.State, decided)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
 		return nil, at, nil, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
 	}
 
-	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
-	if entry.Message, err = a.Codecs.Messages.Encode(msg); err != nil {
+	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta, Message: stored}
+	if encodeErr != nil {
 		// The message cannot be stored at all, so a refusal of it cannot be
 		// recorded either. Return the decider's refusal rather than the
 		// encoding error: the caller's message was answered, and an entry that
 		// cannot hold the message would be worse than none.
 		var notStorable *codec.NotStorableError
-		if decision.Refused() && errors.As(err, &notStorable) {
+		if decision.Refused() && errors.As(encodeErr, &notStorable) {
 			return nil, at, nil, nil, decision.Refusal
 		}
-		return nil, at, nil, nil, err
+		return nil, at, nil, nil, encodeErr
 	}
 	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {
 		return nil, at, nil, nil, err
