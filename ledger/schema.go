@@ -212,6 +212,31 @@ ALTER TABLE cairn.state_snapshots ALTER COLUMN state TYPE json USING state::json
 	// rolling deploy runs older and newer releases side by side.
 	{Statements: []string{`
 DELETE FROM cairn.outbox WHERE done_at IS NOT NULL`}},
+
+	// 4: an entry keeps the bytes json.Marshal wrote, as a snapshot does since
+	// migration 2. jsonb parses a value and re-serialises it, reordering object
+	// keys and normalising numbers, so an idempotent retry, ReadStream or Verify
+	// could see a different message, result, events or effects from the one the
+	// decider produced. json stores the text as written and returns it
+	// unchanged; every reader and writer of these columns already treats them as
+	// text, so a process on an earlier release keeps working across the change
+	// and after a rollback.
+	//
+	// The refusal CHECK uses json's text, because json has no equality operator.
+	// Every empty events or effects value is written as exactly "[]" by
+	// json.Marshal, and a jsonb value converted by this migration has the same
+	// canonical text.
+	{Statements: []string{`
+ALTER TABLE cairn.entries DROP CONSTRAINT entries_refusal_inert;
+ALTER TABLE cairn.entries
+    ALTER COLUMN message TYPE json USING message::json,
+    ALTER COLUMN result TYPE json USING result::json,
+    ALTER COLUMN refusal TYPE json USING refusal::json,
+    ALTER COLUMN events TYPE json USING events::json,
+    ALTER COLUMN effects TYPE json USING effects::json,
+    ALTER COLUMN extra TYPE json USING extra::json;
+ALTER TABLE cairn.entries ADD CONSTRAINT entries_refusal_inert
+    CHECK (refusal IS NULL OR (events::text = '[]' AND effects::text = '[]'))`}},
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every

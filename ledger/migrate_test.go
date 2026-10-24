@@ -109,6 +109,90 @@ func TestEveryReleasesStatementsRunOnTheNewestSchema(t *testing.T) {
 	}
 }
 
+// Before migration 4 cairn.entries stored its value columns as jsonb, which
+// parses a value and writes it back with object keys reordered and numbers
+// normalised. The migration moves them to json, which keeps the text exactly.
+// A row written by an earlier release must still read back, and a value
+// written afterwards must be returned with the bytes it was given.
+func TestEntryColumnsKeepTheirBytesAcrossTheMigration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := emptyDatabase(t)
+	store := New(pool, RequireActor(false))
+	// Migrations 1 to 3 are the last schema whose entry columns are jsonb.
+	if err := store.migrate(ctx, migrations[:3], migrationLeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+
+	// An entry as the previous release wrote it. jsonb had already reordered
+	// and spaced its message, which is all that column could keep.
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.streams (stream, kind, seq) VALUES ('mig/a', 'mig', 1);
+INSERT INTO cairn.entries (stream, kind, seq, message, result, events, effects, extra)
+VALUES ('mig/a', 'mig', 1,
+    '{"type":"mig.message","v":1,"data":{"n":1}}', NULL, '[]', '[]', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	var oldMessage string
+	if err := pool.QueryRow(ctx, `SELECT message::text FROM cairn.entries WHERE seq = 1`).Scan(&oldMessage); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	old, err := store.ReadStream(ctx, Stream{Kind: "mig", ID: "a"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old) != 1 || old[0].Message.Type != "mig.message" {
+		t.Fatalf("the entry written before the migration read back as %+v", old)
+	}
+	var migratedMessage string
+	if err := pool.QueryRow(ctx, `SELECT message::text FROM cairn.entries WHERE seq = 1`).Scan(&migratedMessage); err != nil {
+		t.Fatal(err)
+	}
+	if migratedMessage != oldMessage {
+		t.Fatalf("the migration changed the old entry's text from %s to %s", oldMessage, migratedMessage)
+	}
+
+	// Every value column keeps the bytes it is given now, not a jsonb
+	// re-serialisation of them.
+	values := map[string]string{
+		"message": `{"b":2,"a":1}`,
+		"result":  `{"n":1e2}`,
+		"events":  `[{"z":-0,"a":1}]`,
+		"effects": `[{"n":1e2}]`,
+		"extra":   `{"b":2,"a":1}`,
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO cairn.streams (stream, kind, seq) VALUES ('mig/b', 'mig', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.entries (stream, kind, seq, message, result, events, effects, extra)
+VALUES ('mig/b', 'mig', 1, $1, $2, $3, $4, $5)`,
+		values["message"], values["result"], values["events"], values["effects"], values["extra"]); err != nil {
+		t.Fatal(err)
+	}
+	for column, want := range values {
+		var got string
+		if err := pool.QueryRow(ctx, `SELECT `+column+`::text FROM cairn.entries WHERE stream = 'mig/b'`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("the %s column returned %s, but was written %s", column, got, want)
+		}
+	}
+
+	// The refusal constraint still holds against the column's new type.
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.entries (stream, kind, seq, message, refusal, events)
+VALUES ('mig/b', 'mig', 2, '{}', '{}', '[{"type":"mig.event","v":1,"data":{}}]')`); err == nil {
+		t.Fatal("a refusal carrying an event was recorded")
+	}
+}
+
 // Postgres assigns a transaction its ID at its first write, and the global log
 // is ordered by that ID, so a transaction that wrote before taking its locks
 // could land in the log ahead of one it queued behind.

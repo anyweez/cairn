@@ -87,7 +87,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) RebuildEntries(ctx context.Context, v Entry
 	}
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries
-WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
+WHERE kind = $1 AND events::text <> '[]' ORDER BY stream`, a.Kind)
 	if err != nil {
 		return 0, err
 	}
