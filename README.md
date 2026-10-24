@@ -370,6 +370,13 @@ is declared, whether or not a test uses it. It reads:
 - **Codecs:** `codec.Register` and `Upcast` calls outside test files, since
   only production code writes to the ledger.
 
+A file the build context leaves out — one whose `//go:build` line or name ties
+it to another platform, or one that needs a tag such as `tools` — is read in a
+build that includes it. A tree therefore produces the same manifest on every
+host, so the committed file is current everywhere and `-base` never reads a
+type that one platform stores and another does not as removed. A file no build
+includes is an error naming the file and its constraint.
+
 Each of these must be stated with constants. A rule, table or registration
 the tool can't read exactly is an error, not a guess. So is a registration
 inside a generic helper: its type argument is the helper's parameter, not the
