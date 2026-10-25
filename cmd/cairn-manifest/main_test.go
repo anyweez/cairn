@@ -332,6 +332,37 @@ func TestRunChecksTheBase(t *testing.T) {
 	}
 }
 
+// A base that passes is not a reason to skip the write: -o still regenerates
+// the manifest it names. Here -o and -base are the same file, the natural
+// local invocation, and a compatible base leaves the regenerated manifest in
+// place.
+func TestRunWritesTheManifestWhenTheBasePasses(t *testing.T) {
+	dir := copyGoodFixture(t)
+	m, err := Extract(dir, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := encode(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(dir, "spec.manifest.yaml")
+	if err := os.WriteFile(manifest, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run(dir, "spec.manifest.yaml", manifest, []string{"./..."}); err != nil {
+		t.Fatalf("an unchanged base must pass: %v", err)
+	}
+	wrote, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("a passing run must still write the manifest: %v", err)
+	}
+	if string(wrote) != string(data) {
+		t.Error("the written manifest is not the one this run generated")
+	}
+}
+
 // A platform's own file must not read as a removal: the base was written by a
 // host that built a different set of files, and the tree is correct on both.
 func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
