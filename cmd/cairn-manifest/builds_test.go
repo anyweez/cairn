@@ -257,6 +257,79 @@ var NeverRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, State
 	}
 }
 
+// A build that fails is not the whole answer: the same file is in other builds,
+// and the one it belongs to may be later in the search. Here a_use.go is
+// selected by either tag but only type-checks with both, so the first builds
+// tried report an error and a later one reads it.
+func TestABuildThatFailsDoesNotStopAnotherReadingTheFile(t *testing.T) {
+	dir := writeModule(t, `module example.com/fallback
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"events.go": `package events
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Common struct {
+	ID string ` + "`json:\"id\"`" + `
+}
+
+func (Common) isEvent() {}
+
+func Codecs() *codec.Codec[Event] {
+	c := codec.New[Event]()
+	codec.Register[Common](c, "constrained.common", 1)
+	return c
+}
+`,
+		// Sorted before z_def.go, so it is the file whose search has to survive
+		// the builds that select it without the declaration it uses.
+		"a_use.go": `//go:build cairnqa || cairnqa2
+
+package events
+
+import "github.com/anyweez/cairn/codec"
+
+type Tagged struct {
+	Path Detail ` + "`json:\"path\"`" + `
+}
+
+func (Tagged) isEvent() {}
+
+func init() {
+	codec.Register[Tagged](Codecs(), "constrained.tagged", 1)
+}
+`,
+		"z_def.go": `//go:build cairnqa && cairnqa2
+
+package events
+
+type Detail struct {
+	Text string ` + "`json:\"text\"`" + `
+}
+`,
+	})
+
+	m, err := Extract(dir, "./...")
+	if err != nil {
+		t.Fatalf("a file that type-checks in one build was refused because another build failed: %v", err)
+	}
+	if got := codecNames(m); !slices.Equal(got, []string{"constrained.common", "constrained.tagged"}) {
+		t.Errorf("codecs: %v", got)
+	}
+	for _, c := range m.Codecs {
+		if c.Name == "constrained.tagged" && !slices.Equal(c.Fields, []string{"path: {text: string}"}) {
+			t.Errorf("the tagged type's shape: %v", c.Fields)
+		}
+	}
+}
+
 func mustRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")

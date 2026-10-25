@@ -101,6 +101,9 @@ func init() {
 		if !strings.Contains(err.Error(), "plat.go") {
 			t.Errorf("the refusal does not name the file it could not read: %v", err)
 		}
+		if !strings.Contains(err.Error(), "undefined: MissingType") {
+			t.Errorf("the refusal does not carry the loader's message: %v", err)
+		}
 		if _, statErr := os.Stat(filepath.Join(dir, "spec.manifest.yaml")); !os.IsNotExist(statErr) {
 			t.Errorf("a refused extraction wrote a manifest anyway: %v", statErr)
 		}
@@ -121,6 +124,8 @@ func init() {
 			t.Errorf("a registration the type checker could not instantiate was accepted instead of reported")
 		} else if !strings.Contains(err.Error(), "plat.go") {
 			t.Errorf("the refusal does not name the file it could not read: %v", err)
+		} else if !strings.Contains(err.Error(), "undefined: MissingType") {
+			t.Errorf("the refusal does not carry the loader's message: %v", err)
 		}
 	})
 }

@@ -11,7 +11,9 @@
 //
 // The manifest does not depend on the host's platform: a file a build
 // constraint excludes is read in a build that includes it, and a file no build
-// includes is an error naming the file and the constraint.
+// includes is an error naming the file and the constraint. A file that build
+// reads but that does not type-check under it is an error carrying the loader's
+// message naming the file, not a shape read from partial type information.
 //
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is

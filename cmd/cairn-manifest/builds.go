@@ -106,29 +106,42 @@ func (x *extractor) readInBuild(dir, path string) {
 		pattern = "./" + filepath.ToSlash(rel)
 	}
 	tried := 0
+	var loadErrs []string
 	for _, ctx := range contexts(path) {
 		if tried == maxBuildsPerFile {
 			break
 		}
-		// A sibling needing the same build has already read this package.
+		// A sibling needing the same build has already read this package, or
+		// already failed to; either way that load's errors are this file's.
 		key := ctx.key() + " " + pkgDir
-		if x.loaded[key] {
+		if errs, done := x.loaded[key]; done {
+			loadErrs = append(loadErrs, errs...)
 			continue
 		}
-		x.loaded[key] = true
 		tried++
-		x.loadBuild(dir, ctx, pattern)
+		errs := x.loadBuild(dir, ctx, pattern)
+		x.loaded[key] = errs
+		loadErrs = append(loadErrs, errs...)
 		if x.seen[path] {
 			return
 		}
+	}
+	if len(loadErrs) > 0 {
+		// A build does include the file; it just does not type-check. The
+		// loader's own message names the file and the symbol it could not
+		// resolve, which is the answer, where extracting from the partial type
+		// information it reports anyway would record a guess.
+		x.errs = append(x.errs, loadErrs...)
+		return
 	}
 	x.errs = append(x.errs, fmt.Sprintf("%s: %s: no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest", x.rel(path), buildConstraint(path)))
 }
 
 // loadBuild reads pattern in the build ctx describes and adds what it declares
-// to x. A build that fails to load leaves the files it was meant to read
-// unread, which the caller reports.
-func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) {
+// to x. It returns the errors the load reported, which the caller reports
+// against the file that made it try: a build the tool cannot read leaves that
+// file unread, and reporting the loader's message says why.
+func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []string {
 	cfg := &packages.Config{
 		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:   dir,
@@ -138,11 +151,12 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) {
 	if len(ctx.tags) > 0 {
 		cfg.BuildFlags = []string{"-tags=" + strings.Join(ctx.tags, ",")}
 	}
-	pkgs, err := packages.Load(cfg, pattern)
+	pkgs, err := loadPackages(cfg, pattern)
 	if err != nil {
-		return
+		return []string{err.Error()}
 	}
 	x.extract(pkgs)
+	return nil
 }
 
 // contexts lists the builds that include path, the inherited build first, so a
