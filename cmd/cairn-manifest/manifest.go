@@ -87,38 +87,13 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		Dir:   dir,
 		Tests: true,
 	}
-	pkgs, err := packages.Load(cfg, patterns...)
+	pkgs, err := loadPackages(cfg, patterns...)
 	if err != nil {
 		return nil, err
 	}
-	if len(pkgs) == 0 {
-		// go list can fail with its message on stderr and nothing on stdout,
-		// and x/tools reports that as no packages and a nil error: a module
-		// that declares nothing is indistinguishable from a load that read
-		// nothing. A manifest is an error rather than a guess, so ask again
-		// in a mode that surfaces the command's error and report its cause.
-		_, cause := packages.Load(&packages.Config{
-			Mode:  packages.NeedName | packages.NeedFiles,
-			Dir:   dir,
-			Tests: true,
-		}, patterns...)
-		if cause == nil {
-			cause = fmt.Errorf("no packages match %s in %s", strings.Join(patterns, " "), dir)
-		}
-		return nil, fmt.Errorf("loading packages: %w", cause)
-	}
-	var loadErrs []string
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			loadErrs = append(loadErrs, e.Error())
-		}
-	})
-	if len(loadErrs) > 0 {
-		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
-	}
 
 	x := &extractor{
-		dir: dir, seen: map[string]bool{}, loaded: map[string]bool{},
+		dir: dir, seen: map[string]bool{}, loaded: map[string][]string{},
 		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
 	}
 	x.extract(pkgs)
@@ -132,7 +107,11 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
+		// A file read in several builds reports the same load error once per
+		// build, and a sibling of a broken file reports the error its package
+		// already reported; identical messages are one problem.
 		slices.Sort(x.errs)
+		x.errs = slices.Compact(x.errs)
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
 	}
 
@@ -152,6 +131,50 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	slices.SortFunc(m.Codecs, func(a, b Codec) int { return cmp.Compare(a.key(), b.key()) })
 	slices.SortFunc(m.Tables, func(a, b Table) int { return cmp.Compare(a.Name, b.Name) })
 	return m, nil
+}
+
+// loadPackages loads patterns and refuses a result the manifest cannot be read
+// from: no packages at all, and any package carrying an error. The manifest
+// states what the type checker resolved, so a package go/packages reports with
+// errors is partial type information and everything read from it would be a
+// guess -- an unresolved field renders as "invalid type", and a registration
+// the checker could not instantiate has no type arguments at all.
+//
+// Both loads the tool performs go through here: the inherited build's, and the
+// build that includes a file the inherited one left out.
+func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return nil, fmt.Errorf("loading packages: %w", err)
+	}
+	if len(pkgs) == 0 {
+		// go list can fail with its message on stderr and nothing on stdout,
+		// and x/tools reports that as no packages and a nil error: a module
+		// that declares nothing is indistinguishable from a load that read
+		// nothing. A manifest is an error rather than a guess, so ask again
+		// in a mode that surfaces the command's error and report its cause.
+		cause := &packages.Config{
+			Mode:       packages.NeedName | packages.NeedFiles,
+			Dir:        cfg.Dir,
+			Tests:      cfg.Tests,
+			Env:        cfg.Env,
+			BuildFlags: cfg.BuildFlags,
+		}
+		if _, err := packages.Load(cause, patterns...); err != nil {
+			return nil, fmt.Errorf("loading packages: %w", err)
+		}
+		return nil, fmt.Errorf("loading packages: no packages match %s in %s", strings.Join(patterns, " "), cfg.Dir)
+	}
+	var loadErrs []string
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		for _, e := range p.Errors {
+			loadErrs = append(loadErrs, e.Error())
+		}
+	})
+	if len(loadErrs) > 0 {
+		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
+	}
+	return pkgs, nil
 }
 
 type upcast struct {
@@ -188,9 +211,10 @@ type extractor struct {
 	dir     string
 	seen    map[string]bool
 	ignored []string
-	// loaded keys the builds already read, so two files in one package under
-	// one constraint cost one load.
-	loaded  map[string]bool
+	// loaded holds, per build and package directory, the errors that build's
+	// load reported -- nil when it read the package. A sibling file needing the
+	// same build costs no second load, and still learns why the build failed.
+	loaded  map[string][]string
 	rules   []Rule
 	ruleAt  map[string]string
 	tables  []Table
@@ -377,7 +401,15 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
-		inst := info.Instances[callee(call)]
+		inst, ok := info.Instances[callee(call)]
+		if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() < 2 {
+			// A registration the type checker could not instantiate has no
+			// entry in Instances, and its type arguments are the only place
+			// the stored type and the codec are written. There is nothing to
+			// record, so this is an error rather than a zero value.
+			x.errorf(p.Fset, call.Pos(), "codec.Register: the type checker could not instantiate this call, so the type an entry is stored as cannot be read")
+			return
+		}
 		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
 		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
 		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
