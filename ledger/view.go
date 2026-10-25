@@ -56,9 +56,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueViews(b *Batch, at Loaded[S], cause En
 
 func queueView[S any](b *Batch, v View[S], at Loaded[S], cause Entry) error {
 	cause.Position, cause.TxID = 0, 0
-	b.owner = v.Name
-	defer func() { b.owner = "" }()
-	if err := v.Write(b, at, cause); err != nil {
+	if err := b.as(v.Name, func() error { return v.Write(b, at, cause) }); err != nil {
 		return &viewFailure{fmt.Errorf("cairn: view %s at %s#%d: %w", v.Name, at.Stream, at.Seq, err)}
 	}
 	return nil
