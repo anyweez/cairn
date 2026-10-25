@@ -105,11 +105,15 @@ func (x *extractor) readShapeBuilds(dir string, patterns []string) {
 		return
 	}
 	for _, ctx := range shapeBuilds() {
-		if ctx.key() == x.inherited || x.loaded[ctx.key()] {
+		if ctx.key() == x.inherited || x.loadedBuilds[ctx.key()] {
 			continue
 		}
-		x.loaded[ctx.key()] = true
-		x.loadBuild(dir, ctx, patterns)
+		// A comparison build's errors are not the module's: a package that
+		// does not type-check on a platform the module is not used on must not
+		// refuse it. It contributes no observation -- extract skips a package
+		// that does not type-check -- and the file-reading path reports a failed
+		// build only for the file whose own package failed.
+		_, _ = x.loadBuild(dir, ctx, patterns)
 	}
 }
 
@@ -207,29 +211,59 @@ func (x *extractor) readInBuild(dir, path string, patterns []string) {
 		return
 	}
 	tried := 0
+	var loadErrs []string
 	for _, ctx := range contexts(path) {
 		if tried == maxBuildsPerFile {
 			break
 		}
-		// A build already read has read every file it selects.
-		if x.loaded[ctx.key()] {
+		// A build already read has read every file it selects, and remembers
+		// what the file's own package reported if it did not type-check.
+		key := ctx.key() + " " + pkgDir
+		if errs, done := x.loadErrs[key]; done {
+			loadErrs = append(loadErrs, errs...)
 			continue
 		}
-		x.loaded[ctx.key()] = true
 		tried++
-		x.loadBuild(dir, ctx, patterns)
+		byDir, err := x.loadBuild(dir, ctx, patterns)
+		if err != nil {
+			x.errs = append(x.errs, err.Error())
+			return
+		}
+		errs := byDir[pkgDir]
+		x.loadErrs[key] = errs
+		loadErrs = append(loadErrs, errs...)
 		if x.seen[path] {
 			return
 		}
+	}
+	if len(loadErrs) > 0 {
+		// A build does include the file; it just does not type-check. The
+		// loader's own message names the file and the symbol it could not
+		// resolve, which is the answer, where extracting from the partial type
+		// information it reports anyway would record a guess. Only the file's
+		// own package is reported: another package in the same load is not this
+		// file's failure, and may fail on a platform the module is not used on.
+		x.errs = append(x.errs, loadErrs...)
+		return
 	}
 	x.errs = append(x.errs, fmt.Sprintf("%s: %s: no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest", x.rel(path), buildConstraint(path)))
 }
 
 // loadBuild reads patterns in the build ctx describes and adds what it declares
-// to x, including every registered type's shape as this build resolves it. A
-// build that fails to load leaves the files it was meant to read unread, which
-// the caller reports.
-func (x *extractor) loadBuild(dir string, ctx buildContext, patterns []string) {
+// to x, including every registered type's shape as this build resolves it. It
+// returns the errors each package reported, keyed by the directory holding the
+// package's files, so a caller reading one file can report the one for that
+// file's own package: a build the tool cannot read leaves that file unread, and
+// the loader's message says why. The whole pattern set is loaded whether or not
+// the file's own package failed, since the other packages' shapes still matter.
+//
+// A build is loaded once however many files it reads; the second caller gets the
+// same per-package errors.
+func (x *extractor) loadBuild(dir string, ctx buildContext, patterns []string) (map[string][]string, error) {
+	if x.loadedBuilds[ctx.key()] {
+		return x.buildErrs[ctx.key()], nil
+	}
+	x.loadedBuilds[ctx.key()] = true
 	cfg := &packages.Config{
 		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:   dir,
@@ -241,9 +275,26 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, patterns []string) {
 	}
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("loading packages for %s: %w", ctx.key(), err)
+	}
+	if len(pkgs) == 0 {
+		// Nothing matches the patterns in this build, so a file it should have
+		// read stays unread and readInBuild reports it.
+		return nil, nil
 	}
 	x.extract(pkgs, ctx.key())
+	byDir := map[string][]string{}
+	for _, p := range pkgs {
+		if len(p.Errors) == 0 {
+			continue
+		}
+		dir := filepath.Clean(p.Dir)
+		for _, e := range p.Errors {
+			byDir[dir] = append(byDir[dir], e.Error())
+		}
+	}
+	x.buildErrs[ctx.key()] = byDir
+	return byDir, nil
 }
 
 // contexts lists the builds that include path, the inherited build first, so a

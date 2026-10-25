@@ -78,7 +78,11 @@ type Edge struct {
 // the tool happens to run on. Each such build resolves every registered type, so
 // a JSON shape that differs between builds is an error naming the type and the
 // files that declare it. A file no build this tool can load includes is an
-// error naming the file and its constraint.
+// error naming the file and its constraint, and a file a build includes but
+// cannot type-check is an error carrying the loader's message naming the file.
+// A package that does not type-check in one of the comparison builds contributes
+// no shape observation, so a platform the module is not used on does not refuse
+// it.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -89,38 +93,14 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		Dir:   dir,
 		Tests: true,
 	}
-	pkgs, err := packages.Load(cfg, patterns...)
+	pkgs, err := loadPackages(cfg, patterns...)
 	if err != nil {
 		return nil, err
 	}
-	if len(pkgs) == 0 {
-		// go list can fail with its message on stderr and nothing on stdout,
-		// and x/tools reports that as no packages and a nil error: a module
-		// that declares nothing is indistinguishable from a load that read
-		// nothing. A manifest is an error rather than a guess, so ask again
-		// in a mode that surfaces the command's error and report its cause.
-		_, cause := packages.Load(&packages.Config{
-			Mode:  packages.NeedName | packages.NeedFiles,
-			Dir:   dir,
-			Tests: true,
-		}, patterns...)
-		if cause == nil {
-			cause = fmt.Errorf("no packages match %s in %s", strings.Join(patterns, " "), dir)
-		}
-		return nil, fmt.Errorf("loading packages: %w", cause)
-	}
-	var loadErrs []string
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			loadErrs = append(loadErrs, e.Error())
-		}
-	})
-	if len(loadErrs) > 0 {
-		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
-	}
 
 	x := &extractor{
-		dir: dir, seen: map[string]bool{}, loaded: map[string]bool{},
+		dir: dir, seen: map[string]bool{},
+		loadedBuilds: map[string]bool{}, loadErrs: map[string][]string{}, buildErrs: map[string]map[string][]string{},
 		inherited: inheritedBuild(),
 		ruleAt:    map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
 		shapes: map[string]map[string]shape{},
@@ -140,7 +120,11 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
+		// A file read in several builds reports the same load error once per
+		// build, and a sibling of a broken file reports the error its package
+		// already reported; identical messages are one problem.
 		slices.Sort(x.errs)
+		x.errs = slices.Compact(x.errs)
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
 	}
 
@@ -162,6 +146,53 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	return m, nil
 }
 
+// loadPackages loads patterns and refuses a result the manifest cannot be read
+// from: no packages at all, and any package carrying an error. The manifest
+// states what the type checker resolved, so a package go/packages reports with
+// errors is partial type information and everything read from it would be a
+// guess -- an unresolved field renders as "invalid type", and a registration
+// the checker could not instantiate has no type arguments at all.
+//
+// The inherited build's load goes through here, so a module that does not
+// type-check on the host is refused rather than half-read. The builds read for a
+// file the host's context left out do not: they load the whole pattern set, and
+// a package that fails on another platform must not refuse the module (see
+// loadBuild).
+func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return nil, fmt.Errorf("loading packages: %w", err)
+	}
+	if len(pkgs) == 0 {
+		// go list can fail with its message on stderr and nothing on stdout,
+		// and x/tools reports that as no packages and a nil error: a module
+		// that declares nothing is indistinguishable from a load that read
+		// nothing. A manifest is an error rather than a guess, so ask again
+		// in a mode that surfaces the command's error and report its cause.
+		cause := &packages.Config{
+			Mode:       packages.NeedName | packages.NeedFiles,
+			Dir:        cfg.Dir,
+			Tests:      cfg.Tests,
+			Env:        cfg.Env,
+			BuildFlags: cfg.BuildFlags,
+		}
+		if _, err := packages.Load(cause, patterns...); err != nil {
+			return nil, fmt.Errorf("loading packages: %w", err)
+		}
+		return nil, fmt.Errorf("loading packages: no packages match %s in %s", strings.Join(patterns, " "), cfg.Dir)
+	}
+	var loadErrs []string
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		for _, e := range p.Errors {
+			loadErrs = append(loadErrs, e.Error())
+		}
+	})
+	if len(loadErrs) > 0 {
+		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
+	}
+	return pkgs, nil
+}
+
 type upcast struct {
 	sum, name string
 	from      int
@@ -178,10 +209,14 @@ func (x *extractor) extract(pkgs []*packages.Package, build string) {
 		if strings.HasSuffix(p.PkgPath, ".test") {
 			continue // the generated test main
 		}
-		// A package that does not type-check resolves shapes from partial type
-		// information, which is a guess rather than a shape to compare: the
-		// file-reading path reports that build instead.
-		observe := len(p.Errors) == 0
+		// A package that does not type-check resolves names from partial type
+		// information, so a rule, table or registration read from it would be a
+		// guess: it contributes nothing. The file-reading path reports a build
+		// whose load failed when the failing package is the file's own, so this
+		// loses no error and never records a partial shape.
+		if len(p.Errors) > 0 {
+			continue
+		}
 		for _, name := range p.IgnoredFiles {
 			if strings.HasSuffix(name, ".go") {
 				x.ignored = append(x.ignored, name)
@@ -191,7 +226,7 @@ func (x *extractor) extract(pkgs []*packages.Package, build string) {
 			name := p.Fset.File(f.Pos()).Name()
 			first := !x.seen[name]
 			x.seen[name] = true
-			x.file(p, f, name, build, first, observe)
+			x.file(p, f, name, build, first)
 		}
 	}
 }
@@ -216,15 +251,24 @@ type extractor struct {
 	ignored []string
 	// inherited names the build Extract's first load ran in.
 	inherited string
-	// loaded keys the builds already read, so one build costs one load however
-	// many files it reads.
-	loaded  map[string]bool
-	rules   []Rule
-	ruleAt  map[string]string
-	tables  []Table
-	codecs  map[string]*Codec
-	codecAt map[string]string
-	upcasts []upcast
+	// loadedBuilds keys the builds already read, so one build costs one load
+	// however many files it reads.
+	loadedBuilds map[string]bool
+	// loadErrs holds, per build and package directory, the errors that build's
+	// load reported for the package -- nil when it read it. A sibling file
+	// needing the same build costs no second load, and still learns why the
+	// build failed.
+	loadErrs map[string][]string
+	// buildErrs is each loaded build's per-package errors as loadBuild found
+	// them, so a build first read for its shapes can be reported later for a
+	// file it could not read.
+	buildErrs map[string]map[string][]string
+	rules     []Rule
+	ruleAt    map[string]string
+	tables    []Table
+	codecs    map[string]*Codec
+	codecAt   map[string]string
+	upcasts   []upcast
 	// shapes holds each build's resolution of a registered type, keyed by the
 	// codec's key and then the build, so two builds that disagree are an error.
 	shapes map[string]map[string]shape
@@ -251,8 +295,8 @@ func (x *extractor) rel(path string) string {
 // file reads one file as build resolves it. first is false for a file another
 // build has already read: its rules and tables are recorded once, but its
 // registrations are still observed, because the shape they resolve is the
-// build's. observe is false for a package that does not type-check.
-func (x *extractor) file(p *packages.Package, f *ast.File, name, build string, first, observe bool) {
+// build's.
+func (x *extractor) file(p *packages.Package, f *ast.File, name, build string, first bool) {
 	if first {
 		for _, decl := range f.Decls {
 			gen, ok := decl.(*ast.GenDecl)
@@ -286,7 +330,7 @@ func (x *extractor) file(p *packages.Package, f *ast.File, name, build string, f
 	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
-			x.codecCall(p, call, build, first, observe)
+			x.codecCall(p, call, build, first)
 		}
 		return true
 	})
@@ -410,14 +454,18 @@ func (x *extractor) table(p *packages.Package, ident *ast.Ident, value ast.Expr)
 	x.tables = append(x.tables, t)
 }
 
-func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build string, first, observe bool) {
+func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build string, first bool) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
 		inst, ok := info.Instances[callee(call)]
-		if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() != 2 {
+		if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() < 2 {
+			// A registration the type checker could not instantiate has no
+			// entry in Instances, and its type arguments are the only place
+			// the stored type and the codec are written. There is nothing to
+			// record, so this is an error rather than a zero value.
 			if first {
-				x.errorf(p.Fset, call.Pos(), "codec.Register: cannot read the type arguments this call instantiates")
+				x.errorf(p.Fset, call.Pos(), "codec.Register: the type checker could not instantiate this call, so the type an entry is stored as cannot be read")
 			}
 			return
 		}
@@ -451,9 +499,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			Type:    types.TypeString(types.Unalias(v), nil),
 			Fields:  fields(v),
 		}
-		if observe {
-			x.observe(p, call, build, c, v)
-		}
+		x.observe(p, call, build, c, v)
 		if !first {
 			return
 		}

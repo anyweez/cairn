@@ -14,7 +14,11 @@
 // includes is an error naming the file and the constraint, and every registered
 // type is resolved in every build the tool reads, so a JSON shape that differs
 // between builds is an error naming the type and the files that declare it
-// rather than the host's representation.
+// rather than the host's representation. A file a build includes but that does
+// not type-check under it is an error carrying the loader's message naming the
+// file, not a shape read from partial type information; a package that fails in
+// a comparison build contributes no shape, so a platform the module is not used
+// on does not refuse it.
 //
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is

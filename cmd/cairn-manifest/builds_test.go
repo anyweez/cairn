@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -376,6 +377,190 @@ func (Stamp) MarshalJSON() ([]byte, error) { return []byte("1"), nil }
 			}
 		}
 	}
+}
+
+// A build that fails is not the whole answer: the same file is in other builds,
+// and the one it belongs to may be later in the search. Here a_use.go is
+// selected by either tag but only type-checks with both, so the first builds
+// tried report an error and a later one reads it.
+func TestABuildThatFailsDoesNotStopAnotherReadingTheFile(t *testing.T) {
+	dir := writeModule(t, `module example.com/fallback
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"events.go": `package events
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Common struct {
+	ID string ` + "`json:\"id\"`" + `
+}
+
+func (Common) isEvent() {}
+
+func Codecs() *codec.Codec[Event] {
+	c := codec.New[Event]()
+	codec.Register[Common](c, "constrained.common", 1)
+	return c
+}
+`,
+		// Sorted before z_def.go, so it is the file whose search has to survive
+		// the builds that select it without the declaration it uses.
+		"a_use.go": `//go:build cairnqa || cairnqa2
+
+package events
+
+import "github.com/anyweez/cairn/codec"
+
+type Tagged struct {
+	Path Detail ` + "`json:\"path\"`" + `
+}
+
+func (Tagged) isEvent() {}
+
+func init() {
+	codec.Register[Tagged](Codecs(), "constrained.tagged", 1)
+}
+`,
+		"z_def.go": `//go:build cairnqa && cairnqa2
+
+package events
+
+type Detail struct {
+	Text string ` + "`json:\"text\"`" + `
+}
+`,
+	})
+
+	m, err := Extract(dir, "./...")
+	if err != nil {
+		t.Fatalf("a file that type-checks in one build was refused because another build failed: %v", err)
+	}
+	if got := codecNames(m); !slices.Equal(got, []string{"constrained.common", "constrained.tagged"}) {
+		t.Errorf("codecs: %v", got)
+	}
+	for _, c := range m.Codecs {
+		if c.Name == "constrained.tagged" && !slices.Equal(c.Fields, []string{"path: {text: string}"}) {
+			t.Errorf("the tagged type's shape: %v", c.Fields)
+		}
+	}
+}
+
+// Two answers have to be told apart: a stored type that really does differ
+// between builds, which is refused naming the files that declare it, and a
+// package that merely fails to type-check in a comparison build for a platform
+// the module is not used on, which must contribute no shape rather than refuse
+// the module. Here the stored type's field is a number on Linux and a string
+// elsewhere, and an unrelated package calls a symbol declared only off Windows.
+func TestAComparisonBuildsUnrelatedFailureDoesNotRefuseTheModule(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the unrelated package is meant to fail on a comparison platform, and on Windows it is the host's own build")
+	}
+
+	// module writes the same tree with the platform declaration the subtest is
+	// about: the two files that disagree, or the one every platform reads.
+	module := func(stampFiles map[string]string) string {
+		files := map[string]string{
+			"events.go": `package events
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Created struct {
+	ID string ` + "`json:\"id\"`" + `
+	At Stamp  ` + "`json:\"at\"`" + `
+}
+
+func (Created) isEvent() {}
+
+func Codecs() *codec.Codec[Event] {
+	c := codec.New[Event]()
+	codec.Register[Created, Event](c, "comparison.created", 1)
+	return c
+}
+`,
+			// A package that builds everywhere off Windows, and a package that
+			// uses it from a file with no constraint of its own: the second one
+			// does not type-check when the tool loads the module for Windows.
+			"unixonly/unixonly.go": `//go:build !windows
+
+package unixonly
+
+func Call() int { return 1 }
+`,
+			"uses/uses.go": `package uses
+
+import "example.com/comparison/unixonly"
+
+var _ = unixonly.Call()
+`,
+		}
+		for name, src := range stampFiles {
+			files[name] = src
+		}
+		return writeModule(t, `module example.com/comparison
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, files)
+	}
+
+	t.Run("the platform difference is refused", func(t *testing.T) {
+		dir := module(map[string]string{
+			"stamp_linux.go": `//go:build linux
+
+package events
+
+type Stamp int64
+`,
+			"stamp_other.go": `//go:build !linux
+
+package events
+
+type Stamp string
+`,
+		})
+		_, err := Extract(dir, "./...")
+		if err == nil {
+			t.Fatal("a stored type whose field differs between builds was recorded as one build's shape")
+		}
+		for _, want := range []string{"Stamp", "stamp_linux.go", "stamp_other.go"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not name %q: %v", want, err)
+			}
+		}
+		// The unrelated package's Windows failure is not the reason: it is a
+		// platform the module is not used on, so it is not named.
+		if strings.Contains(err.Error(), "uses.go") {
+			t.Errorf("the refusal is the comparison build's unrelated failure, not the shape difference: %v", err)
+		}
+	})
+
+	t.Run("the unrelated failure alone does not refuse", func(t *testing.T) {
+		dir := module(map[string]string{
+			"stamp.go": `package events
+
+type Stamp int64
+`,
+		})
+		m, err := Extract(dir, "./...")
+		if err != nil {
+			t.Fatalf("a package that does not type-check on Windows refused a module whose stored types agree everywhere: %v", err)
+		}
+		if got := codecNames(m); !slices.Equal(got, []string{"comparison.created"}) {
+			t.Errorf("codecs: %v", got)
+		}
+	})
 }
 
 func mustRepoRoot(t *testing.T) string {
