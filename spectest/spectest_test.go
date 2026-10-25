@@ -61,6 +61,29 @@ func TestVacuousEstablishedRuleFails(t *testing.T) {
 	}
 }
 
+// The vacuity gate counts the runs rapid completed, not the draws a generator
+// rejected. A full-length check still performs its 100 valid runs when some
+// draws are rejected, so an established rule none of them reached must still
+// fail it: the -short exception must not become a hole at full length.
+func TestVacuousEstablishedRuleStillFailsWhenTheGeneratorRejectsDraws(t *testing.T) {
+	if testing.Short() {
+		t.Skip("vacuity is only enforced on a full-length check")
+	}
+	m := counter(unreachable())
+	draws := 0
+	m.Messages = func(t *rapid.T, _ int) int {
+		draws++
+		if draws <= 5 {
+			t.Skip("not a valid draw")
+		}
+		return rapid.IntRange(0, 1).Draw(t, "msg")
+	}
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, "C1 is vacuous") {
+		t.Fatalf("a full-length check must still fail a rule no valid run reached, got err=%v %q", err, msg)
+	}
+}
+
 func TestAllowVacuous(t *testing.T) {
 	m := counter(unreachable())
 	m.AllowVacuous = []string{unreachable().ID}
