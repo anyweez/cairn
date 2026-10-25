@@ -149,6 +149,10 @@ type Loaded[S any] struct {
 	Seq    int64
 
 	snapshotSeq int64
+	// snapshotBytes is the size of the state's last snapshot, which estimates
+	// what it costs the store's cache (see StateCacheBytes). It is zero until
+	// a snapshot has been written or read.
+	snapshotBytes int
 }
 
 // Handled is what recording one message produced. The stream's state after
@@ -603,7 +607,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 		if err := json.Unmarshal(p.snapshot, &state); err != nil {
 			return Loaded[S]{}, fmt.Errorf("cairn: decoding snapshot of %s: %w", p.stream, err)
 		}
-		at.State, at.snapshotSeq = state, p.snapSeq
+		at.State, at.snapshotSeq, at.snapshotBytes = state, p.snapSeq, len(p.snapshot)
 	case p.snapshot != nil:
 		// A snapshot past the stream's seq can only come from damaged data.
 		// Ignore it, and fold every entry instead.
@@ -923,5 +927,6 @@ INSERT INTO cairn.state_snapshots (stream, seq, version, state) VALUES ($1, $2, 
 ON CONFLICT (stream, version) DO UPDATE SET seq = excluded.seq, state = excluded.state, taken_at = now()`,
 		at.Stream.String(), at.Seq, a.StateVersion, jsonArg(data))
 	at.snapshotSeq = at.Seq
+	at.snapshotBytes = len(data)
 	return nil
 }
