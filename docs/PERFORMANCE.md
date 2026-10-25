@@ -47,8 +47,17 @@ instead.
 
 A store keeps the state of up to 10,000 streams in memory by default.
 `ledger.StateCacheSize(n)` sets the size, and `StateCacheSize(0)` turns the
-cache off. Each stream that an aggregate writes has a lane in the process,
-and its messages are recorded one transaction at a time:
+cache off. That bounds the number of streams, so its cost in memory is the
+count times a state's size: a few hundred bytes a state is a few megabytes at
+most, and a megabyte a state is gigabytes. `ledger.StateCacheBytes(n)` adds a
+bound in bytes, estimated from the snapshots the store already writes, and
+evicts the least recently used streams to stay under it. It is off by
+default, because how much memory a deployment can spare is its own choice.
+The estimate is the size of a stream's last snapshot, so it trails a state
+that has grown since, and an aggregate with no `StateVersion` writes none to
+size; those keep the count as their only bound. Each stream that an aggregate
+writes has a lane in the process, and its messages are recorded one
+transaction at a time:
 
 - **A cached stream costs one round trip.** Its message is decided as soon as
   it is its turn. One batch then opens a transaction, locks the stream on

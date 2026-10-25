@@ -374,6 +374,42 @@ func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
 	}
 }
 
+// A store given a byte budget does not cache a state larger than it, so every
+// message to that stream reads the store first, as it would for an evicted
+// stream. The same state fits the same cache when only the stream count
+// bounds it.
+func TestAByteBudgetEvictsAStateTooLargeForIt(t *testing.T) {
+	t.Parallel()
+	pool, trips := tracedPool(t, 1)
+	bounded := counterOn(ledger.New(pool, ledger.RequireActor(false), ledger.StateCacheSize(10), ledger.StateCacheBytes(1)))
+	roomy := counterOn(ledger.New(pool, ledger.RequireActor(false), ledger.StateCacheSize(10), ledger.StateCacheBytes(1<<20)))
+	for _, agg := range []*ledger.Aggregate[counter, msg, int, event, effect]{bounded, roomy} {
+		agg.StateVersion, agg.SnapshotEvery = "v1", 1
+	}
+	handle := func(agg *ledger.Aggregate[counter, msg, int, event, effect], id string) int64 {
+		t.Helper()
+		trips.reset()
+		if _, err := agg.Handle(ctx, id, add{1, 100}); err != nil {
+			t.Fatal(err)
+		}
+		return trips.trips.Load()
+	}
+	// The first message to each stream is read from the store, and the next
+	// message to the roomy stream is the first on the cached path, which
+	// prepares its statements.
+	handle(bounded, "a")
+	handle(roomy, "b")
+	handle(roomy, "b")
+	if n := handle(bounded, "a"); n != 2 {
+		t.Fatalf("a state larger than the byte budget took %d round trips, want 2", n)
+	}
+	if n := handle(roomy, "b"); n != 1 {
+		t.Fatalf("a state within the byte budget took %d round trips, want 1", n)
+	}
+	checkStream(t, bounded, "a", 2, 2)
+	checkStream(t, roomy, "b", 3, 3)
+}
+
 // A state with a map in it, so that a caller holding one could change what
 // the cache holds.
 type basket struct{ Items map[string]int }

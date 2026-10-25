@@ -59,7 +59,7 @@ func TestACacheAheadOfTheStoredStreamLeavesNoGap(t *testing.T) {
 	}
 
 	stream := agg.Stream("a")
-	store.cache.put(agg.cacheKey(stream), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5})
+	store.cache.put(agg.cacheKey(stream), Loaded[tally]{Stream: stream, State: tally{N: 5}, Seq: 5}, 0)
 	h, err := agg.Handle(ctx, "a", bump{})
 	if err != nil {
 		t.Fatal(err)
@@ -289,9 +289,9 @@ func TestALaneWithMoreThanGroupMaxWaitingRecordsItInChunks(t *testing.T) {
 // decisions bring it back.
 func TestTrustInACachedStreamDecaysAndRecovers(t *testing.T) {
 	t.Parallel()
-	cache := newStateCache(4)
+	cache := newStateCache(4, 0)
 	const key = "tally/a"
-	cache.put(key, tally{N: 1})
+	cache.put(key, tally{N: 1}, 0)
 	if _, trust := cache.begin(key); !trust {
 		t.Fatal("a stream new to the cache was not trusted")
 	}
@@ -320,5 +320,50 @@ func TestTrustInACachedStreamDecaysAndRecovers(t *testing.T) {
 	}
 	if !trusted {
 		t.Fatal("the cache never trusted the stream again")
+	}
+}
+
+// The byte budget is a second bound: a cache with room for every stream it is
+// given still evicts the least recently used state once the states together
+// pass the budget, and never keeps one state larger than the whole budget.
+func TestAByteBudgetEvictsTheLeastRecentlyUsedState(t *testing.T) {
+	t.Parallel()
+	cache := newStateCache(4, 10)
+	cache.put("a", tally{N: 1}, 4)
+	cache.put("b", tally{N: 2}, 4)
+	cache.put("c", tally{N: 3}, 4) // 12 bytes, so the least recently used goes
+	if v, _ := cache.begin("a"); v != nil {
+		t.Fatal("the least recently used stream stayed past the byte budget")
+	}
+	for _, key := range []string{"b", "c"} {
+		if v, _ := cache.begin(key); v == nil {
+			t.Fatalf("%s was evicted under a byte budget with room for it", key)
+		}
+	}
+
+	// A state larger than the whole budget would evict every other stream and
+	// then itself, so it is not kept at all.
+	cache.put("d", tally{N: 4}, 11)
+	if v, _ := cache.begin("d"); v != nil {
+		t.Fatal("a state larger than the whole byte budget was cached")
+	}
+	if cache.order.Len() != 0 || cache.held != 0 {
+		t.Fatalf("the cache holds %d states and %d bytes, want none", cache.order.Len(), cache.held)
+	}
+
+	// Replacing a state adjusts what the cache holds, rather than adding the
+	// new size beside the old one.
+	cache = newStateCache(4, 8)
+	cache.put("a", tally{N: 1}, 4)
+	cache.put("a", tally{N: 2}, 6)
+	if v, _ := cache.begin("a"); v == nil {
+		t.Fatal("a replaced state's old size was still counted")
+	}
+
+	// Dropping a state frees what it held.
+	cache.drop("a")
+	cache.put("b", tally{N: 3}, 8)
+	if v, _ := cache.begin("b"); v == nil {
+		t.Fatal("a dropped state's size was not freed")
 	}
 }

@@ -36,6 +36,8 @@ type Store struct {
 	pool         *pgxpool.Pool
 	requireActor bool
 	cache        *stateCache
+	cacheStreams int
+	cacheBytes   int
 }
 
 // StoreOption configures a Store.
@@ -51,26 +53,38 @@ const DefaultStateCacheSize = 10_000
 
 // StateCacheSize sets how many streams' state the store keeps in memory
 // between messages, for every aggregate on it. Zero turns the cache off, and
-// Handle then reads every stream before deciding. See docs/PERFORMANCE.md.
+// Handle then reads every stream before deciding. StateCacheBytes adds a
+// bound on the memory those states hold. See docs/PERFORMANCE.md.
 func StateCacheSize(streams int) StoreOption {
-	return func(s *Store) {
-		s.cache = nil
-		if streams > 0 {
-			s.cache = newStateCache(streams)
-		}
-	}
+	return func(s *Store) { s.cacheStreams = streams }
+}
+
+// StateCacheBytes bounds the state the store keeps in memory for its cache,
+// measured by the snapshot encoding of each stream's state. The least
+// recently used streams are evicted to stay under it. Zero, the default,
+// leaves StateCacheSize's stream count as the only bound.
+//
+// The size comes from the snapshots the store already writes, so it is an
+// estimate: a stream with no snapshot yet counts as nothing, and one that has
+// grown since its last snapshot counts at the size it was then. An aggregate
+// with no StateVersion writes no snapshot, so its states are not counted;
+// bound those with StateCacheSize alone. See docs/PERFORMANCE.md.
+func StateCacheBytes(bytes int) StoreOption {
+	return func(s *Store) { s.cacheBytes = bytes }
 }
 
 // New returns a store over pool. Call Migrate before first use.
 //
 // The store keeps the state of up to DefaultStateCacheSize streams in memory,
 // so that Handle can record a message to a stream it has recently recorded to
-// in one round trip; StateCacheSize changes that.
+// in one round trip; StateCacheSize changes that, and StateCacheBytes bounds
+// the memory it holds.
 func New(pool *pgxpool.Pool, opts ...StoreOption) *Store {
-	s := &Store{pool: pool, requireActor: true, cache: newStateCache(DefaultStateCacheSize)}
+	s := &Store{pool: pool, requireActor: true, cacheStreams: DefaultStateCacheSize}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.cache = newStateCache(s.cacheStreams, s.cacheBytes)
 	return s
 }
 
