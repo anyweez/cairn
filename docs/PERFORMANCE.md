@@ -167,9 +167,9 @@ Already off the path: effect delivery (`Dispatcher`), projections and
 Ordered by payoff.
 
 1. **Fewer round trips for the dispatcher.** It makes about two per effect
-   (restarting the lease, then recording the outcome). That's off the path a
-   caller waits on, but it limits how fast effects are carried out over a
-   slow link.
+   (restarting the lease and counting the attempt, then recording the outcome).
+   That's off the path a caller waits on, but it limits how fast effects are
+   carried out over a slow link.
 2. **Decide whether refusals need a durable write.** A refused message costs a
    write transaction and a flush. `SET LOCAL synchronous_commit = off` for
    transactions that record only refusals would save the flush, but not a
