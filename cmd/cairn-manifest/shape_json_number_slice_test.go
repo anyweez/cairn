@@ -2,12 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"go/types"
 	"slices"
 	"strings"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // jsonNumberSlice and jsonStringSlice have the same rendered shape today,
@@ -25,23 +22,7 @@ type jsonStringSlice struct {
 // is rendered as []string, the same as a []string, so the -base check watches a
 // wire format that is not the one encoding/json writes.
 func TestAJSONNumberSliceIsShapedAsEncodingJSONWritesIt(t *testing.T) {
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lookup := func(name string) types.Type {
-		for _, p := range pkgs {
-			if p.Types == nil {
-				continue
-			}
-			if obj := p.Types.Scope().Lookup(name); obj != nil {
-				return obj.Type()
-			}
-		}
-		t.Fatalf("%s not found in the loaded package", name)
-		return nil
-	}
+	declared := loadDeclaredTypes(t)
 
 	// The wire formats differ: bare numbers against quoted strings.
 	numberRAW, err := json.Marshal(jsonNumberSlice{Numbers: []json.Number{"1"}})
@@ -56,7 +37,7 @@ func TestAJSONNumberSliceIsShapedAsEncodingJSONWritesIt(t *testing.T) {
 		t.Fatalf("the two wire formats are the same: %s", numberRAW)
 	}
 
-	number, str := fields(lookup("jsonNumberSlice")), fields(lookup("jsonStringSlice"))
+	number, str := fields(declared.get(t, "jsonNumberSlice")), fields(declared.get(t, "jsonStringSlice"))
 	slices.Sort(number)
 	slices.Sort(str)
 	if strings.Join(number, ",") == strings.Join(str, ",") {

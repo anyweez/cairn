@@ -9,13 +9,10 @@ package main
 
 import (
 	"encoding/json"
-	"go/types"
 	"reflect"
 	"strings"
 	"testing"
 	"unicode"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // DiffEmbeddedA and DiffEmbeddedB each marshal themselves with a value
@@ -208,7 +205,7 @@ var diffFixtures = []any{
 // rendered, every rendered name must be written, and where the shape says
 // which kind of JSON value it is, the written value must be that kind.
 func TestFieldsMatchesEncodingJSONForEveryFixture(t *testing.T) {
-	declared := loadTestPackageTypes(t)
+	declared := loadDeclaredTypes(t)
 	for _, fixture := range diffFixtures {
 		rt := reflect.TypeOf(fixture)
 		name := rt.Name()
@@ -414,27 +411,4 @@ func populate(v reflect.Value, depth int) {
 	case reflect.Bool:
 		v.SetBool(true)
 	}
-}
-
-// loadTestPackageTypes loads this package's declared types, the way the other
-// shape tests reach the real declaration, once for every fixture.
-func loadTestPackageTypes(t *testing.T) map[string]types.Type {
-	t.Helper()
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	byName := map[string]types.Type{}
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		for _, name := range p.Types.Scope().Names() {
-			if obj := p.Types.Scope().Lookup(name); obj != nil && obj.Type() != nil {
-				byName[name] = obj.Type()
-			}
-		}
-	}
-	return byName
 }
