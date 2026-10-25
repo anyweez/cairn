@@ -375,7 +375,11 @@ it to another platform, or one that needs a tag such as `tools` — is read in a
 build that includes it. A tree therefore produces the same manifest on every
 host, so the committed file is current everywhere and `-base` never reads a
 type that one platform stores and another does not as removed. A file no build
-includes is an error naming the file and its constraint.
+includes is an error naming the file and its constraint. A registered type is
+resolved in every build the tool reads, so a JSON shape that differs between
+builds — a field whose type one platform declares as a number and another as a
+string — is an error naming the type and the files that declare it, rather than
+whichever representation the generating host happens to build.
 
 Each of these must be stated with constants. A rule, table or registration
 the tool can't read exactly is an error, not a guess. So is a registration

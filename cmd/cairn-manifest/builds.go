@@ -28,7 +28,11 @@ type buildContext struct {
 }
 
 func (c buildContext) key() string {
-	return c.goos + "/" + c.goarch + " tags=" + strings.Join(c.tags, ",")
+	s := c.goos + "/" + c.goarch
+	if len(c.tags) > 0 {
+		s += " tags=" + strings.Join(c.tags, ",")
+	}
+	return s
 }
 
 // selects reports whether the file at path belongs to a package under c.
@@ -51,13 +55,113 @@ func (c buildContext) selects(path string) bool {
 // inherited build selects, so the extractor reads the rest itself: each file is
 // read in a build that includes it, found by matching its name and build line
 // against every platform the toolchain knows and the extra tags its line names.
+//
+// Each such build loads the whole pattern set, not just the file's package, so
+// every registered type is resolved in it wherever it is declared: a field
+// whose type one platform declares differently is caught rather than recorded
+// as the host's shape.
 func (x *extractor) readBuilds(dir string, patterns []string) {
 	for _, path := range x.unread(dir, patterns) {
 		if x.seen[path] {
 			continue
 		}
-		x.readInBuild(dir, path)
+		x.readInBuild(dir, path, patterns)
 	}
+}
+
+// inheritedBuild names the build Extract's first load ran in: the GOOS and
+// GOARCH in the environment, which is what packages.Load reads when the tool
+// gives it no build configuration of its own.
+func inheritedBuild() string {
+	goos, goarch := os.Getenv("GOOS"), os.Getenv("GOARCH")
+	if goos == "" {
+		goos = build.Default.GOOS
+	}
+	if goarch == "" {
+		goarch = build.Default.GOARCH
+	}
+	return buildContext{goos: goos, goarch: goarch}.key()
+}
+
+// shapeBuilds lists the builds whose resolution of a registered type is compared.
+// They are a fixed set rather than the host's, so which builds are compared does
+// not depend on the machine: the inherited build is compared with them, and a
+// file the host includes and another platform excludes -- a marshaler declared
+// for one platform, say -- is read from both sides.
+func shapeBuilds() []buildContext {
+	return []buildContext{
+		{goos: "linux", goarch: "amd64"},
+		{goos: "darwin", goarch: "arm64"},
+		{goos: "windows", goarch: "amd64"},
+	}
+}
+
+// readShapeBuilds reads the comparison builds when the module declares a file
+// whose platform decides whether it is built, since only then can a registered
+// type's shape depend on the host. Reading only the builds needed to see an
+// excluded file would leave the compared set depending on the host.
+func (x *extractor) readShapeBuilds(dir string, patterns []string) {
+	if len(x.codecs) == 0 || !x.hasPlatformConstrained(dir, patterns) {
+		return
+	}
+	for _, ctx := range shapeBuilds() {
+		if ctx.key() == x.inherited || x.loaded[ctx.key()] {
+			continue
+		}
+		x.loaded[ctx.key()] = true
+		x.loadBuild(dir, ctx, patterns)
+	}
+}
+
+// hasPlatformConstrained reports whether the module declares a file whose
+// platform decides whether it is built. A file kept out by another tag is read in a build
+// that enables it on every host, so it cannot make the result host-dependent;
+// a file behind a GOOS or GOARCH is built on some hosts and not others, and the
+// builds compared have to cover both sides.
+func (x *extractor) hasPlatformConstrained(dir string, patterns []string) bool {
+	var files []string
+	if slices.Contains(patterns, "./...") {
+		all, err := moduleGoFiles(dir)
+		if err != nil {
+			return false // readBuilds reports the walk's error
+		}
+		files = all
+	} else {
+		files = append(files, x.ignored...)
+		for path := range x.seen {
+			files = append(files, path)
+		}
+	}
+	for _, path := range files {
+		if platformConstrained(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// platformConstrained reports whether a GOOS or GOARCH decides whether path is
+// built. A file kept out by another tag is read in a build that enables it on
+// every host, so it cannot make the result host-dependent; a file behind a
+// platform is built on some hosts and not others, and the builds compared have
+// to cover both sides. The search is the one contexts already does: a file is
+// platform-constrained when one tag set selects it for some platforms and not
+// others.
+func platformConstrained(path string) bool {
+	for _, tags := range tagSets(extraTags(path)) {
+		ctx := buildContext{tags: tags}
+		selected := 0
+		for _, pair := range platformPairs() {
+			ctx.goos, ctx.goarch = pair[0], pair[1]
+			if ctx.selects(path) {
+				selected++
+			}
+		}
+		if selected > 0 && selected < len(platformPairs()) {
+			return true
+		}
+	}
+	return false
 }
 
 // unread lists the files the module has that no load has read: the packages'
@@ -93,31 +197,27 @@ func (x *extractor) unread(dir string, patterns []string) []string {
 	return out
 }
 
-// readInBuild reads one file in a build that includes it.
-func (x *extractor) readInBuild(dir, path string) {
+// readInBuild reads one file in a build that includes it, and with it the rest
+// of the module as that build resolves it.
+func (x *extractor) readInBuild(dir, path string, patterns []string) {
 	pkgDir := filepath.Dir(path)
 	rel, err := filepath.Rel(dir, pkgDir)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		x.errs = append(x.errs, fmt.Sprintf("%s is outside %s, so no package pattern reaches it", path, dir))
 		return
 	}
-	pattern := "."
-	if rel != "." {
-		pattern = "./" + filepath.ToSlash(rel)
-	}
 	tried := 0
 	for _, ctx := range contexts(path) {
 		if tried == maxBuildsPerFile {
 			break
 		}
-		// A sibling needing the same build has already read this package.
-		key := ctx.key() + " " + pkgDir
-		if x.loaded[key] {
+		// A build already read has read every file it selects.
+		if x.loaded[ctx.key()] {
 			continue
 		}
-		x.loaded[key] = true
+		x.loaded[ctx.key()] = true
 		tried++
-		x.loadBuild(dir, ctx, pattern)
+		x.loadBuild(dir, ctx, patterns)
 		if x.seen[path] {
 			return
 		}
@@ -125,10 +225,11 @@ func (x *extractor) readInBuild(dir, path string) {
 	x.errs = append(x.errs, fmt.Sprintf("%s: %s: no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest", x.rel(path), buildConstraint(path)))
 }
 
-// loadBuild reads pattern in the build ctx describes and adds what it declares
-// to x. A build that fails to load leaves the files it was meant to read
-// unread, which the caller reports.
-func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) {
+// loadBuild reads patterns in the build ctx describes and adds what it declares
+// to x, including every registered type's shape as this build resolves it. A
+// build that fails to load leaves the files it was meant to read unread, which
+// the caller reports.
+func (x *extractor) loadBuild(dir string, ctx buildContext, patterns []string) {
 	cfg := &packages.Config{
 		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:   dir,
@@ -138,11 +239,11 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) {
 	if len(ctx.tags) > 0 {
 		cfg.BuildFlags = []string{"-tags=" + strings.Join(ctx.tags, ",")}
 	}
-	pkgs, err := packages.Load(cfg, pattern)
+	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		return
 	}
-	x.extract(pkgs)
+	x.extract(pkgs, ctx.key())
 }
 
 // contexts lists the builds that include path, the inherited build first, so a
@@ -324,23 +425,38 @@ var (
 )
 
 // platformPairs lists the GOOS/GOARCH pairs the toolchain can target, the
-// inherited build first. It asks `go tool dist list` rather than carrying its
-// own copy of the list, so a platform added to a later toolchain is searched
-// for rather than refused.
+// inherited build first and the common targets next, so the build read for a
+// file the host excludes is one a module is likely to type-check under. It asks
+// `go tool dist list` rather than carrying its own copy of the list, so a
+// platform added to a later toolchain is searched for rather than refused.
 func platformPairs() [][2]string {
 	pairsOnce.Do(func() {
 		host := [2]string{build.Default.GOOS, build.Default.GOARCH}
 		pairsAll = [][2]string{host}
+		seen := map[[2]string]bool{host: true}
+		add := func(pair [2]string) {
+			if !seen[pair] {
+				seen[pair] = true
+				pairsAll = append(pairsAll, pair)
+			}
+		}
+		for _, pair := range [][2]string{
+			{"linux", "amd64"}, {"linux", "arm64"},
+			{"darwin", "arm64"}, {"darwin", "amd64"},
+			{"windows", "amd64"}, {"windows", "arm64"},
+		} {
+			add(pair)
+		}
 		out, err := exec.Command("go", "tool", "dist", "list").Output()
 		if err != nil {
 			return
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			goos, goarch, ok := strings.Cut(strings.TrimSpace(line), "/")
-			if !ok || (goos == host[0] && goarch == host[1]) {
+			if !ok {
 				continue
 			}
-			pairsAll = append(pairsAll, [2]string{goos, goarch})
+			add([2]string{goos, goarch})
 		}
 	})
 	return pairsAll

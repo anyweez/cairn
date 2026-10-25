@@ -257,6 +257,127 @@ var NeverRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, State
 	}
 }
 
+// A registered type's shape can depend on a build-constrained declaration in
+// another package: here the codec lives in a, and the field's type is declared
+// once per platform in b. Reading the constrained file is not enough -- the
+// build that includes it has to resolve a's registration too, or the shape
+// recorded is the host's and the two manifests disagree.
+func TestAShapeThatDependsOnAnotherPackageIsRefused(t *testing.T) {
+	dir := writeModule(t, `module example.com/crosspackage
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"a/events.go": `package a
+
+import (
+	"example.com/crosspackage/b"
+
+	"github.com/anyweez/cairn/codec"
+)
+
+type Event interface{ isEvent() }
+
+type Created struct {
+	ID string  ` + "`json:\"id\"`" + `
+	At b.Stamp ` + "`json:\"at\"`" + `
+}
+
+func (Created) isEvent() {}
+
+func Codecs() *codec.Codec[Event] {
+	c := codec.New[Event]()
+	codec.Register[Created, Event](c, "cross.created", 1)
+	return c
+}
+`,
+		"b/stamp_linux.go": `//go:build linux
+
+package b
+
+type Stamp int64
+`,
+		"b/stamp_other.go": `//go:build !linux
+
+package b
+
+type Stamp string
+`,
+	})
+
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("a stored type whose field is declared differently in another package's build was recorded as the host's shape")
+	}
+	for _, want := range []string{"Stamp", "stamp_linux.go", "stamp_other.go"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// A shape can change without the type's own declaration changing: a marshaler
+// declared for one platform makes the type opaque there. On that platform the
+// inherited build includes the marshaler, so the comparison needs a build that
+// excludes it too, or the manifest records whichever host generated it.
+func TestAShapeThatDependsOnABuildConstrainedMarshalerIsRefused(t *testing.T) {
+	dir := writeModule(t, `module example.com/marshaler
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"events.go": `package marshaler
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Created struct {
+	At Stamp ` + "`json:\"at\"`" + `
+}
+
+func (Created) isEvent() {}
+
+func Codecs() *codec.Codec[Event] {
+	c := codec.New[Event]()
+	codec.Register[Created, Event](c, "marshaler.created", 1)
+	return c
+}
+`,
+		"stamp.go": `package marshaler
+
+type Stamp struct {
+	A int ` + "`json:\"a\"`" + `
+}
+`,
+		"stamp_linux.go": `//go:build linux
+
+package marshaler
+
+func (Stamp) MarshalJSON() ([]byte, error) { return []byte("1"), nil }
+`,
+	})
+
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Setenv("GOOS", goos)
+		_, err := Extract(dir, "./...")
+		if err == nil {
+			t.Fatalf("on %s: a type whose marshaler is declared for one platform was recorded as that platform's shape", goos)
+		}
+		for _, want := range []string{"Stamp", "stamp_linux.go"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("on %s: the refusal does not name %q: %v", goos, want, err)
+			}
+		}
+	}
+}
+
 func mustRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")

@@ -10,8 +10,11 @@
 // only production code writes to the ledger.
 //
 // The manifest does not depend on the host's platform: a file a build
-// constraint excludes is read in a build that includes it, and a file no build
-// includes is an error naming the file and the constraint.
+// constraint excludes is read in a build that includes it, a file no build
+// includes is an error naming the file and the constraint, and every registered
+// type is resolved in every build the tool reads, so a JSON shape that differs
+// between builds is an error naming the type and the files that declare it
+// rather than the host's representation.
 //
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is

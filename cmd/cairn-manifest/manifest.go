@@ -75,7 +75,9 @@ type Edge struct {
 //
 // A file the current build context excludes is read in a build that includes it,
 // so the manifest is the whole module's spec and not the spec of the platform
-// the tool happens to run on. A file no build this tool can load includes is an
+// the tool happens to run on. Each such build resolves every registered type, so
+// a JSON shape that differs between builds is an error naming the type and the
+// files that declare it. A file no build this tool can load includes is an
 // error naming the file and its constraint.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
@@ -119,16 +121,22 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 
 	x := &extractor{
 		dir: dir, seen: map[string]bool{}, loaded: map[string]bool{},
-		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
+		inherited: inheritedBuild(),
+		ruleAt:    map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
+		shapes: map[string]map[string]shape{},
 	}
-	x.extract(pkgs)
+	x.extract(pkgs, x.inherited)
 	if len(x.errs) == 0 {
 		// A file the inherited build context left out declares nothing the
 		// manifest can see, so the build-constrained half of the module is
-		// read separately. Skipped when the load already found a declaration
-		// it cannot read: the error is the answer, and a second load only
-		// spends time on it.
+		// read separately. Each build it reads resolves every registered type,
+		// so a shape that depends on the build is an error rather than the
+		// host's answer. Skipped when the load already found a declaration it
+		// cannot read: the error is the answer, and a second load only spends
+		// time on it.
 		x.readBuilds(dir, patterns)
+		x.readShapeBuilds(dir, patterns)
+		x.checkShapes()
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
@@ -160,14 +168,20 @@ type upcast struct {
 	pos       string
 }
 
-// extract adds the declarations in pkgs to x. A package's files appear again in
-// its test variant, so each file is read once, and the files its build context
-// left out are remembered for readBuilds.
-func (x *extractor) extract(pkgs []*packages.Package) {
+// extract adds the declarations in pkgs, resolved in build, to x. A package's
+// files appear again in its test variant and a file appears again in every
+// build that includes it: each file is read once for its rules and tables, but
+// every build's resolution of a registered type is recorded, and the files its
+// build context left out are remembered for readBuilds.
+func (x *extractor) extract(pkgs []*packages.Package, build string) {
 	for _, p := range pkgs {
 		if strings.HasSuffix(p.PkgPath, ".test") {
 			continue // the generated test main
 		}
+		// A package that does not type-check resolves shapes from partial type
+		// information, which is a guess rather than a shape to compare: the
+		// file-reading path reports that build instead.
+		observe := len(p.Errors) == 0
 		for _, name := range p.IgnoredFiles {
 			if strings.HasSuffix(name, ".go") {
 				x.ignored = append(x.ignored, name)
@@ -175,21 +189,35 @@ func (x *extractor) extract(pkgs []*packages.Package) {
 		}
 		for _, f := range p.Syntax {
 			name := p.Fset.File(f.Pos()).Name()
-			if x.seen[name] {
-				continue
-			}
+			first := !x.seen[name]
 			x.seen[name] = true
-			x.file(p, f, name)
+			x.file(p, f, name, build, first, observe)
 		}
 	}
+}
+
+// shape is one build's resolution of a registered type: what the manifest would
+// record, and the files that declare the types it is made of, so two builds
+// that disagree can name what differs.
+type shape struct {
+	sum, name, typ string
+	version        int
+	fields         []string
+	// at is where the registration is written, as file:line.
+	at string
+	// decls maps every named type reachable from the registered type, and every
+	// marshaler that decides how it is written, to the file declaring it.
+	decls map[string]string
 }
 
 type extractor struct {
 	dir     string
 	seen    map[string]bool
 	ignored []string
-	// loaded keys the builds already read, so two files in one package under
-	// one constraint cost one load.
+	// inherited names the build Extract's first load ran in.
+	inherited string
+	// loaded keys the builds already read, so one build costs one load however
+	// many files it reads.
 	loaded  map[string]bool
 	rules   []Rule
 	ruleAt  map[string]string
@@ -197,7 +225,10 @@ type extractor struct {
 	codecs  map[string]*Codec
 	codecAt map[string]string
 	upcasts []upcast
-	errs    []string
+	// shapes holds each build's resolution of a registered type, keyed by the
+	// codec's key and then the build, so two builds that disagree are an error.
+	shapes map[string]map[string]shape
+	errs   []string
 }
 
 func (x *extractor) errorf(fset *token.FileSet, pos token.Pos, format string, args ...any) {
@@ -217,28 +248,34 @@ func (x *extractor) rel(path string) string {
 	return path
 }
 
-func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
-	for _, decl := range f.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range gen.Specs {
-			vs := spec.(*ast.ValueSpec)
-			for i, ident := range vs.Names {
-				obj := p.TypesInfo.Defs[ident]
-				if obj == nil {
-					continue
-				}
-				var value ast.Expr
-				if i < len(vs.Values) {
-					value = vs.Values[i]
-				}
-				switch {
-				case isNamed(obj.Type(), specPath, "Rule"):
-					x.rule(p, ident, value)
-				case isNamed(obj.Type(), fsmPath, "Table"):
-					x.table(p, ident, value)
+// file reads one file as build resolves it. first is false for a file another
+// build has already read: its rules and tables are recorded once, but its
+// registrations are still observed, because the shape they resolve is the
+// build's. observe is false for a package that does not type-check.
+func (x *extractor) file(p *packages.Package, f *ast.File, name, build string, first, observe bool) {
+	if first {
+		for _, decl := range f.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs := spec.(*ast.ValueSpec)
+				for i, ident := range vs.Names {
+					obj := p.TypesInfo.Defs[ident]
+					if obj == nil {
+						continue
+					}
+					var value ast.Expr
+					if i < len(vs.Values) {
+						value = vs.Values[i]
+					}
+					switch {
+					case isNamed(obj.Type(), specPath, "Rule"):
+						x.rule(p, ident, value)
+					case isNamed(obj.Type(), fsmPath, "Table"):
+						x.table(p, ident, value)
+					}
 				}
 			}
 		}
@@ -249,7 +286,7 @@ func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
 	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
-			x.codecCall(p, call)
+			x.codecCall(p, call, build, first, observe)
 		}
 		return true
 	})
@@ -373,23 +410,33 @@ func (x *extractor) table(p *packages.Package, ident *ast.Ident, value ast.Expr)
 	x.tables = append(x.tables, t)
 }
 
-func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
+func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build string, first, observe bool) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
-		inst := info.Instances[callee(call)]
-		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
-		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
-		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
+		inst, ok := info.Instances[callee(call)]
+		if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() != 2 {
+			if first {
+				x.errorf(p.Fset, call.Pos(), "codec.Register: cannot read the type arguments this call instantiates")
+			}
 			return
 		}
-		if !x.concrete(p, call.Pos(), sum, subject, "the codec a stored entry names comes from the caller's type argument") {
-			return
+		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
+		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
+		if first {
+			if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
+				return
+			}
+			if !x.concrete(p, call.Pos(), sum, subject, "the codec a stored entry names comes from the caller's type argument") {
+				return
+			}
 		}
 		name, okName := x.constant(p, call.Args[1])
 		version, okVersion := x.constant(p, call.Args[2])
 		if !okName || !okVersion {
-			x.errorf(p.Fset, call.Pos(), "codec.Register[%s]: the name and version must be constants", types.TypeString(v, nil))
+			if first {
+				x.errorf(p.Fset, call.Pos(), "codec.Register[%s]: the name and version must be constants", types.TypeString(v, nil))
+			}
 			return
 		}
 		n, _ := constant.Int64Val(version)
@@ -404,14 +451,23 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			Type:    types.TypeString(types.Unalias(v), nil),
 			Fields:  fields(v),
 		}
+		if observe {
+			x.observe(p, call, build, c, v)
+		}
+		if !first {
+			return
+		}
 		at := x.position(p.Fset, call.Pos())
-		if prev, dup := x.codecAt[c.key()]; dup {
+		if prev, dup := x.codecAt[c.key()+" "+build]; dup {
 			x.errorf(p.Fset, call.Pos(), "%s is also registered at %s", c.Name, prev)
 			return
 		}
-		x.codecAt[c.key()] = at
+		x.codecAt[c.key()+" "+build] = at
 		x.codecs[c.key()] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
+		if !first {
+			return
+		}
 		// The declaring receiver is *codec.Codec[T] whether the caller names it
 		// directly, through an alias, or promotes it from an embedded codec;
 		// the selection's own receiver is only whatever the caller spelled.
@@ -444,8 +500,148 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			pos:  x.position(p.Fset, call.Pos()),
 		})
 	case unattributedUpcast(info, call):
-		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
+		if first {
+			x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
+		}
 	}
+}
+
+// observe records the shape build resolves for a registered type, so that a
+// second build resolving it differently is an error rather than the host's
+// answer written into the manifest.
+func (x *extractor) observe(p *packages.Package, call *ast.CallExpr, build string, c *Codec, v types.Type) {
+	s := shape{
+		sum: c.Sum, name: c.Name, typ: c.Type, version: c.Version, fields: c.Fields,
+		at:    x.position(p.Fset, call.Pos()),
+		decls: declarationFiles(p.Fset, v, x.rel),
+	}
+	if x.shapes[c.key()] == nil {
+		x.shapes[c.key()] = map[string]shape{}
+	}
+	x.shapes[c.key()][build] = s
+}
+
+// checkShapes refuses a registered type whose name or JSON shape differs between
+// the builds the tool read. The manifest states one shape per codec, so
+// committing a build's answer would make the file depend on the host and let
+// -base miss a wire change made only on another platform.
+func (x *extractor) checkShapes() {
+	keys := make([]string, 0, len(x.shapes))
+	for key := range x.shapes {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		obs := x.shapes[key]
+		if len(obs) < 2 {
+			continue
+		}
+		builds := make([]string, 0, len(obs))
+		for build := range obs {
+			builds = append(builds, build)
+		}
+		slices.Sort(builds)
+		first := obs[builds[0]]
+		for _, build := range builds[1:] {
+			other := obs[build]
+			if first.sum == other.sum && first.typ == other.typ && first.version == other.version && sameFields(first.fields, other.fields) {
+				continue
+			}
+			x.errs = append(x.errs, first.at+": "+shapeConflict(first, builds[0], other, build))
+		}
+	}
+}
+
+// shapeConflict says how two builds disagree about a stored type, naming the
+// declarations that differ so the reader knows which file to fix.
+func shapeConflict(a shape, buildA string, b shape, buildB string) string {
+	var parts []string
+	switch {
+	case a.sum != b.sum || a.typ != b.typ:
+		parts = append(parts, fmt.Sprintf("it is %s in %s and %s in %s", a.typ, buildA, b.typ, buildB))
+	case a.version != b.version:
+		parts = append(parts, fmt.Sprintf("it is version %d in %s and version %d in %s", a.version, buildA, b.version, buildB))
+	default:
+		parts = append(parts, differingFields(a.fields, b.fields, buildA, buildB))
+	}
+	parts = append(parts, differingDeclarations(a, b, buildA, buildB)...)
+	return fmt.Sprintf("%s (%s) has a different JSON shape in different builds: %s; a stored type must be the same in every build", a.name, a.typ, strings.Join(parts, "; "))
+}
+
+// differingFields names the first field two shapes render differently, matched
+// by name because that is what encoding/json decodes by.
+func differingFields(a, b []string, buildA, buildB string) string {
+	index := func(fields []string) map[string]string {
+		out := map[string]string{}
+		for _, f := range fields {
+			name, _, _ := strings.Cut(f, ": ")
+			out[name] = f
+		}
+		return out
+	}
+	fa, fb := index(a), index(b)
+	names := make([]string, 0, len(fa)+len(fb))
+	for name := range fa {
+		names = append(names, name)
+	}
+	for name := range fb {
+		if _, ok := fa[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		x, okA := fa[name]
+		y, okB := fb[name]
+		if okA && okB && x == y {
+			continue
+		}
+		switch {
+		case okA && okB:
+			return fmt.Sprintf("it records field %s in %s and %s in %s", x, buildA, y, buildB)
+		case okA:
+			return fmt.Sprintf("it records field %s in %s but not in %s", x, buildA, buildB)
+		default:
+			return fmt.Sprintf("it records field %s in %s but not in %s", y, buildB, buildA)
+		}
+	}
+	return fmt.Sprintf("it records %q in %s and %q in %s", strings.Join(a, ", "), buildA, strings.Join(b, ", "), buildB)
+}
+
+// differingDeclarations names the types, and the files declaring them, that the
+// two builds resolve differently.
+func differingDeclarations(a, b shape, buildA, buildB string) []string {
+	names := make([]string, 0, len(a.decls)+len(b.decls))
+	for name := range a.decls {
+		names = append(names, name)
+	}
+	for name := range b.decls {
+		if _, ok := a.decls[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	var out []string
+	for _, name := range names {
+		fa, okA := a.decls[name]
+		fb, okB := b.decls[name]
+		if okA && okB && fa == fb {
+			continue
+		}
+		switch {
+		case okA && okB:
+			out = append(out, fmt.Sprintf("%s is declared in %s in %s and in %s in %s", name, fa, buildA, fb, buildB))
+		case okA:
+			out = append(out, fmt.Sprintf("%s is declared in %s in %s and in no file %s reads", name, fa, buildA, buildB))
+		default:
+			out = append(out, fmt.Sprintf("%s is declared in %s in %s and in no file %s reads", name, fb, buildB, buildA))
+		}
+		if len(out) == 3 {
+			out = append(out, "and more")
+			break
+		}
+	}
+	return out
 }
 
 func (x *extractor) upcastsToCodecs() {
@@ -505,6 +701,60 @@ func typeParamIn(t types.Type, seen map[types.Type]bool) string {
 		}
 	}
 	return ""
+}
+
+// declarations maps every named type reachable from t, and every marshaler
+// that decides how it is written, to the file that declares it. Two builds whose
+// resolutions disagree name the declarations that differ with it.
+func declarationFiles(fset *token.FileSet, t types.Type, rel func(string) string) map[string]string {
+	out := map[string]string{}
+	seen := map[types.Type]bool{}
+	var walk func(types.Type)
+	walk = func(t types.Type) {
+		// An alias declared behind a constraint points at different types in
+		// different builds, and the alias's own name is what the reader has to
+		// find, so record it before resolving it away.
+		if alias, ok := t.(*types.Alias); ok {
+			if obj := alias.Obj(); obj != nil && obj.Pos().IsValid() {
+				out[types.TypeString(alias, nil)] = rel(fset.Position(obj.Pos()).Filename)
+			}
+		}
+		t = types.Unalias(t)
+		if seen[t] {
+			return
+		}
+		seen[t] = true
+		named, ok := t.(*types.Named)
+		if !ok {
+			for _, child := range typeChildren(t) {
+				walk(child)
+			}
+			return
+		}
+		name := types.TypeString(named, nil)
+		if obj := named.Obj(); obj != nil && obj.Pos().IsValid() {
+			out[name] = rel(fset.Position(obj.Pos()).Filename)
+		}
+		// Whether a type is opaque depends on these two methods alone, and one
+		// declared behind a constraint changes the shape without changing the
+		// type's own declaration.
+		for _, method := range []string{"MarshalJSON", "MarshalText"} {
+			for _, recv := range []types.Type{named, types.NewPointer(named)} {
+				if obj, _, _ := types.LookupFieldOrMethod(recv, false, nil, method); obj != nil && obj.Pos().IsValid() {
+					out[name+"."+method] = rel(fset.Position(obj.Pos()).Filename)
+				}
+			}
+		}
+		// A named type's children are its type arguments and its underlying
+		// type's fields; typeChildren alone returns only the former.
+		walk(named.Underlying())
+		args := named.TypeArgs()
+		for i := range args.Len() {
+			walk(args.At(i))
+		}
+	}
+	walk(t)
+	return out
 }
 
 // typeChildren lists the types t contains that could hold a type parameter.
