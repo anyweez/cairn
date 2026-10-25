@@ -58,9 +58,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntryViews(b *Batch, before, after Loa
 // write made.
 func queueEntryView[S, Ev any](b *Batch, v EntryView[S, Ev], before, after Loaded[S], entry Entry, events []Ev) error {
 	entry.Position, entry.TxID = 0, 0
-	b.owner = v.Name
-	defer func() { b.owner = "" }()
-	if err := v.Write(b, before, after, entry, events); err != nil {
+	if err := b.as(v.Name, func() error { return v.Write(b, before, after, entry, events) }); err != nil {
 		return &viewFailure{fmt.Errorf("cairn: entry view %s at %s#%d: %w", v.Name, after.Stream, entry.Seq, err)}
 	}
 	return nil

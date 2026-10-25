@@ -120,9 +120,9 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 				strconv.FormatUint(after.TxID, 10), after.Position)
 
 			for _, e := range entries {
-				b.owner = fmt.Sprintf("%s#%d", e.Stream, e.Seq)
-				if err := p.Apply(ctx, &b, e); err != nil {
-					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, b.owner, err)
+				owner := fmt.Sprintf("%s#%d", e.Stream, e.Seq)
+				if err := b.as(owner, func() error { return p.Apply(ctx, &b, e) }); err != nil {
+					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, owner, err)
 				}
 			}
 			err = b.send(ctx, tx)

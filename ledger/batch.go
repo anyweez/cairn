@@ -21,7 +21,9 @@ import (
 type Batch struct {
 	queued pgx.Batch
 	items  []batchItem
-	owner  string
+	// owner is whose statements Queue adds next. Only as sets it, so an owner
+	// never outlives the callback it names.
+	owner string
 	// commits is set on a batch that ends its own transaction and may have
 	// recorded a message. send can report ErrRecorded for it only when
 	// hasCommit proves the transaction committed.
@@ -39,6 +41,17 @@ type Batch struct {
 type batchItem struct {
 	owner  string
 	handle func(pgx.BatchResults) error
+}
+
+// as queues the statements write adds as owner, so a failing one names whose
+// statement it was, and restores the previous owner afterwards. The callback
+// is what lets the ledger queue its own statements after a caller's without
+// inheriting the caller's owner.
+func (b *Batch) as(owner string, write func() error) error {
+	previous := b.owner
+	b.owner = owner
+	defer func() { b.owner = previous }()
+	return write()
 }
 
 // Queue adds a statement to the batch.
