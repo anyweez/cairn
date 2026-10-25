@@ -2,12 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"go/types"
 	"slices"
 	"strings"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // invalidTagged has a field whose JSON tag name encoding/json rejects.
@@ -22,23 +19,7 @@ type invalidTagged struct {
 // the rejected tag name instead of the Go field name, so the -base check
 // watches a key that is never written.
 func TestAFieldWithAnInvalidJSONTagIsShapedAsEncodingJSONWritesIt(t *testing.T) {
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ttype types.Type
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		if obj := p.Types.Scope().Lookup("invalidTagged"); obj != nil {
-			ttype = obj.Type()
-		}
-	}
-	if ttype == nil {
-		t.Fatal("invalidTagged not found in the loaded package")
-	}
+	ttype := loadDeclaredTypes(t).get(t, "invalidTagged")
 
 	var got []string
 	for _, f := range fields(ttype) {

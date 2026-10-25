@@ -13,8 +13,6 @@ import (
 	"go/types"
 	"slices"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 type dominanceInner struct {
@@ -27,23 +25,7 @@ type dominanceOuter struct {
 }
 
 func TestAShadowedEmbeddedFieldIsNotAStoredField(t *testing.T) {
-	cfg := &packages.Config{
-		Mode:  packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo,
-		Tests: true,
-	}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var typ types.Type
-	for _, p := range pkgs {
-		if obj := p.Types.Scope().Lookup("dominanceOuter"); obj != nil {
-			typ = obj.Type()
-		}
-	}
-	if typ == nil {
-		t.Fatal("dominanceOuter was not found in the loaded packages")
-	}
+	typ := loadDeclaredTypes(t).get(t, "dominanceOuter")
 
 	// What encoding/json actually writes: the outer field wins, the embedded
 	// one is shadowed, so there is one key.
@@ -91,7 +73,7 @@ func TestFieldDominanceDropsATieAndPrefersATag(t *testing.T) {
 		want []string
 	}{
 		{
-			// Same JSON name at the same depth, neither tagged: the name is
+			// Same JSON name at the same depth, both tagged: the name is
 			// ambiguous, so encoding/json writes no key for it.
 			"tie",
 			embedding(withField("Name", types.Typ[types.String], `json:"name"`),

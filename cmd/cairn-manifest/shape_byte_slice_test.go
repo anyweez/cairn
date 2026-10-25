@@ -5,8 +5,6 @@ import (
 	"go/types"
 	"slices"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // byteMarshaler is a named byte type that chooses its own JSON encoding. A
@@ -27,26 +25,9 @@ type byteSliceHolder struct {
 // does. So a []byteMarshaler is rendered as base64 when it is really a JSON
 // array of the marshaled elements.
 func TestASliceOfSelfMarshalingBytesIsNotBase64(t *testing.T) {
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var holder, elem types.Type
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		if obj := p.Types.Scope().Lookup("byteSliceHolder"); obj != nil {
-			holder = obj.Type()
-		}
-		if obj := p.Types.Scope().Lookup("byteMarshaler"); obj != nil {
-			elem = obj.Type()
-		}
-	}
-	if holder == nil || elem == nil {
-		t.Fatal("byteSliceHolder or byteMarshaler not found in the loaded package")
-	}
+	declared := loadDeclaredTypes(t)
+	holder := declared.get(t, "byteSliceHolder")
+	elem := declared.get(t, "byteMarshaler")
 
 	// The reference is what encoding/json actually writes for the slice.
 	raw, err := json.Marshal([]byteMarshaler{1})

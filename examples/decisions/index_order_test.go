@@ -30,12 +30,15 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 	}
 
 	index := NewReferenceIndex()
-	deliveries := 0
+	deliveries, applied := 0, 0
 	d := &ledger.Dispatcher[Effect]{
 		Store:   svc.Register.Store,
 		Kind:    "decision",
 		Effects: svc.Register.Codecs.Effects,
-		Backoff: func(int) time.Duration { return time.Millisecond },
+		// Retry at once: this test is about which delivery the index drops,
+		// not about how long the dispatcher waits, so the second drain finds
+		// the failed effect available without sleeping past a backoff.
+		Backoff: func(int) time.Duration { return 0 },
 		Handle: func(_ context.Context, dl ledger.Delivery[Effect]) error {
 			deliveries++
 			if deliveries == 1 {
@@ -45,6 +48,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 			// drops it because its entry is older, not because of the order it
 			// is handed.
 			index.Apply(dl.Seq, dl.Effect.(IndexReferences))
+			applied++
 			return nil
 		},
 	}
@@ -53,10 +57,13 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 	if _, err := d.DrainOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
-	// Second drain: the failed effect is retried and overwrites the newer text.
+	// Second drain: the create's effect is retried. Offered the older entry,
+	// the index keeps the newer text rather than going back to it.
 	if _, err := d.DrainOnce(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if applied != 2 {
+		t.Fatalf("the index applied %d deliveries, so the failed effect was never retried", applied)
 	}
 
 	state, err := svc.Get(ctx, id)

@@ -292,8 +292,14 @@ func TestWinnerMayStillAnswerTheOutcome(t *testing.T) {
 // five, and the generator could miss the path in the runs it had, so the
 // mutant survived without a defect in the code under test. The aimed
 // generator follows the lifecycle directly, so the mutation is reached on the
-// first run whatever budget it is given.
-func aimed(target Status, trigger Msg) func(*rapid.T, State) Msg {
+// first run whatever budget it is given. It can only route to Open and
+// Decided; any other target would fall back to the broad generator, which is
+// the flake it exists to remove.
+func aimed(t *testing.T, target Status, trigger Msg) func(*rapid.T, State) Msg {
+	t.Helper()
+	if target != Open && target != Decided {
+		t.Fatalf("aimed routes only to Open and Decided, so it cannot reach %s", target)
+	}
 	at := time.Unix(1_700_000_000, 0).UTC()
 	return func(t *rapid.T, s State) Msg {
 		switch {
@@ -305,7 +311,8 @@ func aimed(target Status, trigger Msg) func(*rapid.T, State) Msg {
 		case s.Status == target:
 			return trigger
 		}
-		return messages(t, s)
+		t.Fatalf("%s is not on the route to %s, so the mutant's trigger would not be aimed", s.Status, target)
+		return trigger
 	}
 }
 
@@ -356,7 +363,7 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := machine()
 			m.Decider.Decide = mut.decide
-			m.Messages = aimed(mut.target, mut.trigger)
+			m.Messages = aimed(t, mut.target, mut.trigger)
 			msg, failed, err := spectest.Fails(t, m.Check)
 			if err != nil {
 				t.Fatalf("the %q mutant made the check die instead of %s catching it: %v", name, mut.rule, err)

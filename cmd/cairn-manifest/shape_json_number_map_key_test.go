@@ -42,12 +42,13 @@ func TestAJSONNumberMapKeyIsShapedAsAString(t *testing.T) {
 		t.Fatalf("the fixtures differ on the wire: json.Number key %s, string key %s", numberRAW, stringRAW)
 	}
 
-	number, str := fields(lookedUpType(t, "jsonNumberKeyMap")), fields(lookedUpType(t, "stringKeyMap"))
+	declared := loadDeclaredTypes(t)
+	number, str := fields(declared.get(t, "jsonNumberKeyMap")), fields(declared.get(t, "stringKeyMap"))
 	if !slices.Equal(number, str) {
 		t.Fatalf("fields() renders a json.Number map key as %v, not the %v a string key gives; the two are identical on the wire", number, str)
 	}
 
-	value := fields(lookedUpType(t, "jsonNumberValueMap"))
+	value := fields(declared.get(t, "jsonNumberValueMap"))
 	if want := []string{"m: map[string]number"}; !slices.Equal(value, want) {
 		t.Fatalf("fields() renders map[string]json.Number as %v, want %v; a json.Number value must stay a number", value, want)
 	}
@@ -78,7 +79,8 @@ func TestAStringKindMapKeyWithAMarshalerIsShapedAsAString(t *testing.T) {
 		t.Fatalf("the fixtures differ on the wire: MarshalText key %s, string key %s", textRAW, stringRAW)
 	}
 
-	text, str := fields(lookedUpType(t, "textKeyMap")), fields(lookedUpType(t, "stringKeyMap"))
+	declared := loadDeclaredTypes(t)
+	text, str := fields(declared.get(t, "textKeyMap")), fields(declared.get(t, "stringKeyMap"))
 	if !slices.Equal(text, str) {
 		t.Fatalf("fields() renders a MarshalText map key as %v, not the %v a string key gives; the two are identical on the wire", text, str)
 	}
