@@ -65,7 +65,7 @@ func queueView[S any](b *Batch, v View[S], at Loaded[S], cause Entry) error {
 }
 
 // viewFailure is a view's Write returning an error. Nothing was sent, so the
-// messages it was writing for can be tried again one at a time.
+// messages it was writing for can be tried again.
 type viewFailure struct{ error }
 
 func (e *viewFailure) Unwrap() error { return e.error }
