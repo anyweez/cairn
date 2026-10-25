@@ -203,8 +203,8 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 }
 
 // When one message's view fails in the database, it spoils the transaction
-// it shares with others. The others are then recorded one by one, and only
-// the message whose view fails is refused.
+// it shares with others. The others are still recorded, and only the message
+// whose view fails is refused.
 func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 	// Not parallel: sleeps order the writes, and load from other tests could
 	// reorder them.
@@ -252,6 +252,73 @@ func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 	if n := writes.Load(); n <= 6 {
 		t.Fatalf("the view was written %d times: the queued messages were never recorded together", n)
 	}
+}
+
+// A message the database refuses spoils the transaction it shares with the
+// others. Retried one message at a time, a burst of 100 costs about two round
+// trips per message while the stream's lane waits; halving the group finds the
+// bad one in a handful of transactions instead.
+func TestOneBadMessageInABurstIsNarrowedDownByHalving(t *testing.T) {
+	// Not parallel: it holds the stream's lane open while the burst queues.
+	const burst = 100
+	agg, trips := tracedCounter(t, 1)
+	view := totalsView(t, agg)
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
+		if at.State.Total == 1 {
+			// Hold the lane until the burst has queued behind this message,
+			// so the whole burst is recorded in one transaction.
+			close(holding)
+			<-release
+		}
+		return view.Write(b, at, cause)
+	}}}
+	agg.EntryViews = []ledger.EntryView[counter, event]{{Name: "refuses_one", Write: func(b *ledger.Batch, _, _ ledger.Loaded[counter], entry ledger.Entry, _ []event) error {
+		if entry.Meta.CorrelationID == "poison" {
+			b.Queue(`SELECT 1/0`)
+		}
+		return nil
+	}}}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if _, err := agg.Handle(ctx, "a", add{1, 1000}); err != nil {
+			t.Error(err)
+		}
+	})
+	<-holding
+
+	trips.reset()
+	hs := make([]ledger.Handled[int], burst)
+	errs := make([]error, burst)
+	for i := range burst {
+		c := ctx
+		if i == burst/2 {
+			c = ledger.ContextWithMeta(ctx, ledger.Meta{CorrelationID: "poison"})
+		}
+		wg.Go(func() { hs[i], errs[i] = agg.Handle(c, "a", add{1, 1000}) })
+	}
+	time.Sleep(100 * time.Millisecond) // every message of the burst joins the lane
+	close(release)
+	wg.Wait()
+
+	var failed int
+	for i := range hs {
+		if errs[i] != nil {
+			failed++
+			if !strings.Contains(errs[i].Error(), "division by zero") {
+				t.Fatalf("want the view's error, got %v", errs[i])
+			}
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("%d messages failed, want only the one whose view fails", failed)
+	}
+	if n := trips.trips.Load(); n > 80 {
+		t.Fatalf("the burst cost %d round trips; one message at a time costs about %d", n, 2*burst)
+	}
+	checkStream(t, agg, "a", burst, burst)
 }
 
 // A transaction whose last message is a refusal writes its views as of the

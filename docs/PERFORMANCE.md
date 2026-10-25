@@ -66,10 +66,13 @@ and its messages are recorded one transaction at a time:
   stored state, in two round trips. The failed attempt costs two of its own:
   the batch that raises, and the rollback of the aborted transaction it left
   behind, so the first stale `Handle` costs four. A failure that spoils a
-  shared transaction is narrowed down by recording its messages one at a
-  time. Only failures the database reported are retried. When it is unknown
-  whether a commit happened, the callers get the error; when a batch's
-  transaction is known to have committed, the error wraps `ErrRecorded`.
+  shared transaction is narrowed down by halving the group: a half the
+  database accepts is recorded whole, and only a failing half is halved
+  again, so one bad message costs a few transactions rather than one per
+  message in the group. Only failures the database reported are retried.
+  When it is unknown whether a commit happened, the callers get the error;
+  when a batch's transaction is known to have committed, the error wraps
+  `ErrRecorded`.
 - **A stream other processes write too is read before each decision.** Every
   message shows whether the cached state would have been right. One decided
   from the cache either succeeds or goes stale; one read first finds the

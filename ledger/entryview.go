@@ -27,7 +27,8 @@ import (
 // entry.Meta and entry.RecordedAt.
 //
 // Write may run more than once for one entry before it is recorded: a group
-// that fails is decided again, from stored state or one message at a time.
+// that fails is decided again from stored state, then in halves while the
+// failing ones are narrowed down.
 // Only the statements queued by the attempt that commits take effect, so
 // Write must do nothing but queue them. It must not change the states it is
 // given, which the store's state cache may still hold.

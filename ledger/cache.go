@@ -291,10 +291,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[M, R]
 	if err != nil {
 		cache.drop(key)
 		if len(reqs) > 1 && retryable(err) {
-			// One message spoiled the transaction for all; find which.
-			for _, r := range reqs {
-				a.record(stream, []*request[M, R]{r}, false)
-			}
+			// One message spoiled the transaction for all. Halve the group
+			// rather than take it one message at a time: a half the database
+			// accepts is recorded whole, and only a half that fails is halved
+			// again, so one bad message costs a few transactions rather than
+			// one per message. The halves are recorded in order, so each one
+			// is decided from the state every message before it left.
+			half := len(reqs) / 2
+			a.record(stream, reqs[:half], false)
+			a.record(stream, reqs[half:], false)
 			return
 		}
 		for _, r := range reqs {
