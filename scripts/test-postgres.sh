@@ -2,9 +2,11 @@
 # Starts (or reuses) a throwaway Postgres for the ledger tests and prints the
 # URL to export. Each test creates and drops its own database inside it. A
 # changed CAIRN_TEST_PORT gets its own container, so sessions on different
-# ports do not disturb each other. Starting or reusing it rolls back prepared
-# transactions a killed test run left behind, which would otherwise hold the
-# server's max_prepared_transactions slots.
+# ports do not disturb each other. A container created before the script passed
+# -c max_prepared_transactions=16 is recreated, so a reused server still runs
+# the ledger's prepared-transaction test rather than skipping it. Starting or
+# reusing it rolls back prepared transactions a killed test run left behind,
+# which would otherwise hold the server's max_prepared_transactions slots.
 #
 #   export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 set -euo pipefail
@@ -14,7 +16,14 @@ source "$(dirname "$0")/containers.sh"
 port=${CAIRN_TEST_PORT:-55871}
 name=$(fixture_name cairn-test-postgres 55871 "$port")
 
-if ! container_publishes "$name" 5432 "$port"; then
+# The port is not the only thing fixed when the container is created: so is
+# every setting the docker run passes. A container from before
+# -c max_prepared_transactions=16 was added still reports the default 0, which
+# makes PREPARE TRANSACTION fail and the prepared-transaction test skip, so
+# recreate it as well.
+prepared=$(container_setting "$name" max_prepared_transactions)
+if ! container_publishes "$name" 5432 "$port" ||
+   [ "${prepared:-0}" = 0 ]; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   # max_prepared_transactions defaults to 0, which makes PREPARE TRANSACTION
   # fail and the ledger's prepared-transaction test skip. The LEAST fence that

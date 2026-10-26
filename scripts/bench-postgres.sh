@@ -15,8 +15,16 @@ direct=$(scripts/test-postgres.sh)
 network=cairn-bench
 pg_port=${CAIRN_TEST_PORT:-55871}
 postgres=$(fixture_name cairn-test-postgres 55871 "$pg_port")
-api_port=${CAIRN_TOXIPROXY_API_PORT:-8474}
+api_port=${CAIRN_TOXIPROXY_API_PORT:-}
 proxy_port=${CAIRN_TOXIPROXY_PORT:-55872}
+# A toxiproxy publishes its API beside the proxy, and both are fixed when the
+# container is created. A session that moves the proxy port has to move the API
+# port with it: otherwise it asks for the port the default session already
+# bound and starts no container at all.
+if [ -z "$api_port" ]; then
+  api_port=8474
+  [ "$proxy_port" = 55872 ] || api_port=$((proxy_port + 1))
+fi
 proxy=$(fixture_name cairn-toxiproxy 55872 "$proxy_port")
 # The proxy's upstream is fixed when the container is created, so a toxiproxy
 # in front of a different Postgres must be a different container.
