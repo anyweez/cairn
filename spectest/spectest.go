@@ -135,10 +135,10 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 	// Under Fails, record the first violation instead of failing rapid: a rapid
 	// failure would shrink it and save a fail file, both of which read the
 	// process-wide rapid flags Fails would have to change — a data race with a
-	// concurrent Check. See recorder.recordViolation.
-	if c, ok := outer.(interface {
-		recordViolation(rule spec.Rule, detail string) bool
-	}); ok {
+	// concurrent Check. See recorder.recordViolation. The recorder is found
+	// through rt's context, so a caller that nested this check in its own
+	// rapid.Check is still caught.
+	if c := failsRecorder(rt); c != nil {
 		c.recordViolation(rule, detail)
 		return
 	}
@@ -150,8 +150,8 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 // or a check that died, so the rest of the check proves nothing and can be
 // skipped.
 func collectorStopped(t rapid.TB) bool {
-	if s, ok := t.(interface{ stopping() bool }); ok {
-		return s.stopping()
+	if r := failsRecorder(t); r != nil {
+		return r.stopping()
 	}
 	return false
 }

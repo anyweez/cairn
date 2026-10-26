@@ -1,6 +1,8 @@
 package spectest_test
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +37,10 @@ func (c *captureTB) Failed() bool          { return c.failed.Load() }
 // while the Check read them, which -race reports as a data race. It now
 // records a violation without failing rapid, so this must stay race-free.
 func TestFailsRacesAConcurrentCheck(t *testing.T) {
+	// captureTB is deliberately not a Fails recorder, so its check really does
+	// fail and rapid saves a fail file for it. Remove it: the fixture is not
+	// what this test is about, and the file would be replayed next time.
+	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join("testdata", "rapid", "capture")) })
 	rule := spec.Rule{ID: "C9", Kind: spec.Never, Status: spec.Established,
 		Statement: "The counter has a value it can never hold."}
 	m := counter(rule)

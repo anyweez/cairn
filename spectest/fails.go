@@ -1,10 +1,14 @@
 package spectest
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 
 	"pgregory.net/rapid"
 
@@ -48,11 +52,13 @@ import (
 // instead of drawing again, and both paths read the process-wide rapid flags
 // a concurrent Check also reads. Instead the first violation is recorded and
 // the check winds down without failing rapid. No process-wide rapid flag is
-// changed, so a Fails may run beside a parallel Check. (A check that dies
-// still travels rapid's teardown on the way out — the death is attributed
-// below — so it may leave a fail file under the test's name: delete
-// testdata/rapid/<name> before re-running a mutant test whose machine has
-// changed.)
+// changed, so a Fails may run beside a parallel Check.
+//
+// A check that dies still travels rapid's teardown on the way out — the death
+// is attributed below — so rapid writes a fail file under the test's name
+// before Fails returns. Fails deletes whatever this name holds: a replayed
+// fail file is never what it wants, since a kill is the expected outcome and a
+// death is reported to the caller.
 //
 // What Fails reports is decided from what the code did — a verdict a rule
 // recorded, or spectest refusing the machine — never from the wording of
@@ -60,6 +66,13 @@ import (
 // itself marked is treated as a check that produced no verdict, whatever it
 // says. So a rapid this file has not been met cannot make a surviving mutant
 // pass again.
+//
+// The recorder is found through the context rapid derives from its TB (see
+// recorder.Context), not by asserting the TB the check is handed, so a caller
+// that nests m.Check inside its own rapid.Check still gets a kill. A TB that
+// wraps the recorder without forwarding Context() is not followed: its
+// violations come back as an error, which is safe but not the kill the mutant
+// test is waiting for.
 func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool, err error) {
 	t.Helper()
 	r := &recorder{TB: t}
@@ -71,6 +84,11 @@ func Fails(t testing.TB, check func(rapid.TB)) (message string, failed bool, err
 		}()
 		check(r)
 	}()
+	// rapid saves a fail file for anything it saw fail: a check that died, or a
+	// violation reported through a TB Fails cannot follow. The next run of this
+	// name would replay it before drawing again, which is a shrink of a check
+	// Fails did not ask rapid to fail.
+	dropFailFiles(t.Name())
 	if r.died {
 		return r.message.String(), false, errors.New("the check did not finish cleanly: " + r.death)
 	}
@@ -97,6 +115,65 @@ type recorder struct {
 	message strings.Builder
 	// death is the detail of the first thing that made the check inconclusive.
 	death string
+}
+
+// failsKey carries a Fails' recorder in the context rapid derives from its TB.
+type failsKey struct{}
+
+// Context is how a violation reaches the recorder from inside a check that
+// nested m.Check in its own rapid.Check: rapid derives a *rapid.T's context
+// from the TB it was given, so the recorder is above that T even though the
+// machine is handed the T and not the recorder. A type assertion on the TB a
+// check is handed misses it; the context does not.
+func (r *recorder) Context() context.Context {
+	return context.WithValue(context.Background(), failsKey{}, r)
+}
+
+// failsRecorder returns the recorder the check t runs under, or nil for an
+// ordinary Check (or a TB that wraps the recorder without forwarding
+// Context).
+func failsRecorder(t rapid.TB) *recorder {
+	c, ok := t.(interface{ Context() context.Context })
+	if !ok {
+		return nil
+	}
+	r, _ := c.Context().Value(failsKey{}).(*recorder)
+	return r
+}
+
+// failFileGlob is where rapid keeps one test's fail files: testdata/rapid/
+// <name>/, with the name reduced to letters, digits, '-' and '_' (rapid's
+// kindaSafeFilename). If rapid changes that rule this finds nothing and the
+// file stays where it was, no worse than not cleaning up at all.
+func failFileGlob(testName string) string {
+	var b strings.Builder
+	for _, c := range testName {
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '-' || c == '_' {
+			b.WriteRune(c)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return filepath.Join("testdata", "rapid", b.String(), "*.fail")
+}
+
+// dropFailFiles removes the fail files rapid has under a test's name. A file
+// records a failure Fails deliberately did not let rapid fail — a check that
+// died, or a violation reported through a TB Fails could not follow — and
+// rapid replays it on the next run of the same test before drawing anything
+// new.
+func dropFailFiles(testName string) {
+	pattern := failFileGlob(testName)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return
+	}
+	for _, match := range matches {
+		if err := os.Remove(match); err != nil {
+			return
+		}
+	}
+	_ = os.Remove(filepath.Dir(pattern)) // only succeeds once the directory is empty
 }
 
 // recordViolation is how judge reports an established rule violation while
@@ -140,7 +217,7 @@ func (r *recorder) recordDeath(detail string) {
 
 func (r *recorder) Log(args ...any)                 {}
 func (r *recorder) Logf(format string, args ...any) {}
-func (r *recorder) Error(args ...any)               { r.Fail(); fmt.Fprintln(&r.message, args...) }
+func (r *recorder) Error(args ...any)               { r.Errorf("%s", fmt.Sprint(args...)) }
 func (r *recorder) Errorf(format string, args ...any) {
 	r.Fail()
 	if r.violated {
@@ -168,11 +245,11 @@ func (r *recorder) Fail()                             { r.failed = true }
 func (r *recorder) FailNow()                          { r.failed = true; panic(errStop) }
 func (r *recorder) Failed() bool                      { return r.failed }
 
-// markViolation is a no-op for a plain testing.TB: only Fails' recorder needs
-// to record a check that failed for a reason its rule verdicts do not show —
-// spectest reporting one directly, or rapid giving up on the run.
+// markViolation records, for Fails' recorder, a check that failed for a reason
+// its rule verdicts do not show — spectest reporting one directly, or rapid
+// giving up on the run. It is a no-op for a plain testing.TB.
 func markViolation(t rapid.TB) {
-	if m, ok := t.(interface{ markViolation() }); ok {
-		m.markViolation()
+	if r := failsRecorder(t); r != nil {
+		r.markViolation()
 	}
 }
