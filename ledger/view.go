@@ -89,7 +89,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Rebuild(ctx context.Context, v View[S]) (in
 	// A stream with no events has nothing in any view.
 	rows, err := a.Store.pool.Query(ctx, `
 SELECT DISTINCT stream FROM cairn.entries
-WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
+WHERE kind = $1 AND events::text <> '[]' ORDER BY stream`, a.Kind)
 	if err != nil {
 		return 0, err
 	}
@@ -106,7 +106,7 @@ WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
 			}
 			// The same entry a live write would have passed: the latest with events.
 			rows, err := tx.Query(ctx, `SELECT `+entryColumns+` FROM cairn.entries
-WHERE stream = $1 AND events <> '[]'::jsonb ORDER BY seq DESC LIMIT 1`, name)
+WHERE stream = $1 AND events::text <> '[]' ORDER BY seq DESC LIMIT 1`, name)
 			if err != nil {
 				return err
 			}
