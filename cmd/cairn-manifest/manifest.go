@@ -188,8 +188,8 @@ type upcast struct {
 // left out are remembered for readBuilds.
 func (x *extractor) extract(pkgs []*packages.Package) {
 	for _, p := range pkgs {
-		if strings.HasSuffix(p.PkgPath, ".test") {
-			continue // the generated test main
+		if generatedTestMain(p) {
+			continue
 		}
 		for _, name := range p.IgnoredFiles {
 			if strings.HasSuffix(name, ".go") {
@@ -205,6 +205,24 @@ func (x *extractor) extract(pkgs []*packages.Package) {
 			x.file(p, f, name)
 		}
 	}
+}
+
+// generatedTestMain reports whether p is the main package the go command
+// builds to run another package's tests. Its import path ends in ".test",
+// which is also a legal ending for a real package's path, so the path alone
+// does not tell them apart: the generated package is named main and has no
+// source file of its own in its directory, its one file being generated into
+// the build's working directory.
+func generatedTestMain(p *packages.Package) bool {
+	if p.Name != "main" || !strings.HasSuffix(p.PkgPath, ".test") {
+		return false
+	}
+	for _, name := range p.GoFiles {
+		if filepath.Dir(name) == p.Dir {
+			return false
+		}
+	}
+	return true
 }
 
 type extractor struct {
