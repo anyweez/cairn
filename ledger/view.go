@@ -81,24 +81,14 @@ func viewError[S any](err error, at Loaded[S]) error {
 // Rebuild writes v for every stream of the aggregate's kind that has recorded
 // an event, returning how many it wrote. Use it when a view is added or its
 // rows change shape. Each stream is locked and written in its own
-// transaction, so Rebuild can run while the aggregate is taking messages.
+// transaction, so Rebuild can run while the aggregate is taking messages. A
+// stream first written while it runs is picked up by a later pass, so it is
+// in the rebuilt view too.
 func (a *Aggregate[S, M, R, Ev, Ef]) Rebuild(ctx context.Context, v View[S]) (int, error) {
 	if err := a.Validate(); err != nil {
 		return 0, err
 	}
-	// A stream with no events has nothing in any view.
-	rows, err := a.Store.pool.Query(ctx, `
-SELECT DISTINCT stream FROM cairn.entries
-WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
-	if err != nil {
-		return 0, err
-	}
-	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return 0, err
-	}
-	for i, name := range names {
-		stream := parseStream(name, a.Kind)
+	return a.eachEventfulStream(ctx, func(name string, stream Stream) error {
 		err := a.Store.Transact(ctx, []Stream{stream}, func(tx *Tx) error {
 			at, err := a.LoadLocked(ctx, tx, stream.ID)
 			if err != nil {
@@ -127,8 +117,45 @@ WHERE stream = $1 AND events <> '[]'::jsonb ORDER BY seq DESC LIMIT 1`, name)
 			return viewError(b.send(ctx, tx.tx), at)
 		})
 		if err != nil {
-			return i, fmt.Errorf("cairn: rebuilding view %s at %s: %w", v.Name, name, err)
+			return fmt.Errorf("cairn: rebuilding view %s at %s: %w", v.Name, name, err)
+		}
+		return nil
+	})
+}
+
+// eachEventfulStream calls visit for every stream of the aggregate's kind that
+// has recorded an entry with events, and returns how many it visited. A stream
+// first written while it runs is visited by a later pass: it lists the streams
+// again after each pass, and stops when a pass finds none it has not already
+// visited. A list read once would leave that stream out of a rebuilt view and
+// report success, which is the gap this closes.
+func (a *Aggregate[S, M, R, Ev, Ef]) eachEventfulStream(ctx context.Context, visit func(name string, stream Stream) error) (int, error) {
+	visited := make(map[string]bool)
+	for {
+		// A stream with no events has nothing in any view.
+		rows, err := a.Store.pool.Query(ctx, `
+SELECT DISTINCT stream FROM cairn.entries
+WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
+		if err != nil {
+			return len(visited), err
+		}
+		names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return len(visited), err
+		}
+		fresh := 0
+		for _, name := range names {
+			if visited[name] {
+				continue
+			}
+			fresh++
+			if err := visit(name, parseStream(name, a.Kind)); err != nil {
+				return len(visited), err
+			}
+			visited[name] = true
+		}
+		if fresh == 0 {
+			return len(visited), nil
 		}
 	}
-	return len(names), nil
 }
