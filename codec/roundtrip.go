@@ -1,28 +1,26 @@
-package spectest
+package codec
 
 import (
 	"reflect"
 	"time"
 )
 
-var timeType = reflect.TypeFor[time.Time]()
-
-// equalRoundTripped reports whether a value and what its codec or snapshot
-// round trip gave back are the same value.
+// EqualRoundTripped reports whether a value and what its codec, snapshot or a
+// replay kept it as are the same value.
 //
 // It is reflect.DeepEqual except for a time.Time, which is compared by its
-// instant, because that is the notion of "read back unchanged" the codec and
-// the ledger hold themselves to. json.Marshal writes an instant and a zone
+// instant, because that is the notion of "read back unchanged" this package
+// and the ledger hold themselves to. json.Marshal writes an instant and a zone
 // offset but neither the monotonic clock reading nor the *Location it came
 // from, so a time the ledger records, snapshots and replays exactly fails
-// DeepEqual. codec.CheckStorable accepts exactly the times whose instant
-// survives, and queueSnapshot runs it before writing a snapshot; this is that
-// rule, applied to the pair rather than to one value.
+// DeepEqual. CheckStorable accepts exactly the times whose instant survives,
+// and the ledger runs it before writing a snapshot; this is that rule, applied
+// to a pair rather than to one value.
 //
 // Everything else is DeepEqual's answer, so a field a codec or a snapshot
 // drops — a `json:"-"` tag, an unexported field — is still reported, and so is
 // a time whose instant moves.
-func equalRoundTripped(a, b any) bool {
+func EqualRoundTripped(a, b any) bool {
 	if reflect.DeepEqual(a, b) {
 		return true
 	}
@@ -128,10 +126,40 @@ func equalMap(a, b reflect.Value, seen map[visit]bool) bool {
 		return true
 	}
 	defer delete(seen, k)
+	if a.Type().Key() == timeType {
+		return equalTimeKeyedMap(a, b, seen)
+	}
 	iter := a.MapRange()
 	for iter.Next() {
 		value := b.MapIndex(iter.Key())
 		if !value.IsValid() || !equalRoundTripValue(iter.Value(), value, seen) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalTimeKeyedMap matches each key by its instant. Go's == on a time.Time
+// compares its *Location, and a decoded key has a new one even when JSON kept
+// the instant, so b.MapIndex would never find the counterpart of a key that
+// survived the round trip.
+func equalTimeKeyedMap(a, b reflect.Value, seen map[visit]bool) bool {
+	keys := b.MapKeys()
+	matched := make([]bool, len(keys))
+	iter := a.MapRange()
+	for iter.Next() {
+		found := false
+		for i, key := range keys {
+			if matched[i] || !sameInstant(iter.Key(), key) {
+				continue
+			}
+			if equalRoundTripValue(iter.Value(), b.MapIndex(key), seen) {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

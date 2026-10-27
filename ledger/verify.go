@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+
+	"github.com/anyweez/cairn/codec"
 )
 
 // Divergence is one stored decision the current Decider would make differently.
@@ -153,7 +155,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) VerifyAll(ctx context.Context) ([]Divergenc
 }
 
 func sameSlice[T any](a, b []T) bool {
-	return (len(a) == 0 && len(b) == 0) || reflect.DeepEqual(a, b)
+	return (len(a) == 0 && len(b) == 0) || codec.EqualRoundTripped(a, b)
 }
 
 // storedResult is an accepted entry's result, upcast to the current version.
