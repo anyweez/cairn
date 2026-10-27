@@ -1,28 +1,26 @@
-package spectest
+package codec
 
 import (
 	"reflect"
 	"time"
 )
 
-var timeType = reflect.TypeFor[time.Time]()
-
-// equalRoundTripped reports whether a value and what its codec or snapshot
-// round trip gave back are the same value.
+// EqualRoundTripped reports whether a value and what its codec, snapshot or a
+// replay kept it as are the same value.
 //
 // It is reflect.DeepEqual except for a time.Time, which is compared by its
-// instant, because that is the notion of "read back unchanged" the codec and
-// the ledger hold themselves to. json.Marshal writes an instant and a zone
+// instant, because that is the notion of "read back unchanged" this package
+// and the ledger hold themselves to. json.Marshal writes an instant and a zone
 // offset but neither the monotonic clock reading nor the *Location it came
 // from, so a time the ledger records, snapshots and replays exactly fails
-// DeepEqual. codec.CheckStorable accepts exactly the times whose instant
-// survives, and queueSnapshot runs it before writing a snapshot; this is that
-// rule, applied to the pair rather than to one value.
+// DeepEqual. CheckStorable accepts exactly the times whose instant survives,
+// and the ledger runs it before writing a snapshot; this is that rule, applied
+// to a pair rather than to one value.
 //
 // Everything else is DeepEqual's answer, so a field a codec or a snapshot
 // drops — a `json:"-"` tag, an unexported field — is still reported, and so is
 // a time whose instant moves.
-func equalRoundTripped(a, b any) bool {
+func EqualRoundTripped(a, b any) bool {
 	if reflect.DeepEqual(a, b) {
 		return true
 	}
