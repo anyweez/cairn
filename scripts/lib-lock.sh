@@ -16,37 +16,41 @@
 #   ...the check-then-act...
 #   lock_release
 #
-# The holder's PID and the time it took the lock are written inside, so a
+# The holder's PID is written inside, along with when it took the lock, so a
 # caller killed while holding it does not wedge the fixture: a lock whose PID is
-# gone, or that has been held for more than a minute, is taken over. An EXIT
-# trap releases the lock when the critical section fails or the script is
-# interrupted.
+# gone is taken over, and so is one that records no PID and has stayed empty for
+# more than a minute, which is the window between mkdir and writing the
+# metadata. A recorded PID that is still alive keeps the lock however long it
+# takes; a first-time `docker pull` inside `docker run` can exceed a minute.
+# An EXIT trap releases the lock when the critical section fails or the script
+# is interrupted.
 
 _lock_dir=
 _lock_held=
 
 lock_acquire() {
   local dir=${TMPDIR:-/tmp}/$1.lock
-  local pid at now ref seen=
+  local pid now seen=
   while ! mkdir "$dir" 2>/dev/null; do
     now=$(date +%s)
     pid=$(cat "$dir/pid" 2>/dev/null || true)
-    at=$(cat "$dir/at" 2>/dev/null || true)
-    ref=$at
-    if [ -z "$ref" ]; then
-      # A holder killed between mkdir and recording itself leaves no time to
-      # age, so age the lock from when this caller first saw it empty.
-      [ -n "$seen" ] || seen=$now
-      ref=$seen
-    else
+    if [ -n "$pid" ]; then
+      # A live holder keeps the lock however long it takes. Taking it would
+      # let a second caller into the check-then-act and reintroduce the
+      # name-conflict race this lock exists to prevent.
       seen=
-    fi
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-      echo "lock $dir: holder $pid is gone, taking it" >&2
-      rm -rf "$dir"
-    elif [ "$((now - ref))" -gt 60 ]; then
-      echo "lock $dir: held for more than 60s, taking it" >&2
-      rm -rf "$dir"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "lock $dir: holder $pid is gone, taking it" >&2
+        rm -rf "$dir"
+      fi
+    else
+      # A holder killed between mkdir and recording itself leaves no PID to
+      # check, so age the lock from when this caller first saw it empty.
+      [ -n "$seen" ] || seen=$now
+      if [ "$((now - seen))" -gt 60 ]; then
+        echo "lock $dir: no holder recorded for more than 60s, taking it" >&2
+        rm -rf "$dir"
+      fi
     fi
     sleep 0.1
   done
