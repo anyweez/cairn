@@ -11,6 +11,7 @@ set -euo pipefail
 source "$(dirname "$0")/containers.sh"
 
 cd "$(dirname "$0")/.."
+. scripts/lib-lock.sh
 
 scripts/test-postgres.sh >/dev/null
 
@@ -23,6 +24,11 @@ name=$(fixture_name cairn-test-pgbouncer 55873 "$port")
 # different Postgres must be a different container.
 [ "$pg_port" = 55871 ] || name="${name}-pg-${pg_port}"
 
+# Creating the network and the container is a check-then-act: callers that
+# start together both see neither, and one caller's `docker rm -f` can delete
+# the container another just started. Serialise them, so the loser reuses the
+# winner's network and container instead of colliding with it on the name.
+lock_acquire cairn-test-pgbouncer
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker network connect "$network" "$postgres" 2>/dev/null || true
 
@@ -36,6 +42,7 @@ if ! container_publishes "$name" 5432 "$port"; then
     -e MAX_CLIENT_CONN=1000 -e DEFAULT_POOL_SIZE=40 \
     edoburu/pgbouncer:v1.24.1-p1 >/dev/null
 fi
+lock_release
 for _ in $(seq 1 60); do
   docker exec "$name" sh -c 'nc -z 127.0.0.1 5432' >/dev/null 2>&1 && ready=1 && break
   sleep 0.5

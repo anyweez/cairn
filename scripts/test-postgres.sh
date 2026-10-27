@@ -10,10 +10,16 @@
 set -euo pipefail
 
 source "$(dirname "$0")/containers.sh"
+. "$(dirname "$0")/lib-lock.sh"
 
 port=${CAIRN_TEST_PORT:-55871}
 name=$(fixture_name cairn-test-postgres 55871 "$port")
 
+# The check and the creation are not atomic on their own: callers that start
+# together both see no container, and one caller's `docker rm -f` can delete the
+# container another just started. Serialise them, so the loser finds the
+# winner's container instead of colliding with it on the name.
+lock_acquire cairn-test-postgres
 if ! container_publishes "$name" 5432 "$port"; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   # max_prepared_transactions defaults to 0, which makes PREPARE TRANSACTION
@@ -23,6 +29,7 @@ if ! container_publishes "$name" 5432 "$port"; then
     -e POSTGRES_PASSWORD=cairn -e POSTGRES_USER=cairn postgres:17-alpine \
     -c max_prepared_transactions=16 >/dev/null
 fi
+lock_release
 # Over TCP: during init the image runs a socket-only server that the unix
 # socket check would mistake for the real one.
 for _ in $(seq 1 60); do
