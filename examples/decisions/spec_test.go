@@ -376,9 +376,13 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 	}
 
 	// An Evolve that writes into the map it shares with the previous state is
-	// caught by the framework's own isolation rule.
+	// caught by the framework's own isolation rule. The trigger is aimed at the
+	// Open state rather than left to the broad generator: the aliasing branch
+	// needs a second SavePosition, once the map exists, and reaching it by
+	// chance made the test depend on rapid's check budget.
 	t.Run("evolve aliases positions", func(t *testing.T) {
 		m := machine()
+		m.Messages = aimed(t, Open, SavePosition{By: "ana", Option: "o1", Body: "changed"})
 		m.Decider.Evolve = func(s State, e Event) State {
 			if p, ok := e.(PositionSaved); ok && s.Positions != nil {
 				s.Positions[p.Member] = Position{Option: p.Option, Body: p.Body}
