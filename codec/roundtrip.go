@@ -126,10 +126,40 @@ func equalMap(a, b reflect.Value, seen map[visit]bool) bool {
 		return true
 	}
 	defer delete(seen, k)
+	if a.Type().Key() == timeType {
+		return equalTimeKeyedMap(a, b, seen)
+	}
 	iter := a.MapRange()
 	for iter.Next() {
 		value := b.MapIndex(iter.Key())
 		if !value.IsValid() || !equalRoundTripValue(iter.Value(), value, seen) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalTimeKeyedMap matches each key by its instant. Go's == on a time.Time
+// compares its *Location, and a decoded key has a new one even when JSON kept
+// the instant, so b.MapIndex would never find the counterpart of a key that
+// survived the round trip.
+func equalTimeKeyedMap(a, b reflect.Value, seen map[visit]bool) bool {
+	keys := b.MapKeys()
+	matched := make([]bool, len(keys))
+	iter := a.MapRange()
+	for iter.Next() {
+		found := false
+		for i, key := range keys {
+			if matched[i] || !sameInstant(iter.Key(), key) {
+				continue
+			}
+			if equalRoundTripValue(iter.Value(), b.MapIndex(key), seen) {
+				matched[i] = true
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

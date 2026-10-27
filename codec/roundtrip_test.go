@@ -81,9 +81,27 @@ func TestEqualRoundTripped(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "the instant as a map key",
+			a:    map[time.Time]int{named: 1},
+			b:    rtJSONRoundTrip(t, map[time.Time]int{named: 1}),
+			want: true,
+		},
+		{
 			name: "an instant JSON moves",
 			a:    rtStamped{At: moved},
 			b:    rtJSONRoundTrip(t, rtStamped{At: moved}),
+			want: false,
+		},
+		{
+			name: "a map key whose instant JSON moves",
+			a:    map[time.Time]int{moved: 1},
+			b:    rtJSONRoundTrip(t, map[time.Time]int{moved: 1}),
+			want: false,
+		},
+		{
+			name: "a map key at a different instant",
+			a:    map[time.Time]int{named: 1},
+			b:    map[time.Time]int{named.Add(time.Nanosecond): 1},
 			want: false,
 		},
 		{
