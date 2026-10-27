@@ -78,13 +78,14 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	case *types.Array:
 		return fmt.Sprintf("[%d]%s", u.Len(), s.shape(u.Elem(), addr))
 	case *types.Map:
-		// encoding/json writes every string-kind map key as a quoted JSON
-		// string, json.Number included, so a number key and a string key are
-		// the same on the wire even though the same type in a value position
-		// is a bare number. Render the key as a string rather than letting
-		// the json.Number check above reach it.
+		// encoding/json writes a string-kind map key as the string itself
+		// (resolveKeyName returns it before any MarshalText is consulted),
+		// so a key type with its own marshaler — json.Number among them —
+		// still writes plain strings. Render the key as the kind it writes,
+		// not as the key type's name, or a change to the key type looks
+		// like a wire break that never happens.
 		key := s.shape(u.Key(), false)
-		if isNamed(types.Unalias(u.Key()), "encoding/json", "Number") {
+		if b, ok := types.Unalias(u.Key()).Underlying().(*types.Basic); ok && b.Kind() == types.String {
 			key = "string"
 		}
 		return "map[" + key + "]" + s.shape(u.Elem(), false)
@@ -219,8 +220,17 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 				if ptr, ok := typ.(*types.Pointer); ok {
 					typ, inner = types.Unalias(ptr.Elem()), true
 				}
+				// encoding/json flattens an untagged embedded struct
+				// regardless of the embedded type's own marshaler: its
+				// typeFields never consults one. Only the outer type's method
+				// set decides whether the fields are written at all, and that
+				// is decided before structFields runs — which is exactly where
+				// it matters, since a promotion that is not ambiguous makes
+				// the outer type opaque and never reaches here. When two
+				// embedded marshalers collide the promoted methods cancel and
+				// encoding/json writes the embedded fields, flattened.
 				if f.Embedded() && name == "" {
-					if _, ok := typ.Underlying().(*types.Struct); ok && !s.opaque(typ, inner) {
+					if _, ok := typ.Underlying().(*types.Struct); ok {
 						nextCount[typ]++
 						if nextCount[typ] == 1 {
 							next = append(next, queued{typ: typ, index: index, addr: inner})
@@ -233,12 +243,12 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 					// anonymous field whose type is a struct; such a field
 					// reaches here only when its tag names it (an untagged
 					// embedded struct was flattened above), and encoding/json
-					// marshals it as a named object.
-					innerType := f.Type()
-					if ptr, ok := innerType.(*types.Pointer); ok {
-						innerType = ptr.Elem()
-					}
-					if _, ok := innerType.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
+					// marshals it as a named object. Test the resolved type
+					// above rather than f.Type(), so `type A = *T` is seen as
+					// the struct encoding/json's reflect sees: an alias is a
+					// *types.Alias whose underlying type is a pointer, not the
+					// *types.Pointer a field's declaration spells.
+					if _, ok := typ.Underlying().(*types.Struct); !ok || !f.Embedded() || name == "" {
 						continue
 					}
 				}
@@ -257,7 +267,12 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 					entry += "?"
 				}
 				shape := s.shape(f.Type(), q.addr)
-				if hasOption(opts, "string") && quotable(f.Type()) {
+				// encoding/json only wraps a value in a string when the
+				// primitive encoders run; a field whose type marshals itself is
+				// written by its marshaler and the option is ignored. The same
+				// addressability the shape was read with decides that, so a
+				// pointer-receiver marshaler in an addressable position counts.
+				if hasOption(opts, "string") && quotable(f.Type()) && !s.opaque(types.Unalias(f.Type()), q.addr) {
 					shape = "string(" + shape + ")" // written inside a JSON string
 				}
 				c := jsonField{name: display, index: index, tagged: tagged, entry: entry + ": " + shape}

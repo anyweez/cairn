@@ -13,8 +13,6 @@ import (
 	"go/types"
 	"slices"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // addressableItem chooses its own JSON through a pointer receiver, so it is
@@ -48,29 +46,9 @@ func TestAFieldInAnAddressableStructKeepsItsPointerMarshaler(t *testing.T) {
 		t.Fatalf("reference: encoding/json wrote %s, want {\"items\":[{\"item\":{}}]}", raw)
 	}
 
-	cfg := &packages.Config{
-		Mode:  packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo,
-		Tests: true,
-	}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var outer, item types.Type
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		if obj := p.Types.Scope().Lookup("addressableOuter"); obj != nil {
-			outer = obj.Type()
-		}
-		if obj := p.Types.Scope().Lookup("addressableItem"); obj != nil {
-			item = obj.Type()
-		}
-	}
-	if outer == nil || item == nil {
-		t.Fatal("addressableOuter or addressableItem was not found in the loaded packages")
-	}
+	declared := loadDeclaredTypes(t)
+	outer := declared.get(t, "addressableOuter")
+	item := declared.get(t, "addressableItem")
 
 	got := fields(outer)
 	want := []string{"items: []{item: " + types.TypeString(item, nil) + "}"}

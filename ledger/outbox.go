@@ -28,7 +28,8 @@ func (d Delivery[Ef]) Key() string { return fmt.Sprintf("%s#%d.%d", d.Stream, d.
 
 // Dispatcher carries out one kind's effects from the outbox, at least once
 // each. Effects are claimed with a lease, so several dispatchers can share
-// the work; order between effects is not guaranteed.
+// the work; order between effects is not guaranteed. A handler must be
+// idempotent and must not depend on delivery order; see docs/EFFECTS.md.
 type Dispatcher[Ef any] struct {
 	Store   *Store
 	Kind    string
@@ -59,6 +60,26 @@ type Dispatcher[Ef any] struct {
 	OnError func(error)
 }
 
+// Validate reports the first thing wrong with how the dispatcher is set up: no
+// store, no Kind, no Effects codec, or no Handle. DrainOnce runs it before
+// claiming anything, so a wiring mistake is an error rather than a nil-pointer
+// panic, or a nil handler recorded as a failed attempt and retried for ever;
+// call it at startup to fail before then.
+func (d *Dispatcher[Ef]) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: dispatcher %s: %s", quoteText(d.Kind), what) }
+	switch {
+	case d.Store == nil:
+		return fail("Store is nil")
+	case d.Kind == "":
+		return fail("Kind must be non-empty")
+	case d.Effects == nil:
+		return fail("Effects is nil")
+	case d.Handle == nil:
+		return fail("Handle is nil")
+	}
+	return nil
+}
+
 type dispatchConfig struct {
 	batch   int
 	lease   time.Duration
@@ -85,15 +106,20 @@ func (d *Dispatcher[Ef]) config() dispatchConfig {
 // DrainOnce claims one batch and carries it out, returning how many effects
 // it claimed.
 //
-// Every claim increments an effect's attempts, and every later write for that
-// effect is conditional on attempts being unchanged. A dispatcher whose lease
-// ran out, and whose effect another dispatcher has since claimed, therefore
-// cannot mark it done or failed.
+// The claim reserves the whole batch with a lease but spends no attempt: an
+// attempt is counted by the per-effect write that hands the effect out, so a
+// drain that ends before the walk reaches a row leaves its count alone. Every
+// write for an effect is conditional on attempts being unchanged. A dispatcher
+// whose lease ran out, and whose effect another dispatcher has since claimed,
+// therefore cannot hand it out, mark it done or mark it failed.
 func (d *Dispatcher[Ef]) DrainOnce(ctx context.Context) (int, error) {
+	if err := d.Validate(); err != nil {
+		return 0, err
+	}
 	cfg := d.config()
 	rows, err := d.Store.pool.Query(ctx, `
 WITH claimed AS (
-    UPDATE cairn.outbox SET attempts = attempts + 1, available_at = now() + make_interval(secs => $3)
+    UPDATE cairn.outbox SET available_at = now() + make_interval(secs => $3)
     WHERE id IN (
         SELECT id FROM cairn.outbox
         WHERE kind = $1 AND done_at IS NULL AND failed_at IS NULL AND available_at <= now()
@@ -102,7 +128,8 @@ WITH claimed AS (
         LIMIT $2)
     RETURNING id, stream, kind, seq, idx, effect, attempts)
 SELECT c.id, c.stream, c.kind, c.seq, c.idx, c.effect, c.attempts,
-    coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, '')
+    coalesce(e.actor, ''), coalesce(e.via, ''), coalesce(e.correlation_id, ''), coalesce(e.causation_id, ''),
+    e.occurred_at, e.extra
 FROM claimed c JOIN cairn.entries e ON e.stream = c.stream AND e.seq = c.seq
 ORDER BY c.id`,
 		d.Kind, cfg.batch, cfg.lease.Seconds())
@@ -122,12 +149,18 @@ ORDER BY c.id`,
 	for rows.Next() {
 		var c claimed
 		var name, kind string
+		var occurred *time.Time
+		var extra []byte
 		if err := rows.Scan(&c.id, &name, &kind, &c.seq, &c.idx, &c.effect, &c.attempts,
-			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID); err != nil {
+			&c.meta.Actor, &c.meta.Via, &c.meta.CorrelationID, &c.meta.CausationID, &occurred, &extra); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		c.stream = parseStream(name, kind)
+		if err := decodeMetaTail(&c.meta, occurred, extra); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("cairn: %s#%d metadata: %w", c.stream, c.seq, err)
+		}
 		batch = append(batch, c)
 	}
 	rows.Close()
@@ -138,14 +171,38 @@ ORDER BY c.id`,
 	// Outcomes are recorded even when ctx is cancelled mid-batch, so an effect
 	// that was carried out is not carried out again after shutdown.
 	record := context.WithoutCancel(ctx)
+	// giveBack makes the effects the walk did not reach claimable at once instead
+	// of after the whole lease: the claim reserved the batch with a lease but
+	// spent no attempt, so availability is all there is to give back. One round
+	// trip; fenced row by row against the claim's own attempt count, so an
+	// effect another dispatcher has since reclaimed is left to that dispatcher.
+	giveBack := func(rest []claimed) error {
+		if len(rest) == 0 {
+			return nil
+		}
+		ids := make([]int64, len(rest))
+		atts := make([]int, len(rest))
+		for i, r := range rest {
+			ids[i], atts[i] = r.id, r.attempts
+		}
+		_, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox o
+SET available_at = now()
+FROM unnest($1::bigint[], $2::int[]) AS u(id, att)
+WHERE o.id = u.id AND o.attempts = u.att AND o.done_at IS NULL AND o.failed_at IS NULL`, ids, atts)
+		return err
+	}
 	const fenced = ` AND attempts = $2 AND done_at IS NULL AND failed_at IS NULL`
-	for _, c := range batch {
+	for i := range batch {
+		c := batch[i]
 		if ctx.Err() != nil {
+			giveBack(batch[i:]) // not the reason the walk stopped
 			return len(batch), ctx.Err()
 		}
-		// Claimed more times than allowed without an outcome being recorded:
-		// earlier attempts died with their dispatcher.
-		if d.MaxAttempts > 0 && c.attempts > d.MaxAttempts {
+		// Delivered more times than allowed without an outcome being recorded:
+		// earlier attempts were handed out by a dispatcher that died before it
+		// could say what happened. Only a delivery spends an attempt, so the
+		// count is the one MaxAttempts gives up on.
+		if d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts {
 			if _, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox SET failed_at = now(),
 last_error = coalesce(last_error, 'no outcome recorded after ' || $3::int || ' attempts') WHERE id = $1`+fenced,
 				c.id, c.attempts, d.MaxAttempts); err != nil {
@@ -153,10 +210,16 @@ last_error = coalesce(last_error, 'no outcome recorded after ' || $3::int || ' a
 			}
 			continue
 		}
-		// The claim's lease started with the batch; restart it for this effect.
+		// The claim's lease started with the batch; restart it for this effect,
+		// and count the attempt it is about to spend. Both in one write: the
+		// attempt is spent by the hand-out, not by the claim, so no drain that
+		// stops early can leave an effect counted and undelivered.
+		attempt := c.attempts + 1
 		tag, err := d.Store.pool.Exec(record, `UPDATE cairn.outbox
-SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id, c.attempts, cfg.lease.Seconds())
+SET attempts = attempts + 1, available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced,
+			c.id, c.attempts, cfg.lease.Seconds())
 		if err != nil {
+			giveBack(batch[i:]) // c's update failed, so it was not handed out either
 			return len(batch), err
 		}
 		if tag.RowsAffected() == 0 {
@@ -165,21 +228,30 @@ SET available_at = now() + make_interval(secs => $3) WHERE id = $1`+fenced, c.id
 
 		handleCtx, cancel := context.WithTimeout(ctx, cfg.lease)
 		err = d.deliver(handleCtx, Delivery[Ef]{ID: c.id, Stream: c.stream, Seq: c.seq, Index: c.idx,
-			Attempt: c.attempts, Meta: c.meta}, c.effect)
+			Attempt: attempt, Meta: c.meta}, c.effect)
 		cancel()
 		switch {
 		case err == nil:
+			// The row exists to hand the effect out; once that is recorded there
+			// is nothing left to read from it. Deleting it as the delivery is
+			// marked keeps a busy outbox from growing without bound, and it is
+			// the only outcome that would set an indexed column: done_at is
+			// part of outbox_pending's predicate, so marking it done rewrites
+			// that index for every effect. A row an earlier release already
+			// marked done is still treated as finished below, because a
+			// rolling deploy runs both.
 			_, err = d.Store.pool.Exec(record,
-				`UPDATE cairn.outbox SET done_at = now(), last_error = NULL WHERE id = $1`+fenced, c.id, c.attempts)
-		case d.MaxAttempts > 0 && c.attempts >= d.MaxAttempts:
+				`DELETE FROM cairn.outbox WHERE id = $1`+fenced, c.id, attempt)
+		case d.MaxAttempts > 0 && attempt >= d.MaxAttempts:
 			_, err = d.Store.pool.Exec(record,
-				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, c.attempts, storableError(err))
+				`UPDATE cairn.outbox SET failed_at = now(), last_error = $3 WHERE id = $1`+fenced, c.id, attempt, storableError(err))
 		default:
 			_, err = d.Store.pool.Exec(record, `UPDATE cairn.outbox
 SET available_at = now() + make_interval(secs => $3), last_error = $4 WHERE id = $1`+fenced,
-				c.id, c.attempts, cfg.backoff(c.attempts).Seconds(), storableError(err))
+				c.id, attempt, cfg.backoff(attempt).Seconds(), storableError(err))
 		}
 		if err != nil {
+			giveBack(batch[i+1:]) // c was handed out; the rows behind it were not
 			return len(batch), err
 		}
 	}
@@ -211,8 +283,17 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byt
 }
 
 // Run drains the outbox every interval until ctx is done. An error ends it
-// unless OnError is set.
+// unless OnError is set. The interval must be positive. A dispatcher that is
+// not configured is reported before the first interval: retrying it cannot fix
+// the mistake.
 func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error {
+	// poll rejects a non-positive interval, and does so before OnError can
+	// swallow it, so keep that the first thing Run reports.
+	if interval > 0 {
+		if err := d.Validate(); err != nil {
+			return err
+		}
+	}
 	return poll(ctx, interval, d.OnError, func(ctx context.Context) (bool, error) {
 		n, err := d.DrainOnce(ctx)
 		return n > 0, err

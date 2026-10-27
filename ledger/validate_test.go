@@ -47,6 +47,26 @@ func TestValidateNamesTheFirstMistake(t *testing.T) {
 	}
 }
 
+// A Kind reaches a text parameter on the paths that filter by Kind alone
+// (Rebuild, RebuildEntries, Streams, ReadAll), so one Postgres cannot store is
+// a setup mistake Validate reports, not a raw SQLSTATE from the driver.
+func TestValidateRefusesAnUnstorableKind(t *testing.T) {
+	t.Parallel()
+	for name, kind := range map[string]string{
+		"NUL":          "counter\x00x",
+		"invalid utf8": "counter\xffx",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			agg := counterOn(ledger.New(nil))
+			agg.Kind = kind
+			if err := agg.Validate(); err == nil || !strings.Contains(err.Error(), "Kind is not valid UTF-8") {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
 // Every method validates first, so a mistake is an error, not a panic.
 func TestMethodsValidateBeforeTouchingTheDatabase(t *testing.T) {
 	t.Parallel()
@@ -60,5 +80,30 @@ func TestMethodsValidateBeforeTouchingTheDatabase(t *testing.T) {
 	}
 	if _, err := agg.VerifyAll(ctx); err == nil || !strings.Contains(err.Error(), "Codecs.Messages is nil") {
 		t.Fatalf("VerifyAll: %v", err)
+	}
+}
+
+// A StateVersion is half the primary key of cairn.state_snapshots. An
+// unstorable or over-long one fails the snapshot write with a raw SQLSTATE, and
+// since a snapshot comes due again on every later message the stream then
+// records nothing more. Validate refuses it up front, naming the value.
+func TestValidateRefusesAStateVersionTheLedgerCannotIndex(t *testing.T) {
+	t.Parallel()
+	for name, version := range map[string]string{
+		"NUL":      "v\x00",
+		"too long": strings.Repeat("v", 1025),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			agg := counterOn(ledger.New(nil))
+			agg.StateVersion = version
+			err := agg.Validate()
+			if err == nil {
+				t.Fatal("Validate accepted a state version the snapshot index cannot hold")
+			}
+			if msg := err.Error(); !strings.Contains(msg, "version") || !strings.Contains(msg, "snapshot") {
+				t.Fatalf("the error does not name the state version: %v", err)
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Batch collects statements that callers hand to the ledger. The ledger sends
@@ -20,7 +21,9 @@ import (
 type Batch struct {
 	queued pgx.Batch
 	items  []batchItem
-	owner  string
+	// owner is whose statements Queue adds next. Only as sets it, so an owner
+	// never outlives the callback it names.
+	owner string
 	// commits is set on a batch that ends its own transaction and may have
 	// recorded a message. send can report ErrRecorded for it only when
 	// hasCommit proves the transaction committed.
@@ -38,6 +41,17 @@ type Batch struct {
 type batchItem struct {
 	owner  string
 	handle func(pgx.BatchResults) error
+}
+
+// as queues the statements write adds as owner, so a failing one names whose
+// statement it was, and restores the previous owner afterwards. The callback
+// is what lets the ledger queue its own statements after a caller's without
+// inheriting the caller's owner.
+func (b *Batch) as(owner string, write func() error) error {
+	previous := b.owner
+	b.owner = owner
+	defer func() { b.owner = previous }()
+	return write()
 }
 
 // Queue adds a statement to the batch.
@@ -103,13 +117,27 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			// rest, and say so rather than reporting a failure that did not
 			// happen.
 			closeErr := results.Close()
-			if b.commits && b.hasCommit && committed(s, err, closeErr) {
-				return &recordedError{err: b.failed(i, err)}
+			j, unbuilt := b.blame(s, i, err)
+			// An unbuilt statement is one the client could not encode, so the
+			// batch was never sent and nothing can have committed — whatever
+			// state the connection happens to be in.
+			if !unbuilt && b.commits && b.hasCommit && committed(s, err, closeErr) {
+				return &recordedError{err: b.failed(j, err)}
 			}
-			return b.failed(i, err)
+			return b.failed(j, err)
 		}
 	}
-	return results.Close()
+	// Every handler above read its statement's result, the COMMIT tag among
+	// them, so the transaction is committed. Close then waits for the server
+	// to resynchronise after that — a round trip of its own — and a
+	// connection lost in between fails it with the commit already durable.
+	// The caller must hear that the message was recorded rather than that the
+	// transaction failed.
+	err := results.Close()
+	if err != nil && b.commits && b.hasCommit {
+		return &recordedError{err: err}
+	}
+	return err
 }
 
 // ErrRecorded reports that a batch's transaction committed, but a result could
@@ -120,9 +148,10 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 // it a second time.
 var ErrRecorded = errors.New("cairn: the message was recorded, but its result could not be read")
 
-// recordedError is a handler failing to read a result from a batch the
-// database had already committed. It carries the error that says what could
-// not be read, and matches ErrRecorded.
+// recordedError is an error from a batch the database had already committed:
+// a handler failed to read a result, or closing the results failed after the
+// commit. It carries the error that says what could not be read, and matches
+// ErrRecorded.
 type recordedError struct{ err error }
 
 func (e *recordedError) Error() string { return fmt.Sprintf("%v: %v", ErrRecorded, e.err) }
@@ -172,19 +201,9 @@ func (b *Batch) end() {
 	b.hasCommit = true
 }
 
-// failed blames the statement at i for err, unless err comes from preparing
-// the batch: pgx prepares every statement before running any, and reports a
-// failure there against the first, naming the SQL that actually failed.
+// failed reports the statement at i having failed: its owner and which of that
+// owner's statements it was. Callers name the owner in their own words.
 func (b *Batch) failed(i int, err error) error {
-	var prep pgx.ErrPreprocessingBatch
-	if errors.As(err, &prep) {
-		for j, q := range b.queued.QueuedQueries {
-			if q.SQL == prep.SQL() {
-				i = j
-				break
-			}
-		}
-	}
 	owner := b.items[i].owner
 	if owner == "" {
 		return err
@@ -194,4 +213,152 @@ func (b *Batch) failed(i int, err error) error {
 		index++
 	}
 	return &batchError{owner: owner, index: index, err: err}
+}
+
+// blame returns the index of the queued statement err belongs to, starting
+// from the one whose result reported it, and whether the client failed to
+// build that statement. A build failure happens before the batch is sent: pgx
+// prepares every statement before running any, and encodes every argument
+// before sending any, so a statement it could not build never ran.
+func (b *Batch) blame(s batchSender, i int, err error) (int, bool) {
+	var prep pgx.ErrPreprocessingBatch
+	if errors.As(err, &prep) {
+		if j, ok := b.blamePrepared(s, prep.SQL()); ok {
+			i = j
+		}
+		return i, true
+	}
+	// A server error is one statement having failed on the server, after
+	// everything was sent: it cannot be an argument the client could not
+	// encode.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return i, false
+	}
+	if j, ok := b.blameUnbuilt(s, err); ok {
+		return j, true
+	}
+	return i, false
+}
+
+// blamePrepared returns the index of the queued statement with the given SQL
+// that pgx could not build, so that a build failure names the statement whose
+// arguments are bad rather than the first one that happens to share its SQL.
+// pgx prepares every statement before it builds any argument, so the
+// statements before the failing one — including any with the same SQL — built
+// fine, and it stops at the first whose arguments it cannot encode.
+//
+// The type map encodes each argument without knowing the types the statement
+// declared for its parameters, which pgx does not report with the error: it
+// infers a type from each value and accepts either format, as pgx does. A
+// value that encodes as its own type but not as the parameter's (a string
+// where the statement expects an integer) is therefore not recognised, and
+// neither is a failure of the SQL itself rather than of an argument, which
+// every statement with that SQL shares. Then the first match stands, as it did
+// before.
+func (b *Batch) blamePrepared(s batchSender, sql string) (int, bool) {
+	m := senderTypeMap(s)
+	if m == nil {
+		return 0, false
+	}
+	first := -1
+	for j, q := range b.queued.QueuedQueries {
+		if q.SQL != sql {
+			continue
+		}
+		if first < 0 {
+			first = j
+		}
+		if !encodable(m, q.Arguments) {
+			return j, true
+		}
+	}
+	return first, first >= 0
+}
+
+// blameUnbuilt returns the index of the queued statement whose arguments the
+// client could not encode, naming the owner of a batch that failed before it
+// was sent. The simple protocol has pgx turn each statement's parameters into
+// SQL text as it builds the batch, which it does without preparing or
+// describing anything: the failure is a plain encoding error, not a
+// pgx.ErrPreprocessingBatch, and it names neither the statement nor its SQL.
+// The same statement is found again here, and it is blamed only when encoding
+// its arguments gives the very error the batch reported. A client-side failure
+// that is not an encoding one — a QueryRewriter's, say, or a connection that
+// cannot run the simple protocol at all — keeps the behaviour it had.
+func (b *Batch) blameUnbuilt(s batchSender, err error) (int, bool) {
+	m := senderTypeMap(s)
+	if m == nil {
+		return 0, false
+	}
+	for j, q := range b.queued.QueuedQueries {
+		if e := unencoded(m, q.Arguments); e != nil && reported(err, e) {
+			return j, true
+		}
+	}
+	return 0, false
+}
+
+// reported reports whether err, or one of the errors it wraps, says what e
+// says. pgx builds a fresh error for the same argument each time, so the text
+// is the only thing that ties the reported failure to the statement that
+// caused it.
+func reported(err, e error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if err.Error() == e.Error() {
+			return true
+		}
+	}
+	return false
+}
+
+// unencoded returns the error from encoding the first argument pgx cannot
+// encode, as the simple protocol does — as text, through the argument's own
+// type — or nil when every argument encodes.
+func unencoded(m *pgtype.Map, args []any) error {
+	for _, arg := range arguments(args) {
+		if _, err := m.Encode(0, pgtype.TextFormatCode, arg, []byte{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// encodable reports whether pgx could build every argument of a statement. An
+// argument that either format encodes is one pgx would accept.
+func encodable(m *pgtype.Map, args []any) bool {
+	for _, arg := range arguments(args) {
+		if _, err := m.Encode(0, pgtype.BinaryFormatCode, arg, nil); err == nil {
+			continue
+		}
+		if _, err := m.Encode(0, pgtype.TextFormatCode, arg, nil); err == nil {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// arguments drops the leading QueryRewriters: pgx applies one instead of
+// encoding it as an argument.
+func arguments(args []any) []any {
+	for len(args) > 0 {
+		if _, ok := args[0].(pgx.QueryRewriter); !ok {
+			break
+		}
+		args = args[1:]
+	}
+	return args
+}
+
+// senderTypeMap is the type map of the connection a batch was sent on, or nil
+// for a sender that doesn't name one.
+func senderTypeMap(s batchSender) *pgtype.Map {
+	switch s := s.(type) {
+	case *Tx:
+		return s.tx.Conn().TypeMap()
+	case interface{ Conn() *pgx.Conn }:
+		return s.Conn().TypeMap()
+	}
+	return nil
 }

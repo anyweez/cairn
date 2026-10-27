@@ -65,9 +65,9 @@ func spiky() spectest.Machine[spike, int, int, any, struct{}] {
 // intermediate N=100 must be caught. It is not: the checker only judges the
 // state after all of a message's events.
 func TestInvariantChecksEveryStateAMessagesEventsPassThrough(t *testing.T) {
-	if msg, failed := spectest.Fails(t, spiky().Check); !failed {
-		t.Fatalf("the state a message's events passed through was not checked: failed=%v msg=%s\n"+
-			"E1 is violated by N=100, which folding this message's events reaches", failed, msg)
+	if msg, failed, err := spectest.Fails(t, spiky().Check); err != nil || !failed {
+		t.Fatalf("the state a message's events passed through was not checked: err=%v failed=%v msg=%s\n"+
+			"E1 is violated by N=100, which folding this message's events reaches", err, failed, msg)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestInvariantCatchesTheOffendingStateWhenItIsFinal(t *testing.T) {
 		}
 		return cairn.Accept[int, any, struct{}](s.N, nil)
 	}
-	if msg, failed := spectest.Fails(t, m.Check); !failed || !strings.Contains(msg, "E1 violated") {
-		t.Fatalf("a state N=100 after a message must be caught by E1: failed=%v msg=%s", failed, msg)
+	if msg, failed, err := spectest.Fails(t, m.Check); err != nil || !failed || !strings.Contains(msg, "E1 violated") {
+		t.Fatalf("a state N=100 after a message must be caught by E1: err=%v failed=%v msg=%s", err, failed, msg)
 	}
 }

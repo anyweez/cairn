@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,6 +36,8 @@ type Store struct {
 	pool         *pgxpool.Pool
 	requireActor bool
 	cache        *stateCache
+	cacheStreams int
+	cacheBytes   int
 }
 
 // StoreOption configures a Store.
@@ -50,26 +53,38 @@ const DefaultStateCacheSize = 10_000
 
 // StateCacheSize sets how many streams' state the store keeps in memory
 // between messages, for every aggregate on it. Zero turns the cache off, and
-// Handle then reads every stream before deciding. See docs/PERFORMANCE.md.
+// Handle then reads every stream before deciding. StateCacheBytes adds a
+// bound on the memory those states hold. See docs/PERFORMANCE.md.
 func StateCacheSize(streams int) StoreOption {
-	return func(s *Store) {
-		s.cache = nil
-		if streams > 0 {
-			s.cache = newStateCache(streams)
-		}
-	}
+	return func(s *Store) { s.cacheStreams = streams }
+}
+
+// StateCacheBytes bounds the state the store keeps in memory for its cache,
+// measured by the snapshot encoding of each stream's state. The least
+// recently used streams are evicted to stay under it. Zero, the default,
+// leaves StateCacheSize's stream count as the only bound.
+//
+// The size comes from the snapshots the store already writes, so it is an
+// estimate: a stream with no snapshot yet counts as nothing, and one that has
+// grown since its last snapshot counts at the size it was then. An aggregate
+// with no StateVersion writes no snapshot, so its states are not counted;
+// bound those with StateCacheSize alone. See docs/PERFORMANCE.md.
+func StateCacheBytes(bytes int) StoreOption {
+	return func(s *Store) { s.cacheBytes = bytes }
 }
 
 // New returns a store over pool. Call Migrate before first use.
 //
 // The store keeps the state of up to DefaultStateCacheSize streams in memory,
 // so that Handle can record a message to a stream it has recently recorded to
-// in one round trip; StateCacheSize changes that.
+// in one round trip; StateCacheSize changes that, and StateCacheBytes bounds
+// the memory it holds.
 func New(pool *pgxpool.Pool, opts ...StoreOption) *Store {
-	s := &Store{pool: pool, requireActor: true, cache: newStateCache(DefaultStateCacheSize)}
+	s := &Store{pool: pool, requireActor: true, cacheStreams: DefaultStateCacheSize}
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.cache = newStateCache(s.cacheStreams, s.cacheBytes)
 	return s
 }
 
@@ -257,30 +272,96 @@ func queueLockAt(b *Batch, stream Stream, seq int64) (*locks, error) {
 	return &locks{seqs: map[string]int64{stream.String(): seq}, at: recordingTime()}, nil
 }
 
-// validStream refuses a stream whose name could be another's (the name joins
-// kind and ID with a slash, so a kind may not contain one) or that Postgres
-// cannot store. A NUL or invalid UTF-8 in either half would otherwise reach
-// the driver as a text parameter and fail with a raw SQLSTATE.
-func validStream(st Stream) error {
-	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
-		return fmt.Errorf("cairn: invalid stream %q", st)
+// maxIndexedTextBytes bounds every text value cairn puts in a btree index.
+// Postgres cannot build a btree entry larger than about 2704 bytes, and a
+// composite index spends that budget on all of its columns, so a stream name
+// and an idempotency key are each bounded well below it. The limit is bytes,
+// not runes, because that is how Postgres measures UTF-8 text.
+//
+// It applies when a new index entry is written, not when a stored one is read:
+// a value written before the bound existed is already in the ledger, so reads
+// must accept whatever Postgres stored.
+const maxIndexedTextBytes = 1024
+
+// maxQuotedTextBytes bounds how much of a rejected value an error quotes. The
+// caller already has the value it sent, so echoing an 8KB one back costs it
+// 8KB of log or response and tells it nothing it did not know.
+const maxQuotedTextBytes = 64
+
+// quoteText renders v for an error message: all of it when it is short enough
+// to be worth reading, and otherwise at most maxQuotedTextBytes, cut on a rune
+// boundary, with an ellipsis showing the rest was left out.
+func quoteText(v string) string {
+	if len(v) <= maxQuotedTextBytes {
+		return fmt.Sprintf("%q", v)
 	}
-	if !cairn.StorableText(st.Kind) || !cairn.StorableText(st.ID) {
-		return fmt.Errorf("cairn: invalid stream %q: the name is not valid UTF-8 or contains a NUL", st)
+	cut := maxQuotedTextBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%q…", v[:cut])
+}
+
+// validStoredText refuses text a plain text column cannot keep, and is the one
+// rule every write path uses for one. Postgres raises an error for a NUL or
+// text that is not valid UTF-8, which would reach the caller as a raw SQLSTATE,
+// and json.Marshal would otherwise rewrite the same text as U+FFFD. what names
+// the value for the caller, who has to change it: "the idempotency key \"k\"
+// for counter/a" rather than "the key".
+func validStoredText(what, value string) error {
+	if !cairn.StorableText(value) {
+		return fmt.Errorf("cairn: %s is not valid UTF-8 or contains a NUL", what)
 	}
 	return nil
 }
 
-// validKind refuses a kind that could be another's or that Postgres cannot
-// store, for the paths that filter by kind alone.
+// validIndexedText refuses text a btree-indexed column cannot keep, which is
+// validStoredText plus the length bound (see maxIndexedTextBytes). It is what
+// every write path bounds an indexed value with, so a caller is told what to
+// shorten rather than a message about an index row size.
+func validIndexedText(what, value string) error {
+	if err := validStoredText(what, value); err != nil {
+		return err
+	}
+	if n := len(value); n > maxIndexedTextBytes {
+		return fmt.Errorf("cairn: %s is %d bytes, longer than the %d-byte limit", what, n, maxIndexedTextBytes)
+	}
+	return nil
+}
+
+// validStream refuses a stream whose name could be another's (the name joins
+// kind and ID with a slash, so a kind may not contain one), or that Postgres
+// cannot store. A NUL or invalid UTF-8 would otherwise reach the driver as a
+// text parameter and fail with a raw SQLSTATE.
+//
+// It does not bound the name's length: a stream written before that bound
+// existed is already in the ledger and must stay readable. validNewStream
+// applies the bound when an append creates a stream.
+func validStream(st Stream) error {
+	if strings.Contains(st.Kind, "/") || st.Kind == "" || st.ID == "" {
+		return fmt.Errorf("cairn: invalid stream %q", st)
+	}
+	// The name is the kind and the ID joined by a slash, so it is valid UTF-8
+	// with no NUL exactly when both halves are.
+	return validStoredText("stream "+quoteText(st.String()), st.String())
+}
+
+// validNewStream refuses a stream name too long for the btree indexes that key
+// on it, when the append would create the stream. A name that already exists
+// is not bounded: Postgres stored it, so it fits, and its entries stay
+// recordable.
+func validNewStream(st Stream) error {
+	return validIndexedText("stream "+quoteText(st.String()), st.String())
+}
+
+// validKind refuses a kind that could be another's, or that Postgres cannot
+// store, for the paths that filter by kind alone. It does not bound the kind's
+// length: a stream written before that bound existed must stay listable.
 func validKind(kind string) error {
 	if kind == "" || strings.Contains(kind, "/") {
 		return fmt.Errorf("cairn: invalid stream kind %q", kind)
 	}
-	if !cairn.StorableText(kind) {
-		return fmt.Errorf("cairn: invalid stream kind %q: the name is not valid UTF-8 or contains a NUL", kind)
-	}
-	return nil
+	return validStoredText("stream kind "+quoteText(kind), kind)
 }
 
 // minTimestamptz and maxTimestamptz bound what Postgres's timestamptz can
@@ -327,6 +408,13 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if err != nil {
 		return err
 	}
+	if seq == 0 {
+		// The first entry creates the stream, so this is where its name must
+		// fit the indexes that will hold it.
+		if err := validNewStream(stream); err != nil {
+			return err
+		}
+	}
 	e.Stream, e.Seq, e.RecordedAt = stream, seq+1, at
 
 	message, err := json.Marshal(e.Message)
@@ -357,9 +445,33 @@ func (l *locks) queueAppend(b *Batch, stream Stream, e *Entry, at time.Time) err
 	if e.IdempotencyKey != "" {
 		key = &e.IdempotencyKey
 	}
-	for _, text := range []string{e.Meta.Actor, e.Meta.Via, e.Meta.CorrelationID, e.Meta.CausationID} {
-		if !cairn.StorableText(text) {
-			return fmt.Errorf("cairn: metadata for %s is not valid UTF-8 or contains a NUL", stream)
+	// A new key is written into a btree index, so its length is bounded here.
+	// The same check is not made when a key is looked up: a key stored before
+	// this bound existed must still answer its retry.
+	if e.IdempotencyKey != "" {
+		if err := validIndexedText("the idempotency key "+quoteText(e.IdempotencyKey)+" for "+stream.String(), e.IdempotencyKey); err != nil {
+			return err
+		}
+	}
+	for _, text := range []struct {
+		name    string
+		value   string
+		indexed bool
+	}{
+		{"actor", e.Meta.Actor, true},
+		{"via", e.Meta.Via, false},
+		{"correlation ID", e.Meta.CorrelationID, true},
+		{"causation ID", e.Meta.CausationID, false},
+	} {
+		what := "metadata " + text.name + " " + quoteText(text.value) + " for " + stream.String()
+		err := validStoredText(what, text.value)
+		// Via and causation ID are not indexed, so only the indexed fields have
+		// a btree entry whose size their length could exceed.
+		if err == nil && text.indexed {
+			err = validIndexedText(what, text.value)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	extra := []byte(`{}`)
@@ -452,8 +564,9 @@ func nonNil(envs []codec.Envelope) []codec.Envelope {
 // the column in ORDER BY txid, which would then sort the log as text ("1000"
 // before "999").
 const entryColumns = `position, txid::text AS txid_text, stream, kind, seq, message, result, refusal, events, effects,
-coalesce(idempotency_key, ''), recorded_at,
-coalesce(actor, ''), coalesce(via, ''), coalesce(correlation_id, ''), coalesce(causation_id, ''), occurred_at, extra`
+coalesce(idempotency_key, '') AS idempotency_key, recorded_at,
+coalesce(actor, '') AS actor, coalesce(via, '') AS via,
+coalesce(correlation_id, '') AS correlation_id, coalesce(causation_id, '') AS causation_id, occurred_at, extra`
 
 func scanEntries(rows pgx.Rows) ([]Entry, error) {
 	defer rows.Close()
@@ -473,13 +586,8 @@ func scanEntries(rows pgx.Rows) ([]Entry, error) {
 			return nil, err
 		}
 		e.Stream = parseStream(name, kind)
-		if occurred != nil {
-			e.Meta.OccurredAt = *occurred
-		}
-		if string(extra) != "{}" {
-			if err := json.Unmarshal(extra, &e.Meta.Extra); err != nil {
-				return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
-			}
+		if err := decodeMetaTail(&e.Meta, occurred, extra); err != nil {
+			return nil, fmt.Errorf("cairn: %s#%d metadata: %w", e.Stream, e.Seq, err)
 		}
 		var err error
 		if e.TxID, err = strconv.ParseUint(txid, 10, 64); err != nil {
@@ -529,23 +637,74 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 }
 
 // logFence measures the global log's read cutoff and stores it in the
-// transaction-local setting cairn.fence, for the read that follows it.
+// transaction-local setting cairn.fence, for the read that follows it in the
+// same batch.
 //
-// Transaction IDs are assigned by the cluster, so pg_snapshot_xmin is the
-// oldest transaction on the whole server: an idle transaction in another
-// database would hold this one's committed entries back. Only a transaction
-// in this database can write to cairn.entries here, so the fence is this
-// database's smallest in-flight transaction ID, not the cluster's.
+// Transaction IDs are assigned by the cluster, so a cutoff measured from the
+// snapshot views alone (pg_snapshot_xmin on the whole server) would let an
+// idle transaction in another database hold this one's committed entries
+// back. Only a transaction in this database can write to cairn.entries here,
+// so the fence is this database's smallest in-flight transaction ID, not the
+// cluster's. pg_stat_activity supplies the ordinary transactions and
+// pg_prepared_xacts the prepared ones — a prepared transaction has no
+// backend — and widenedXid widens both sources' 32-bit xids, which carry no
+// epoch, onto the xid8 scale cairn.entries.txid is stored and ordered on.
 //
-// Measuring the in-flight set in a statement of its own, before the read's
-// snapshot, is what makes the cutoff sound. A transaction that is in flight
-// when the read takes its snapshot either already existed at the measurement,
-// and is in the measured set, or was assigned its transaction ID after it,
-// and is at or above the measured pg_snapshot_xmax. LEAST of the two bounds
-// every such transaction. Measuring inside the read would be unsound: its
-// snapshot is taken before its own subqueries read pg_stat_activity, so a
-// transaction that commits in between is neither visible to the snapshot nor
-// counted in the in-flight set.
+// The reference the widening reads against is the fence statement's own
+// snapshot frontier, pg_snapshot_xmax(pg_current_snapshot()) — an xid8, so it
+// carries the epoch the 32-bit columns drop. Postgres hands out transaction
+// IDs from one counter and refuses a new one once the oldest live transaction
+// would fall 2^31 behind, so every live transaction is within 2^31 of that
+// frontier in either direction. The signed distance below is therefore exact
+// for every thumb the fence can read.
+//
+// That frontier is the statement's snapshot, not one taken wherever the
+// function is evaluated: Postgres takes a statement's snapshot before the
+// executor runs, so it is fixed before the view is read. A transaction
+// assigned after that point has an ID at or above the frontier, and the LEAST
+// with the frontier keeps the cutoff at or below it — no transaction of our
+// own is needed to hold that line.
+//
+// Nothing in the read path assigns a transaction ID, and nothing should. A
+// standalone ReadAll is a pure read: assigning an xid uses one up on every
+// poll, hastening the epoch rollover this widening exists to cross, writes a
+// commit WAL record for a read, and fails outright on a hot standby.
+//
+// Widening is a signed distance: the frontier minus the shortest signed
+// distance from the frontier's low 32 bits to the thumb is exact for any xid
+// within 2^31 of the frontier in either direction.
+//
+// pg_snapshot_xmax was rejected once, and the widening was why. It is the
+// latest completed transaction plus one, not the newest assigned one, so under
+// any write load the newest assigned transaction — still in flight — sits
+// above it. A widening that read a thumb above the reference's low half as the
+// previous epoch put that thumb a whole 2^32 low, and the cutoff with it: the
+// same stall as the epoch-less cast, at every epoch past 0. Read by signed
+// distance the thumb stays just above the frontier, and the LEAST keeps the
+// cutoff at the frontier and no lower.
+//
+// Measuring before the read's snapshot is what makes the cutoff sound. A
+// transaction that is in flight when the read takes its snapshot either was
+// in flight when the fence read the view, and is in the measured set with
+// its widened true value, or was assigned its transaction ID after the
+// fence's snapshot, and so is at or above the frontier the cutoff is capped
+// by. Measuring inside the read would be unsound: its snapshot is taken
+// before its own subqueries read pg_stat_activity, so a transaction that
+// commits in between is neither visible to the snapshot nor counted in the
+// in-flight set.
+//
+// The read's snapshot has to be taken after the fence statement's. Under
+// READ COMMITTED every statement gets its own, so the batch below holds:
+// readAll's statements share one implicit transaction — pgx ends the batch
+// with a single Sync — which runs at the server's default transaction
+// isolation, READ COMMITTED unless the server says otherwise. Under
+// REPEATABLE READ a transaction reuses the snapshot its first statement
+// took, and the first statement of CatchUp's transaction — its checkpoint
+// read — predates the fence, so a transaction that commits after the fence
+// but before the read would be invisible to the read while its cursor
+// position has already been passed. CatchUp's transactions are therefore
+// begun READ COMMITTED; a caller of the internal readAll that opens its own
+// transaction must do the same.
 //
 // The fence must also be the first read of pg_stat_activity in its
 // transaction: that view is cached for the transaction's lifetime, so a
@@ -554,35 +713,91 @@ func (s *Store) ReadStream(ctx context.Context, stream Stream, afterSeq int64) (
 // transaction that started since, skipping its entries. CatchUp opens one
 // transaction per batch to keep this true.
 //
-// A prepared transaction has no backend in pg_stat_activity, so pg_prepared_xacts
-// supplies it. The two minima are combined with LEAST, not COALESCE: an older
-// prepared transaction must bound the fence even while a newer ordinary one is
-// open, or its later commit would land behind a cursor that already passed it.
+// backend_xid is visible to every role on the servers this runs against:
+// PostgreSQL 17 made it unconditional, so a deployment with several writer
+// roles does not lose the guard and nothing here needs a fallback for a
+// privilege gap. (Verified against 17.11, as an unprivileged role watching a
+// transaction held open in another session.) On older servers the column is
+// hidden without pg_read_all_stats; such a deployment needs that privilege.
 //
-// pg_stat_activity.backend_xid is visible to every role in PostgreSQL 17, so a
-// deployment with several writer roles does not lose the guard. If a session
-// in this database holds a transaction but its backend_xid is hidden, the
-// reader lacks the privilege to see it; rather than silently drop that
-// transaction from the fence, fall back to the cluster-wide pg_snapshot_xmin,
-// which is conservative but sound.
-const logFence = `SELECT set_config('cairn.fence', (
-  CASE WHEN EXISTS (
-    SELECT 1 FROM pg_locks l
-    JOIN pg_stat_activity a ON a.pid = l.pid
-    WHERE l.locktype = 'transactionid' AND l.mode = 'ExclusiveLock' AND l.granted
-      AND a.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
-      AND a.backend_xid IS NULL
-  ) THEN pg_snapshot_xmin(pg_current_snapshot())
-  ELSE LEAST(
-    COALESCE((SELECT min(backend_xid::text::xid8) FROM pg_stat_activity
-              WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())),
-             '18446744073709551615'::xid8),
-    COALESCE((SELECT min(transaction::text::xid8) FROM pg_prepared_xacts
-              WHERE database = current_database()),
-             '18446744073709551615'::xid8),
-    pg_snapshot_xmax(pg_current_snapshot())
-  )
-  END)::text, true)`
+// One blind spot the widening cannot treat differently from the exact case:
+// a 32-bit xid carries no epoch, so nothing can say how many wraps an older
+// one is past. The signed distance is exact within 2^31 of the frontier in
+// either direction, which covers every live transaction — Postgres refuses
+// new xids before a running one can fall that far behind — but not a prepared
+// one. A prepared transaction still open after the cluster has consumed
+// another 2^31 xids widens above the frontier instead of below it, and a
+// reader could pass its commit. pg_prepared_xacts is meant to be emptied
+// out — a prepared transaction is committed or rolled back in ordinary
+// operation, and cairn's own tests roll theirs back — so the fence assumes
+// nothing is still there across a wrap.
+//
+// Postgres's mod() takes the dividend's sign, so 2^32 is added before the mod
+// below to keep the argument non-negative: the frontier's low half less a
+// thumb just under 2^32 is still negative after 2^31 is added.
+const widenedXid = `(ref.xmax - (
+      ((ref.xmax % 4294967296::numeric) - x.thumb + 2147483648::numeric
+       + 4294967296::numeric) % 4294967296::numeric
+      - 2147483648::numeric))::text::xid8`
+
+const fenceRef = `
+    (SELECT pg_snapshot_xmax(pg_current_snapshot())::text::numeric AS xmax)`
+
+const logFence = `SELECT set_config('cairn.fence', LEAST(COALESCE((
+  SELECT min(` + widenedXid + `)
+  FROM (SELECT backend_xid::text::numeric AS thumb FROM pg_stat_activity
+        WHERE datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        UNION ALL
+        SELECT transaction::text::numeric FROM pg_prepared_xacts
+        WHERE database = current_database()) AS x(thumb)
+  CROSS JOIN ` + fenceRef + ` AS ref
+), '18446744073709551615'::xid8), pg_snapshot_xmax(pg_current_snapshot()))::text, true)`
+
+// readAllSQL builds the read of the global log after a cursor. With kinds, it
+// reads each kind's own range of entries_kind_log and merges the results: one
+// statement with a kind list cannot use (kind, txid, position) in log order
+// for more than one kind, so the planner falls back to walking entries_log and
+// filtering by kind. A reader for a kind that is rare in the log would then
+// scan every entry the fence lets it see, on every poll. Each branch is capped
+// at limit entries because the union's first limit are drawn from the kinds'
+// own first limit: an entry in the answer has at most limit-1 entries ahead of
+// it in the log, all of them ahead of it in its kind too.
+func readAllSQL(after Cursor, limit int, kinds []string) (string, []any) {
+	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
+	if len(kinds) == 0 {
+		return `SELECT ` + entryColumns + ` FROM cairn.entries
+WHERE (txid, position) > ($1::text::xid8, $2)
+  AND txid < current_setting('cairn.fence')::xid8` +
+			fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit), args
+	}
+	// kind = ANY treats a repeated kind as a set; a branch per kind would read
+	// and return its entries twice.
+	seen := make(map[string]struct{}, len(kinds))
+	unique := kinds[:0:0]
+	for _, kind := range kinds {
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		unique = append(unique, kind)
+	}
+	kinds = unique
+	branches := make([]string, len(kinds))
+	for i, kind := range kinds {
+		args = append(args, kind)
+		branches[i] = fmt.Sprintf(`(SELECT `+entryColumns+`, txid
+FROM cairn.entries
+WHERE (txid, position) > ($1::text::xid8, $2)
+  AND txid < current_setting('cairn.fence')::xid8
+  AND kind = $%d
+ORDER BY txid, position
+LIMIT %d)`, i+3, limit)
+	}
+	return `SELECT ` + entryColumns + `
+FROM (` + strings.Join(branches, "\nUNION ALL\n") + `) AS log
+ORDER BY txid, position
+LIMIT ` + strconv.Itoa(limit), args
+}
 
 func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []string) ([]Entry, error) {
 	for _, kind := range kinds {
@@ -590,22 +805,17 @@ func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []st
 			return nil, err
 		}
 	}
-	sql := `SELECT ` + entryColumns + ` FROM cairn.entries
-WHERE (txid, position) > ($1::text::xid8, $2)
-  AND txid < current_setting('cairn.fence')::xid8`
-	args := []any{strconv.FormatUint(after.TxID, 10), after.Position}
-	if len(kinds) > 0 {
-		sql += ` AND kind = ANY($3)`
-		args = append(args, kinds)
-	}
 	if limit <= 0 {
 		limit = 100
 	}
-	sql += fmt.Sprintf(` ORDER BY txid, position LIMIT %d`, limit)
+	sql, args := readAllSQL(after, limit, kinds)
 
 	// The fence and the read go out together, in one round trip, so CatchUp
-	// stays within its budget. pgx runs a batch in an implicit transaction, so
-	// the read sees the setting the fence statement made.
+	// stays within its budget. pgx runs a batch in an implicit transaction and
+	// ends it with a single Sync, so both statements share it and run in order:
+	// the fence measures the cutoff, and the read sees the setting it made.
+	// Neither statement takes a transaction ID; see logFence for why the read
+	// path must not.
 	var b pgx.Batch
 	b.Queue(logFence)
 	b.Queue(sql, args...)

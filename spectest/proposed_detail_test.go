@@ -23,8 +23,8 @@ func TestProposedViolationKeepsAnEmptyDetail(t *testing.T) {
 		return spec.Fail("counter is %d", n)
 	}}}
 	var violations []spectest.Violation
-	if msg, failed := spectest.Fails(t, func(t rapid.TB) { violations = m.CheckReport(t) }); failed {
-		t.Fatalf("a proposed rule must not fail the check: %s", msg)
+	if msg, failed, err := spectest.Fails(t, func(t rapid.TB) { violations = m.CheckReport(t) }); err != nil || failed {
+		t.Fatalf("a proposed rule must not fail the check: err=%v %s", err, msg)
 	}
 	if len(violations) != 1 || violations[0].Rule.ID != rule.ID {
 		t.Fatalf("want one violation of %s, got %+v", rule.ID, violations)

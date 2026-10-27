@@ -191,6 +191,69 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	}
 }
 
+// A registration reached through a generic helper writes the helper's type
+// parameter, whose JSON shape is its constraint ("=: any"), so every
+// instantiation of the helper looked alike and -base missed a wire change to the
+// type the caller supplies. The extractor states what is stored or refuses, so
+// the parameter must be an error rather than a recorded shape.
+func TestExtractRefusesGenericRegistrations(t *testing.T) {
+	_, err := Extract("testdata/genericregister", "./...")
+	if err == nil {
+		t.Fatal("a registration through a type parameter must be refused, not recorded as its constraint")
+	}
+	for _, want := range []string{
+		"genericregister.go:18: codec.Register[V]: V is a type parameter, so the stored shape comes from the caller's type argument, not V",
+		"genericregister.go:22: codec.Register[example.com/genericregister.Event]: T is a type parameter, so the codec a stored entry names comes from the caller's type argument, not T",
+		"genericregister.go:26: Upcast: T is a type parameter, so the codec this upcaster belongs to comes from the caller's type argument, not T",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in:\n%v", want, err)
+		}
+	}
+	if n := strings.Count(err.Error(), "\n") + 1; n != 3 {
+		t.Errorf("got %d errors, want 3:\n%v", n, err)
+	}
+}
+
+// Generics that do not choose what is stored are ordinary code: the module must
+// load, and a concrete registration records its shape as before.
+func TestExtractReadsAModuleThatUsesGenericsElsewhere(t *testing.T) {
+	m, err := Extract("testdata/genericok", "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: %+v", m.Codecs)
+	}
+	c := m.Codecs[0]
+	if c.Sum != "example.com/genericok.Msg" || c.Type != "example.com/genericok.Event" || !slices.Equal(c.Fields, []string{"v: int"}) {
+		t.Errorf("codec: %+v", c)
+	}
+}
+
+// A module whose packages go list refuses to load. It is the state a module is
+// in right after someone adds an import and before `go mod tidy`, and x/tools
+// reports it as zero packages and a nil error -- which reads as a module that
+// declares nothing, so the tool wrote an empty manifest and exited 0. The
+// fixture declares a table and a rule, so an empty manifest says the load read
+// nothing rather than that the module has nothing to say.
+func TestExtractRefusesALoadThatReadNothing(t *testing.T) {
+	_, err := Extract("testdata/unloadable", "./...")
+	if err == nil {
+		t.Fatal("a load that read no packages must be an error, not an empty manifest")
+	}
+	if !strings.Contains(err.Error(), "updates to go.mod needed") {
+		t.Errorf("the loader's own message must be reported, got: %v", err)
+	}
+
+	// go list succeeds here and reports no packages, so there is no loader
+	// message to pass on; the tool still must not call the module empty.
+	_, err = Extract("testdata/nopackages", "./...")
+	if err == nil || !strings.Contains(err.Error(), "no packages match ./...") {
+		t.Errorf("a module with no packages must be an error, got: %v", err)
+	}
+}
+
 // A rule whose literal names an alias of spec.Rule is legal Go. It must be
 // read like any other rule rather than crashing the extractor on a type
 // assertion that assumes the literal's type is a *types.Named.
@@ -269,12 +332,60 @@ func TestRunChecksTheBase(t *testing.T) {
 	}
 }
 
+// A base that passes is not a reason to skip the write: -o still regenerates
+// the manifest it names. Here -o and -base are the same file, the natural
+// local invocation, and a compatible base leaves the regenerated manifest in
+// place.
+func TestRunWritesTheManifestWhenTheBasePasses(t *testing.T) {
+	dir := copyGoodFixture(t)
+	m, err := Extract(dir, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := encode(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(dir, "spec.manifest.yaml")
+	if err := os.WriteFile(manifest, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run(dir, "spec.manifest.yaml", manifest, []string{"./..."}); err != nil {
+		t.Fatalf("an unchanged base must pass: %v", err)
+	}
+	wrote, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("a passing run must still write the manifest: %v", err)
+	}
+	if string(wrote) != string(data) {
+		t.Error("the written manifest is not the one this run generated")
+	}
+}
+
+// A platform's own file must not read as a removal: the base was written by a
+// host that built a different set of files, and the tree is correct on both.
+func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
+	dir := constrainedModule(t)
+
+	t.Setenv("GOOS", "linux")
+	if err := run(dir, "linux.yaml", "", []string{"./..."}); err != nil {
+		t.Fatalf("writing the base on linux: %v", err)
+	}
+
+	t.Setenv("GOOS", "darwin")
+	if err := run(dir, "darwin.yaml", filepath.Join(dir, "linux.yaml"), []string{"./..."}); err != nil {
+		t.Fatalf("the manifest generated on darwin reports the base's stored types as broken: %v", err)
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}
 	}
 	v1 := []string{"a: string"}
 	v2 := []string{"a: string", "b: int"}
+	one := func(fields ...string) []Codec { return []Codec{codec(1, fields)} }
 	for _, tc := range []struct {
 		name     string
 		old, now []Codec
@@ -291,6 +402,25 @@ func TestIncompatible(t *testing.T) {
 		{"fields reordered", []Codec{codec(1, []string{"a: string", "b: int"})}, []Codec{codec(1, []string{"b: int", "a: string"})}, ""},
 		{"upcaster dropped", []Codec{codec(2, v2, 1)}, []Codec{codec(2, v2)}, "no upcaster from version 1"},
 		{"older upcaster dropped on a bump", []Codec{codec(2, v2, 1)}, []Codec{codec(3, v2, 2)}, "no upcaster from version 1"},
+
+		// A nested struct is one string in its parent's field, so its field
+		// order must be ignored the way the outer order already is.
+		{"nested fields reordered", one("o: {a: string, b: int}"), one("o: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a pointer", one("o: *{a: string, b: int}"), one("o: *{b: int, a: string}"), ""},
+		{"nested fields reordered in a slice element", one("o: []{a: string, b: int}"), one("o: []{b: int, a: string}"), ""},
+		{"nested fields reordered in a map value", one("o: map[string]{a: string, b: int}"), one("o: map[string]{b: int, a: string}"), ""},
+		{"nested fields reordered inside an anonymous struct", one("o: []{i: {a: string, b: int}, j: int}"), one("o: []{i: {b: int, a: string}, j: int}"), ""},
+		// The comma in a function signature does not separate fields.
+		{"nested fields reordered beside a function signature", one("o: {f: func(int, string) error, a: string}"), one("o: {a: string, f: func(int, string) error}"), ""},
+
+		// A real change below the top level is still a wire change.
+		{"nested field renamed", one("o: {a: string, b: int}"), one("o: {a: string, c: int}"), "changed shape without a version bump"},
+		{"nested field retyped", one("o: {a: string, b: int}"), one("o: {a: string, b: string}"), "changed shape without a version bump"},
+		{"nested field added", one("o: {a: string}"), one("o: {a: string, b: int}"), "changed shape without a version bump"},
+		{"nested field removed", one("o: {a: string, b: int}"), one("o: {a: string}"), "changed shape without a version bump"},
+		{"nested omitempty added", one("o: {a: string}"), one("o: {a?: string}"), "changed shape without a version bump"},
+		{"nested string option added", one("o: {a: int}"), one("o: {a: string(int)}"), "changed shape without a version bump"},
+		{"nested reorder hides a rename", one("o: {a: string, b: int}"), one("o: {b: int, c: string}"), "changed shape without a version bump"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := strings.Join(Incompatible(&Manifest{Codecs: tc.old}, &Manifest{Codecs: tc.now}), "\n")

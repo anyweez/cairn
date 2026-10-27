@@ -249,12 +249,21 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   snapshot and its views commit together, or none of them do. Messages that
   arrive together for one stream may share a transaction; each caller returns
   once its own message has committed.
+- **Effects are delivered at least once, in no guaranteed order.** An effect
+  is queued in the transaction that records it and carried out by a
+  dispatcher, which claims it with a lease and retries a failure. A handler
+  must be idempotent and must not depend on delivery order; `Delivery.Key()`
+  names an effect across retries. See [docs/EFFECTS.md](docs/EFFECTS.md).
 - **Snapshots are a fold, and the version names it.** A snapshot holds the
   state `Evolve` produced at a seq, and it is reused only under the
   `StateVersion` that took it. That version must change when `Evolve` changes
   how it folds events, not only when the state type changes: otherwise a
   stream that has a snapshot keeps the old fold, while a stream rebuilt from
-  the same events gets the new one.
+  the same events gets the new one. A snapshot is stored as the bytes
+  `json.Marshal` wrote, so a load returns exactly the state that was
+  snapshotted; a state that could not be read back unchanged — text
+  `json.Marshal` would rewrite, or a NUL — is refused with a cairn error when
+  the snapshot is due, rather than stored as something else.
 - **Read your own writes.** An aggregate's `Views` are written from the
   stream's new state inside that transaction, so a caller that writes and then
   reads a view table sees its write. A view replaces a stream's rows from its
@@ -296,13 +305,16 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
 - **Safe retries.** `IdempotencyKey` returns the first answer, refusals
   included. A stored result is decoded through the `Results` codec's
   upcasters, so a retry gets the current shape; a field added since it was
-  recorded comes back as its zero value unless the upcaster fills it in.
+  recorded comes back as its zero value unless the upcaster fills it in. A
+  request that names an actor or a stream the ledger would refuse is refused
+  rather than answered: a key never stands in for an identity check.
 - **Told when a message was recorded.** Every statement in a write batch runs
   before the caller reads any result, so a handler can fail in Go — a scan or
-  a parse — after the transaction has committed. That error wraps
-  `ErrRecorded`, which says the message is in the ledger even though the
-  caller cannot be given its result. A caller must not replay it unless it
-  carries an idempotency key.
+  a parse — after the transaction has committed. And even when every result is
+  read, closing the batch on a lost connection fails after the commit has
+  happened. Either error wraps `ErrRecorded`, which says the message is in the
+  ledger even though the caller cannot be given its result. A caller must not
+  replay it unless it carries an idempotency key.
 - **Replay verification.** `Aggregate.Verify` re-decides every stored message
   with today's code and reports each divergence. State between messages comes
   from the stored events, so one divergence doesn't cascade. A stored result
@@ -358,9 +370,21 @@ is declared, whether or not a test uses it. It reads:
 - **Codecs:** `codec.Register` and `Upcast` calls outside test files, since
   only production code writes to the ledger.
 
+A file the build context leaves out — one whose `//go:build` line or name ties
+it to another platform, or one that needs a tag such as `tools` — is read in a
+build that includes it. A tree therefore produces the same manifest on every
+host, so the committed file is current everywhere and `-base` never reads a
+type that one platform stores and another does not as removed. A file no build
+includes is an error naming the file and its constraint.
+
 Each of these must be stated with constants. A rule, table or registration
-the tool can't read exactly is an error, not a guess. Declare a fixture
-rule inside a function to keep it out of the manifest.
+the tool can't read exactly is an error, not a guess. So is a registration
+inside a generic helper: its type argument is the helper's parameter, not the
+type the caller supplies, so the tool refuses it — register the concrete type
+where the helper is instantiated. And so is a module it can't load at all — a
+`go.mod` that needs tidying, say: the tool fails with go's own message rather
+than writing a manifest that says the module declares nothing. Declare a
+fixture rule inside a function to keep it out of the manifest.
 
 Reading codecs from source can still be fooled: an `Upcast` inside a helper
 that never runs looks like an upcaster, and a `Register` taken as a function
@@ -398,8 +422,11 @@ export CAIRN_TEST_DATABASE_URL=$(scripts/test-postgres.sh)
 go test ./...
 ```
 
-Without the database URL, ledger tests are skipped. In CI, set
-`CAIRN_REQUIRE_DATABASE=1` as well, so they fail instead of skipping.
+Without the database URL, ledger tests are skipped. Set
+`CAIRN_REQUIRE_DATABASE=1` as well to make a missing database fail instead of
+skip. It also makes the prepared-transaction test fail when the server has
+`max_prepared_transactions=0`, because the gate must not pass without
+exercising that fence; `scripts/test-postgres.sh` sets it above 0.
 
 The manifest tool is its own module, so the library doesn't depend on
 `golang.org/x/tools`. Its tests also check that the committed manifest is

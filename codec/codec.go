@@ -15,6 +15,12 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/anyweez/cairn"
 )
@@ -104,28 +110,41 @@ func (c *Codec[T]) Encode(v T) (Envelope, error) {
 	return Envelope{Type: e.name, Version: e.version, Data: data}, nil
 }
 
-// NotStorableError names the field of a value that carries text the ledger
-// cannot store. It is returned by Encode and reported by CheckStorable.
+// NotStorableError names the field of a value the ledger cannot store: text
+// jsonb would rewrite or reject, or a time its JSON encoding cannot carry as
+// the same instant. It is returned by Encode and reported by CheckStorable.
 type NotStorableError struct {
 	Path string
+	// Why says what makes the value unstorable, for a value refused for
+	// something other than its text. Empty for the text case.
+	Why string
 }
 
 func (e *NotStorableError) Error() string {
+	if e.Why != "" {
+		return fmt.Sprintf("%s cannot be stored: %s", e.Path, e.Why)
+	}
 	return fmt.Sprintf("%s is not valid UTF-8 or contains a NUL, so it cannot be stored", e.Path)
 }
 
-// CheckStorable reports whether every string in v can be stored in the ledger
+// CheckStorable reports whether every value in v can be stored in the ledger
 // and read back unchanged. json.Marshal replaces a string that is not valid
 // UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
-// would silently store text the caller never wrote.
+// would silently store text the caller never wrote. A time.Time is checked
+// through its JSON encoding, because json.Marshal reports a year it cannot
+// write only at encode time and rounds a zone offset with seconds in it to
+// the minute without reporting anything, storing an instant that was never
+// sent.
 //
-// It walks the same values json.Marshal does. A type with its own MarshalJSON
-// decides its own encoding and is not inspected, because those bytes are the
-// JSON. A type with its own MarshalText does not: json writes the text through
-// its own string encoder, so the bytes it returns are checked like any other
-// string. A MarshalText or MarshalJSON on the pointer to the value counts too
-// wherever json reaches the value addressably, which is a slice or array
-// element, or a field of a struct behind a pointer.
+// It walks the same values json.Marshal does. A type with its own MarshalText
+// is checked through the text it returns, because json writes it through its
+// own string encoder rather than verbatim. A type with its own MarshalJSON
+// decides its own encoding, so the Go value behind it is not inspected; the
+// bytes it returns are, because json.Marshal copies them into the entry and
+// jsonb's alphabet is narrower than JSON's. A MarshalText or MarshalJSON on
+// the pointer to the value counts too wherever json reaches the value
+// addressably, which is a slice or array element, or a field of a struct
+// behind a pointer.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
@@ -153,6 +172,21 @@ func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
 	return k, true
 }
 
+// jsonNil reports whether json.Marshal renders v as null and so never calls
+// MarshalJSON or MarshalText on it: a nil pointer, or a nil interface, or an
+// interface whose dynamic value is a nil pointer. The dynamic value is what
+// has to be tested — a Value of kind Interface is never of kind Pointer, even
+// when it holds one.
+func jsonNil(v reflect.Value) bool {
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return true
+		}
+		v = v.Elem()
+	}
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
 func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	if !v.IsValid() {
 		return nil
@@ -160,13 +194,13 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	// json.Marshal uses a pointer-receiver MarshalJSON or MarshalText whenever
 	// the value is addressable — a slice or array element, or a struct behind a
 	// pointer — and prefers it to a value-receiver method, so it is checked
-	// first. A json.Marshaler decides its own bytes and is opaque; a
-	// TextMarshaler's bytes go through json's string encoder, so they are
-	// checked like any other string.
+	// first. A json.Marshaler decides its own bytes, but jsonb decides whether
+	// it can keep them; a TextMarshaler's bytes go through json's string
+	// encoder, so they are checked like any other string.
 	if v.CanAddr() && v.Kind() != reflect.Pointer && v.Addr().CanInterface() {
 		addr := v.Addr()
 		if _, ok := addr.Interface().(json.Marshaler); ok {
-			return nil
+			return checkStorableMarshaler(addr, path)
 		}
 		if _, ok := addr.Interface().(encoding.TextMarshaler); ok {
 			_, err := renderStorableText(addr, path)
@@ -175,12 +209,12 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	}
 	if v.CanInterface() {
 		if _, ok := v.Interface().(json.Marshaler); ok {
-			return nil
+			return checkStorableMarshaler(v, path)
 		}
 		if _, ok := v.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer as null and never calls
-			// MarshalText.
-			if v.Kind() == reflect.Pointer && v.IsNil() {
+			// MarshalText — including a nil pointer held behind an interface.
+			if jsonNil(v) {
 				return nil
 			}
 			_, err := renderStorableText(v, path)
@@ -208,18 +242,14 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 		defer delete(seen, k)
 		return checkStorable(v.Elem(), path, seen)
 	case reflect.Struct:
-		t := v.Type()
-		for i := 0; i < v.NumField(); i++ {
-			f := t.Field(i)
-			// json.Marshal skips an unexported field, but not an unexported
-			// embedded struct's exported fields.
-			if f.PkgPath != "" && !f.Anonymous {
+		for _, f := range storableFields(v.Type()) {
+			fv, err := v.FieldByIndexErr(f.index)
+			if err != nil {
+				// An embedded pointer on the path is nil, so json writes no
+				// field beyond it.
 				continue
 			}
-			if f.Tag.Get("json") == "-" {
-				continue
-			}
-			if err := checkStorable(v.Field(i), path+"."+f.Name, seen); err != nil {
+			if err := checkStorable(fv, path+"."+f.path, seen); err != nil {
 				return err
 			}
 		}
@@ -266,6 +296,185 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	return nil
 }
 
+// storableField is a field encoding/json writes for a struct type: the index
+// path to it and the Go field names along that path, for an error message.
+type storableField struct {
+	index []int
+	path  string
+}
+
+// storableFieldsCache holds the resolved fields of a struct type. The set
+// depends only on the type, and Encode walks it for every entry.
+var storableFieldsCache sync.Map // reflect.Type -> []storableField
+
+// storableFields returns the fields encoding/json actually writes for a struct
+// type, after resolving field-name dominance the way encoding/json does: a
+// name reachable through more than one field keeps only its shallowest field,
+// a tagged field beats an untagged one at the same depth, and any remaining
+// tie drops the name. A field json drops is never stored, so its text is not a
+// reason to refuse the value.
+func storableFields(t reflect.Type) []storableField {
+	if cached, ok := storableFieldsCache.Load(t); ok {
+		return cached.([]storableField)
+	}
+	fields := computeStorableFields(t)
+	storableFieldsCache.Store(t, fields)
+	return fields
+}
+
+// fieldCandidate is one field encoding/json may write, before name dominance
+// removes the ones it drops.
+type fieldCandidate struct {
+	name   string // the JSON key
+	index  []int  // path from the root struct
+	tagged bool   // its JSON tag named it, which breaks a depth tie
+	path   string // its Go field names, for an error message
+}
+
+func computeStorableFields(t reflect.Type) []storableField {
+	type queued struct {
+		typ   reflect.Type
+		index []int
+		path  string
+	}
+
+	current := []queued{}
+	next := []queued{{typ: t}}
+	// count is how many times a type was queued at the current depth. A type
+	// reachable twice contributes its fields twice, which is what makes the
+	// dominance pass drop an ambiguous name rather than pick one.
+	var count, nextCount map[reflect.Type]int
+	visited := map[reflect.Type]bool{}
+	var cands []fieldCandidate
+
+	for len(next) > 0 {
+		current, next = next, current[:0]
+		count, nextCount = nextCount, map[reflect.Type]int{}
+		for _, q := range current {
+			if visited[q.typ] {
+				continue
+			}
+			visited[q.typ] = true
+			for i := 0; i < q.typ.NumField(); i++ {
+				f := q.typ.Field(i)
+				if f.Anonymous {
+					ft := f.Type
+					if ft.Kind() == reflect.Pointer {
+						ft = ft.Elem()
+					}
+					// json.Marshal skips an unexported embedded non-struct, but
+					// keeps an unexported embedded struct for its exported fields.
+					if f.PkgPath != "" && ft.Kind() != reflect.Struct {
+						continue
+					}
+				} else if f.PkgPath != "" {
+					continue
+				}
+				tag := f.Tag.Get("json")
+				if tag == "-" {
+					continue
+				}
+				name, _, _ := strings.Cut(tag, ",")
+				if !validJSONTag(name) {
+					// json discards an invalid tag name and falls back to the Go
+					// field name, so the field is untagged for dominance too.
+					name = ""
+				}
+				tagged := name != ""
+
+				index := make([]int, len(q.index)+1)
+				copy(index, q.index)
+				index[len(q.index)] = i
+				fieldPath := f.Name
+				if q.path != "" {
+					fieldPath = q.path + "." + f.Name
+				}
+
+				ft := f.Type
+				if ft.Name() == "" && ft.Kind() == reflect.Pointer {
+					// json follows an unnamed pointer to an embedded struct.
+					ft = ft.Elem()
+				}
+				if name != "" || !f.Anonymous || ft.Kind() != reflect.Struct {
+					if name == "" {
+						name = f.Name
+					}
+					c := fieldCandidate{name: name, index: index, tagged: tagged, path: fieldPath}
+					cands = append(cands, c)
+					if count[q.typ] > 1 {
+						cands = append(cands, c)
+					}
+					continue
+				}
+
+				nextCount[ft]++
+				if nextCount[ft] == 1 {
+					next = append(next, queued{typ: ft, index: index, path: fieldPath})
+				}
+			}
+		}
+	}
+
+	slices.SortFunc(cands, func(a, b fieldCandidate) int {
+		if c := strings.Compare(a.name, b.name); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(len(a.index), len(b.index)); c != 0 {
+			return c
+		}
+		if a.tagged != b.tagged {
+			if a.tagged {
+				return -1
+			}
+			return 1
+		}
+		return slices.Compare(a.index, b.index)
+	})
+
+	out := cands[:0]
+	for advance, i := 0, 0; i < len(cands); i += advance {
+		name := cands[i].name
+		for advance = 1; i+advance < len(cands) && cands[i+advance].name == name; advance++ {
+		}
+		if advance == 1 {
+			out = append(out, cands[i])
+			continue
+		}
+		// The first two are the shallowest. Still equal in depth and tag
+		// presence, the name is ambiguous and json writes none of them.
+		if len(cands[i].index) == len(cands[i+1].index) && cands[i].tagged == cands[i+1].tagged {
+			continue
+		}
+		out = append(out, cands[i])
+	}
+	cands = out
+
+	slices.SortFunc(cands, func(a, b fieldCandidate) int { return slices.Compare(a.index, b.index) })
+	fields := make([]storableField, len(cands))
+	for i, c := range cands {
+		fields[i] = storableField{index: c.index, path: c.path}
+	}
+	return fields
+}
+
+// validJSONTag reports whether s may name a JSON field, mirroring
+// encoding/json's isValidTag: letters, digits and a fixed set of punctuation.
+// A name containing a quote, a backslash or a control character is rejected.
+func validJSONTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+			// Backslash and quote are reserved; other punctuation is allowed.
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
+}
+
 // checkMapKey checks a map key the way json.Marshal will render it, and returns
 // the text that becomes the JSON object key.
 //
@@ -286,8 +495,9 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 	if k.CanInterface() {
 		if _, ok := k.Interface().(encoding.TextMarshaler); ok {
 			// json.Marshal renders a nil pointer key as the empty string and
-			// never calls its MarshalText.
-			if k.Kind() == reflect.Pointer && k.IsNil() {
+			// never calls its MarshalText — including a nil pointer held
+			// behind an interface.
+			if jsonNil(k) {
 				return "", nil
 			}
 			return renderStorableText(k, path)
@@ -296,6 +506,144 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 	// An integer key becomes its decimal form, which is always storable. The
 	// value is only a path for anything else, which json.Marshal will reject.
 	return k.String(), nil
+}
+
+var timeType = reflect.TypeFor[time.Time]()
+
+// offsetSecondsLayout is RFC 3339 with the zone offset in seconds. time's own
+// layouts carry an offset only to the minute, which would print the instant
+// that moves and the one it moves to as if they were the same.
+const offsetSecondsLayout = "2006-01-02T15:04:05.999999999-07:00:00"
+
+// checkStorableMarshaler calls v's MarshalJSON and checks the bytes jsonb will
+// be handed. A nil pointer is storable because json writes null and never
+// calls the method, and a marshaller that fails is left to Encode's own
+// json.Marshal, which reports that failure once. A time.Time is the exception:
+// its marshaller both fails on a value json cannot write and silently moves
+// one whose zone offset it rounds, so it is checked by the round trip.
+func checkStorableMarshaler(v reflect.Value, path string) error {
+	if jsonNil(v) {
+		return nil
+	}
+	if t, ok := asTime(v); ok {
+		return checkStorableTime(t, path)
+	}
+	data, err := v.Interface().(json.Marshaler).MarshalJSON()
+	if err != nil {
+		return nil
+	}
+	return checkMarshalledJSON(data, path)
+}
+
+// asTime returns the time.Time v holds, for a value, a pointer to one, or
+// either of those behind an interface — the walk reaches a time held in an
+// `any`, as in Meta.Extra, as the interface value itself.
+func asTime(v reflect.Value) (time.Time, bool) {
+	for v.Kind() == reflect.Interface && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Type() == timeType {
+		return v.Interface().(time.Time), true
+	}
+	if v.Kind() == reflect.Pointer && v.Type().Elem() == timeType {
+		return v.Elem().Interface().(time.Time), true
+	}
+	return time.Time{}, false
+}
+
+// checkStorableTime reports whether t is stored as the instant it is. A
+// time.Time encodes itself, so the walk reaches it here rather than as a
+// struct, and the check is the encoding/json round trip rather than a copy of
+// its rules: MarshalJSON refuses a year outside [0,9999] and a timezone hour
+// outside [0,23], and writes a zone offset only to the minute, so an offset
+// with seconds in it (every tzdata zone before about 1900) comes back as a
+// different instant with no error at all.
+func checkStorableTime(t time.Time, path string) error {
+	data, err := t.MarshalJSON()
+	if err != nil {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot write (%v)", err)}
+	}
+	var back time.Time
+	if err := json.Unmarshal(data, &back); err != nil {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot read back (%v)", err)}
+	}
+	if !back.Equal(t) {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf(
+			"it is %s, whose zone offset JSON writes only to the minute, so it would be stored as %s",
+			t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
+	}
+	return nil
+}
+
+// checkMarshalledJSON reports whether the JSON a MarshalJSON returned can be
+// stored in jsonb and read back unchanged. json.Marshal compacts those bytes
+// but does not sanitize them, so they reach the entry as they are: a string in
+// them that is not valid UTF-8 is rejected by jsonb as an invalid byte
+// sequence (SQLSTATE 22021), and a NUL or an unpaired UTF-16 surrogate escape
+// is rejected as an unsupported Unicode escape (SQLSTATE 22P05). The bytes are
+// the type's to decide, but what jsonb can keep is not.
+func checkMarshalledJSON(data []byte, path string) error {
+	if !utf8.Valid(data) {
+		return &NotStorableError{Path: path}
+	}
+	for i := 0; i < len(data); {
+		if data[i] != '\\' || i+1 >= len(data) {
+			i++
+			continue
+		}
+		if data[i+1] != 'u' {
+			// An escaped quote, backslash or control character.
+			i += 2
+			continue
+		}
+		u, ok := jsonHex4(data[i+2:])
+		if !ok {
+			// Not JSON at all: json.Marshal refuses it, so there is no entry
+			// to keep.
+			return nil
+		}
+		switch {
+		case u == 0, u >= 0xdc00 && u <= 0xdfff:
+			// A NUL, or a low surrogate with no high surrogate before it.
+			return &NotStorableError{Path: path}
+		case u >= 0xd800 && u <= 0xdbff:
+			// A high surrogate is storable only as half of a pair.
+			lo, paired := rune(0), false
+			if i+12 <= len(data) && data[i+6] == '\\' && data[i+7] == 'u' {
+				lo, paired = jsonHex4(data[i+8:])
+			}
+			if !paired || lo < 0xdc00 || lo > 0xdfff {
+				return &NotStorableError{Path: path}
+			}
+			i += 12
+			continue
+		}
+		i += 6
+	}
+	return nil
+}
+
+// jsonHex4 reads the four hex digits of a \u escape, reporting whether b holds
+// them.
+func jsonHex4(b []byte) (rune, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	var u rune
+	for _, c := range b[:4] {
+		switch {
+		case c >= '0' && c <= '9':
+			c -= '0'
+		case c >= 'a' && c <= 'f':
+			c = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			c = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		u = u<<4 | rune(c)
+	}
+	return u, true
 }
 
 // renderStorableText calls v's MarshalText and returns the text json.Marshal
@@ -470,25 +818,110 @@ func sortRegistrations(rs []Registration) {
 }
 
 // goTypeString renders a runtime type as go/types does for the manifest: a
-// named type with its full import path, a basic type by name.
+// named type with its full import path, a basic type by name, an unnamed type
+// in go/types' own spelling. reflect's Type.String is not that spelling — it
+// writes `interface {}` and `struct { X int }` where go/types writes `any` and
+// `struct{X int}` — so an unnamed composite is built here rather than borrowed
+// from it. `cmd/cairn-manifest` renders the other half with types.TypeString,
+// and a sum type the two name differently fails codec.CheckRegistrations in
+// both directions for one correct codec.
 func goTypeString(t reflect.Type) string {
+	// A defined type is named however its kind looks: `type Listing []string`
+	// is example.com/x.Listing to go/types, not []string. Ask for the name
+	// before expanding a composite, or the runtime half of the manifest
+	// cross-check names a different type than the static half.
+	if t.Name() != "" {
+		if t.PkgPath() == "" {
+			return t.Name()
+		}
+		return t.PkgPath() + "." + t.Name()
+	}
 	switch t.Kind() {
 	case reflect.Pointer:
 		return "*" + goTypeString(t.Elem())
 	case reflect.Slice:
 		return "[]" + goTypeString(t.Elem())
 	case reflect.Array:
-		return fmt.Sprintf("[%d]%s", t.Len(), goTypeString(t.Elem()))
+		return "[" + strconv.Itoa(t.Len()) + "]" + goTypeString(t.Elem())
 	case reflect.Map:
 		return "map[" + goTypeString(t.Key()) + "]" + goTypeString(t.Elem())
+	case reflect.Chan:
+		switch t.ChanDir() {
+		case reflect.RecvDir:
+			return "<-chan " + goTypeString(t.Elem())
+		case reflect.SendDir:
+			return "chan<- " + goTypeString(t.Elem())
+		}
+		return "chan " + goTypeString(t.Elem())
+	case reflect.Func:
+		return goFuncString(t)
+	case reflect.Struct:
+		return goStructString(t)
+	case reflect.Interface:
+		return goInterfaceString(t)
 	}
-	if t.Name() == "" {
-		return t.String()
+	return t.String()
+}
+
+// goInterfaceString writes an interface as `any` or `interface{M() int}`.
+// go/types spells the empty interface `any`, and the extractor unaliases a sum
+// written that way to it, so the empty interface is `any` here. reflect has one
+// type for `any` and a written `interface{}` and cannot tell them apart, so a
+// sum spelled `interface{}` still names differently in the two halves.
+func goInterfaceString(t reflect.Type) string {
+	if t.NumMethod() == 0 {
+		return "any"
 	}
-	if t.PkgPath() == "" {
-		return t.Name()
+	methods := make([]string, 0, t.NumMethod())
+	for i := range t.NumMethod() {
+		m := t.Method(i)
+		methods = append(methods, m.Name+strings.TrimPrefix(goFuncString(m.Type), "func"))
 	}
-	return t.PkgPath() + "." + t.Name()
+	return "interface{" + strings.Join(methods, "; ") + "}"
+}
+
+// goStructString writes a struct as `struct{X int; Y string}`, the field name
+// omitted for an embedded field and the tag quoted as go/types quotes it.
+func goStructString(t reflect.Type) string {
+	fields := make([]string, 0, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		field := goTypeString(f.Type)
+		if !f.Anonymous {
+			field = f.Name + " " + field
+		}
+		if f.Tag != "" {
+			field += " " + strconv.Quote(string(f.Tag))
+		}
+		fields = append(fields, field)
+	}
+	return "struct{" + strings.Join(fields, "; ") + "}"
+}
+
+// goFuncString writes a signature as `func(int, ...string) (int, error)`.
+func goFuncString(t reflect.Type) string {
+	params := make([]string, 0, t.NumIn())
+	for i := range t.NumIn() {
+		in := t.In(i)
+		if t.IsVariadic() && i == t.NumIn()-1 {
+			in = in.Elem()
+			params = append(params, "..."+goTypeString(in))
+			continue
+		}
+		params = append(params, goTypeString(in))
+	}
+	s := "func(" + strings.Join(params, ", ") + ")"
+	switch t.NumOut() {
+	case 0:
+		return s
+	case 1:
+		return s + " " + goTypeString(t.Out(0))
+	}
+	results := make([]string, 0, t.NumOut())
+	for i := range t.NumOut() {
+		results = append(results, goTypeString(t.Out(i)))
+	}
+	return s + " (" + strings.Join(results, ", ") + ")"
 }
 
 // Registrations returns the registrations of all four codecs, sorted.

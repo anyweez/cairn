@@ -1,6 +1,7 @@
 package ledger_test
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -51,6 +52,12 @@ func TestAnOlderPreparedTransactionIsNotSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 	if maxPrepared == 0 {
+		// The gate sets CAIRN_REQUIRE_DATABASE=1, so a server that cannot
+		// prepare transactions must fail the gate rather than let it report
+		// success without exercising the fence this test proves.
+		if os.Getenv("CAIRN_REQUIRE_DATABASE") != "" {
+			t.Fatalf("max_prepared_transactions is 0, so PREPARE TRANSACTION is disabled; set it above 0 (scripts/test-postgres.sh does) or run without CAIRN_REQUIRE_DATABASE")
+		}
 		t.Skip("max_prepared_transactions is 0, so PREPARE TRANSACTION is disabled")
 	}
 

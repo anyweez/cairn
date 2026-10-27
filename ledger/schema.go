@@ -192,6 +192,26 @@ BEGIN
     END IF;
 END $$;
 `}},
+
+	// 2: a snapshot keeps the bytes json.Marshal wrote. jsonb parses a state and
+	// re-serialises it, reordering object keys, reformatting numbers and
+	// normalising whitespace, so a state loaded from a snapshot could differ
+	// from the one that was stored. json stores the text as written and returns
+	// it unchanged; every reader and writer of this column already treats it as
+	// text, so a process on an earlier release keeps working across the change
+	// and after a rollback.
+	{Statements: []string{`
+ALTER TABLE cairn.state_snapshots ALTER COLUMN state TYPE json USING state::json`}},
+
+	// 3: the outbox is a queue and no longer keeps delivered effects: a
+	// dispatcher deletes an effect's row as it records the delivery, so the
+	// table holds only work outstanding or failed rather than every effect ever
+	// delivered. This clears what earlier releases left behind, which nothing
+	// reads once a row is done. Rows marked failed stay: an operator clears
+	// those. A dispatcher still treats a done row as finished, because a
+	// rolling deploy runs older and newer releases side by side.
+	{Statements: []string{`
+DELETE FROM cairn.outbox WHERE done_at IS NOT NULL`}},
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every

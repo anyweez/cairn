@@ -53,7 +53,7 @@ func noteMachine() spectest.Machine[int, noteMsg, int, int, struct{}] {
 // must not fail it: D6 only means something for a message that is recorded,
 // and an unstorable message is not.
 func TestRefusedUnstorableMessagePassesD6(t *testing.T) {
-	if msg, failed := spectest.Fails(t, noteMachine().Check); failed {
+	if msg, failed, err := spectest.Fails(t, noteMachine().Check); err != nil || failed {
 		if strings.Contains(msg, spectest.Encodable.ID) {
 			t.Fatalf("a correct machine that refuses an unstorable message was failed by %s:\n%s",
 				spectest.Encodable.ID, msg)
@@ -69,9 +69,9 @@ func TestAcceptedUnstorableMessageFailsD6(t *testing.T) {
 	m.Decider.Decide = func(n int, _ noteMsg) cairn.Decision[int, int, struct{}] {
 		return cairn.Accept[int, int, struct{}](n+1, []int{1})
 	}
-	msg, failed := spectest.Fails(t, m.Check)
-	if !failed || !strings.Contains(msg, spectest.Encodable.ID) {
-		t.Fatalf("an accepted unstorable message should fail %s, got failed=%v:\n%s",
-			spectest.Encodable.ID, failed, msg)
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || !failed || !strings.Contains(msg, spectest.Encodable.ID) {
+		t.Fatalf("an accepted unstorable message should fail %s, got err=%v failed=%v:\n%s",
+			spectest.Encodable.ID, err, failed, msg)
 	}
 }

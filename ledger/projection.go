@@ -22,7 +22,10 @@ import (
 // idempotent.
 type Projection struct {
 	Store *Store
-	Name  string
+	// Name keys the projection's checkpoint, so it is required: a projection
+	// with no Name would share the empty checkpoint with every other unnamed
+	// projection, and only the first to run would apply anything.
+	Name string
 	// Kinds limits the projection to these stream kinds. Empty means all.
 	Kinds []string
 	Apply func(ctx context.Context, b *Batch, e Entry) error
@@ -33,8 +36,33 @@ type Projection struct {
 	OnError func(error)
 }
 
+// Validate reports the first thing wrong with how the projection is set up: no
+// store, no Name, a Name the ledger cannot store or index, or no Apply
+// function. The name keys its checkpoint, so an unnamed projection has no place
+// of its own in the log. CatchUp runs it first, so call it at startup to fail
+// before Run would.
+func (p *Projection) Validate() error {
+	fail := func(what string) error { return fmt.Errorf("cairn: projection %q: %s", p.Name, what) }
+	switch {
+	case p.Store == nil:
+		return fail("Store is nil")
+	case p.Name == "":
+		return fail("Name must be non-empty; it keys the checkpoint, and unnamed projections would share one")
+	case p.Apply == nil:
+		return fail("Apply is nil")
+	}
+	// Name is the primary key of cairn.checkpoints, so it is bounded like every
+	// other text value cairn puts in a btree index: a longer one, or one with a
+	// NUL, otherwise reaches Postgres and fails every CatchUp with a raw error
+	// about an index row.
+	return validIndexedText("the Name of projection "+quoteText(p.Name), p.Name)
+}
+
 // CatchUp applies every entry visible now, returning how many it applied.
 func (p *Projection) CatchUp(ctx context.Context) (int, error) {
+	if err := p.Validate(); err != nil {
+		return 0, err
+	}
 	batch := p.BatchSize
 	if batch <= 0 {
 		batch = 100
@@ -42,7 +70,13 @@ func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 	total := 0
 	for {
 		n := 0
-		err := pgx.BeginFunc(ctx, p.Store.pool, func(tx pgx.Tx) error {
+		// READ COMMITTED is required, not the default: under REPEATABLE READ the
+		// transaction's snapshot would be taken here, before readAll measures the
+		// log fence, and a transaction committing in between would be invisible
+		// to the read while the fence had already passed it. The fence has to be
+		// the batch's first pg_stat_activity read, so the isolation is set on the
+		// BEGIN, not with a SET inside it.
+		err := pgx.BeginTxFunc(ctx, p.Store.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 			// Read the batch before touching the checkpoint row: locking it gives
 			// this transaction an ID, and the log only shows entries older than
 			// every running transaction.
@@ -86,9 +120,9 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 				strconv.FormatUint(after.TxID, 10), after.Position)
 
 			for _, e := range entries {
-				b.owner = fmt.Sprintf("%s#%d", e.Stream, e.Seq)
-				if err := p.Apply(ctx, &b, e); err != nil {
-					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, b.owner, err)
+				owner := fmt.Sprintf("%s#%d", e.Stream, e.Seq)
+				if err := b.as(owner, func() error { return p.Apply(ctx, &b, e) }); err != nil {
+					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, owner, err)
 				}
 			}
 			err = b.send(ctx, tx)
@@ -107,8 +141,12 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 		if err != nil {
 			return total, err
 		}
-		if n == 0 {
-			return total, nil
+		// A short batch means there are no more entries visible as of the read
+		// that produced it. Return without reading again: the next call picks up
+		// anything that commits meanwhile, and the terminating transaction would
+		// otherwise cost four round trips on its own.
+		if n < batch {
+			return total + n, nil
 		}
 		total += n
 	}
@@ -117,8 +155,11 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 var errLostCheckpoint = fmt.Errorf("cairn: checkpoint moved underneath this runner")
 
 // Run catches the projection up every interval until ctx is done. An error
-// ends it unless OnError is set.
+// ends it unless OnError is set. The interval must be positive.
 func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
 	return poll(ctx, interval, p.OnError, func(ctx context.Context) (bool, error) {
 		// CatchUp applies everything visible, so there is nothing to repeat.
 		_, err := p.CatchUp(ctx)
@@ -130,6 +171,9 @@ func (p *Projection) Run(ctx context.Context, interval time.Duration) error {
 // once reports more to do. An error ends it unless onError is set, in which
 // case it is reported there and the next interval tries again.
 func poll(ctx context.Context, interval time.Duration, onError func(error), once func(context.Context) (bool, error)) error {
+	if interval <= 0 {
+		return fmt.Errorf("cairn: interval must be positive, got %v", interval)
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {

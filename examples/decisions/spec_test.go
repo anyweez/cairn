@@ -180,7 +180,7 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 			}},
 		},
 		Changes: []spec.Change[State, Msg]{
-			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, Trigger),
+			fsm.Law(FollowsLifecycle, Lifecycle, func(s State) Status { return s.Status }, TriggerOf),
 			{Rule: FreezeOnSettle, Check: func(before State, m Msg, after State) spec.Verdict {
 				// Options and positions are free only while the decision stays
 				// open; creation is the one message that fills them on its way
@@ -235,6 +235,25 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 	}
 }
 
+// Every edge on Lifecycle answers a trigger some message asks for. The table
+// is data and the triggers are methods, so a word written in only one of them
+// leaves an edge nothing can follow.
+func TestEveryLifecycleEdgeIsAskedForByAMessage(t *testing.T) {
+	asked := map[Trigger]bool{}
+	for _, m := range []Msg{
+		Create{}, Edit{}, AddOption{}, SavePosition{}, RecordOutcome{},
+		SetStatus{To: Open}, SetStatus{To: Deferred}, SetStatus{To: Dropped},
+		Supersede{}, Acknowledge{},
+	} {
+		asked[TriggerOf(m)] = true
+	}
+	for _, e := range Lifecycle.Edges() {
+		if !asked[e.On] {
+			t.Errorf("Lifecycle has %s → %s on %q, which no message asks for", e.From, e.To, e.On)
+		}
+	}
+}
+
 func TestRegisterSpec(t *testing.T) {
 	// DR8 is proposed because the register does not satisfy it yet: lore lets
 	// anyone with a position answer the outcome, though the answer is meant for
@@ -273,8 +292,14 @@ func TestWinnerMayStillAnswerTheOutcome(t *testing.T) {
 // five, and the generator could miss the path in the runs it had, so the
 // mutant survived without a defect in the code under test. The aimed
 // generator follows the lifecycle directly, so the mutation is reached on the
-// first run whatever budget it is given.
-func aimed(target Status, trigger Msg) func(*rapid.T, State) Msg {
+// first run whatever budget it is given. It can only route to Open and
+// Decided; any other target would fall back to the broad generator, which is
+// the flake it exists to remove.
+func aimed(t *testing.T, target Status, trigger Msg) func(*rapid.T, State) Msg {
+	t.Helper()
+	if target != Open && target != Decided {
+		t.Fatalf("aimed routes only to Open and Decided, so it cannot reach %s", target)
+	}
 	at := time.Unix(1_700_000_000, 0).UTC()
 	return func(t *rapid.T, s State) Msg {
 		switch {
@@ -286,7 +311,8 @@ func aimed(target Status, trigger Msg) func(*rapid.T, State) Msg {
 		case s.Status == target:
 			return trigger
 		}
-		return messages(t, s)
+		t.Fatalf("%s is not on the route to %s, so the mutant's trigger would not be aimed", s.Status, target)
+		return trigger
 	}
 }
 
@@ -337,8 +363,11 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := machine()
 			m.Decider.Decide = mut.decide
-			m.Messages = aimed(mut.target, mut.trigger)
-			msg, failed := spectest.Fails(t, m.Check)
+			m.Messages = aimed(t, mut.target, mut.trigger)
+			msg, failed, err := spectest.Fails(t, m.Check)
+			if err != nil {
+				t.Fatalf("the %q mutant made the check die instead of %s catching it: %v", name, mut.rule, err)
+			}
 			if !strings.Contains(msg, mut.rule+" violated") {
 				t.Fatalf("the %q mutant must be caught by %s; failed %v: %s", name, mut.rule, failed, firstLine(msg))
 			}
@@ -357,7 +386,10 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 			}
 			return evolve(s, e)
 		}
-		msg, _ := spectest.Fails(t, m.Check)
+		msg, _, err := spectest.Fails(t, m.Check)
+		if err != nil {
+			t.Fatalf("the aliasing Evolve made the check die instead of %s catching it: %v", spectest.Isolated.ID, err)
+		}
 		if !strings.Contains(msg, spectest.Isolated.ID+" violated") {
 			t.Fatalf("aliasing Evolve must be caught by %s: %s", spectest.Isolated.ID, firstLine(msg))
 		}

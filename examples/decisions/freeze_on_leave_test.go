@@ -8,24 +8,17 @@ import (
 )
 
 // DR5, FreezeOnSettle, states: "Options or positions change while the
-// decision is not open." Its check only looks at the state *before* the
-// message:
+// decision is not open." Its check exempts only creation, so a message that
+// moves a decision out of open in the same breath as changing its options
+// must be caught. This is the regression test for the gap that let that
+// message survive.
 //
-//	if before.Status == Open || before.Status == Uncreated {
-//		return spec.NA
-//	}
-//
-// A message that moves a decision out of open in the same breath as changing
-// its options is therefore never checked: before is open, so the check
-// answers NA. This mutant defers a decision from open and adds an option in
-// the same message; DR1 allows the status edge, and no other rule looks at
-// the option change, so the mutant survives.
-//
-// The rule should exempt only creation (Uncreated -> open) and otherwise
-// require options and positions to be unchanged whenever either the before or
-// the after state is not open.
+// The trigger is aimed at the Open state rather than left to the broad
+// generator: reaching the transition by chance made the test depend on rapid's
+// check budget, which -short divides by five.
 func TestFreezeRuleCatchesOptionsChangedWhileLeavingOpen(t *testing.T) {
 	m := machine()
+	m.Messages = aimed(t, Open, SetStatus{By: "ana", To: Deferred})
 	m.Decider.Decide = func(s State, msg Msg) decision {
 		if st, ok := msg.(SetStatus); ok && s.Status == Open && st.To == Deferred {
 			return decision{
@@ -39,7 +32,10 @@ func TestFreezeRuleCatchesOptionsChangedWhileLeavingOpen(t *testing.T) {
 		return decide(s, msg)
 	}
 
-	msg, caught := spectest.Fails(t, m.Check)
+	msg, caught, err := spectest.Fails(t, m.Check)
+	if err != nil {
+		t.Fatalf("the freeze mutant made the check die instead of %s catching it: %v", FreezeOnSettle.ID, err)
+	}
 	if !caught {
 		t.Fatal("a message that changed a decision's options while moving it out of open survived the spec; the freeze rule did not catch it")
 	}

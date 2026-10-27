@@ -42,13 +42,46 @@ func TestAJSONNumberMapKeyIsShapedAsAString(t *testing.T) {
 		t.Fatalf("the fixtures differ on the wire: json.Number key %s, string key %s", numberRAW, stringRAW)
 	}
 
-	number, str := fields(lookedUpType(t, "jsonNumberKeyMap")), fields(lookedUpType(t, "stringKeyMap"))
+	declared := loadDeclaredTypes(t)
+	number, str := fields(declared.get(t, "jsonNumberKeyMap")), fields(declared.get(t, "stringKeyMap"))
 	if !slices.Equal(number, str) {
 		t.Fatalf("fields() renders a json.Number map key as %v, not the %v a string key gives; the two are identical on the wire", number, str)
 	}
 
-	value := fields(lookedUpType(t, "jsonNumberValueMap"))
+	value := fields(declared.get(t, "jsonNumberValueMap"))
 	if want := []string{"m: map[string]number"}; !slices.Equal(value, want) {
 		t.Fatalf("fields() renders map[string]json.Number as %v, want %v; a json.Number value must stay a number", value, want)
+	}
+}
+
+// A string-kind map key with its own MarshalText is written as the string
+// itself: resolveKeyName returns the key's string before any marshaler is
+// consulted, so the key type's name says nothing about what is on the wire
+// and the manifest must not record it as the key.
+type textKey string
+
+func (textKey) MarshalText() ([]byte, error) { return []byte("Tk"), nil }
+
+type textKeyMap struct {
+	M map[textKey]int `json:"m"`
+}
+
+func TestAStringKindMapKeyWithAMarshalerIsShapedAsAString(t *testing.T) {
+	textRAW, err := json.Marshal(textKeyMap{M: map[textKey]int{"1": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stringRAW, err := json.Marshal(stringKeyMap{M: map[string]int{"1": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(textRAW) != string(stringRAW) {
+		t.Fatalf("the fixtures differ on the wire: MarshalText key %s, string key %s", textRAW, stringRAW)
+	}
+
+	declared := loadDeclaredTypes(t)
+	text, str := fields(declared.get(t, "textKeyMap")), fields(declared.get(t, "stringKeyMap"))
+	if !slices.Equal(text, str) {
+		t.Fatalf("fields() renders a MarshalText map key as %v, not the %v a string key gives; the two are identical on the wire", text, str)
 	}
 }

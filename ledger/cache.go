@@ -12,8 +12,8 @@ import (
 )
 
 // A store keeps the state of recently used streams in memory between
-// messages (see StateCacheSize), and lines up the messages each stream
-// receives in this process.
+// messages (see StateCacheSize and StateCacheBytes), and lines up the
+// messages each stream receives in this process.
 //
 // A message for a stream whose state is cached is decided as soon as it is
 // its turn, and recorded in one round trip. The transaction locks the stream
@@ -42,7 +42,9 @@ import (
 // change it, which spectest holds deciders to.
 type stateCache struct {
 	mu      sync.Mutex
-	size    int
+	size    int        // most streams to keep
+	bytes   int        // most snapshot bytes to keep, or 0 for no byte limit
+	held    int        // bytes the states in order were last measured at
 	order   *list.List // of *cachedState, most recently used first
 	entries map[string]*list.Element
 	lanes   map[laneKey][]any // messages waiting, for each lane with a worker
@@ -51,6 +53,7 @@ type stateCache struct {
 type cachedState struct {
 	key   string
 	state any // a Loaded[S]
+	bytes int // the state's size when it was cached
 	// right is a moving average of how often the cached state turned out to
 	// be the stream's: every message shows it, whether it was decided from
 	// the cache or from a read.
@@ -66,17 +69,22 @@ type laneKey struct {
 
 // trustAbove is how often a stream's cached state must have been right for
 // the next message to be decided from it. A right guess costs one round trip
-// and a wrong one three, against two for reading first, so guessing pays above
-// half; the margin covers the lock waits a wrong guess adds for others.
+// and a wrong one four, against two for reading first, so guessing pays above
+// two in three; the margin covers the lock waits a wrong guess adds for others.
 const trustAbove = 0.75
 
-// rightWeight is how much one message moves a stream's average: after about
-// seven messages the other way, a stream crosses trustAbove.
+// rightWeight is how much one message moves a stream's average: from a
+// trusted 1, three wrong messages take a stream below trustAbove, and from 0
+// eleven right ones bring it back.
 const rightWeight = 1.0 / 8
 
-func newStateCache(streams int) *stateCache {
+func newStateCache(streams, bytes int) *stateCache {
+	if streams <= 0 {
+		return nil
+	}
 	return &stateCache{
 		size:    streams,
+		bytes:   max(bytes, 0),
 		order:   list.New(),
 		entries: map[string]*list.Element{},
 		lanes:   map[laneKey][]any{},
@@ -112,21 +120,28 @@ func (c *stateCache) observe(key string, right bool) {
 	}
 }
 
-// put caches state for key. A stream new to the cache is trusted until it
-// proves otherwise.
-func (c *stateCache) put(key string, state any) {
+// put caches state for key, which is bytes large. A stream new to the cache
+// is trusted until it proves otherwise. The least recently used streams are
+// evicted while the cache holds more streams than its size, or more bytes
+// than its byte budget.
+func (c *stateCache) put(key string, state any, bytes int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
-		e.Value.(*cachedState).state = state
+		cs := e.Value.(*cachedState)
+		c.held += bytes - cs.bytes
+		cs.state, cs.bytes = state, bytes
 		c.order.MoveToFront(e)
-		return
+	} else {
+		c.entries[key] = c.order.PushFront(&cachedState{key: key, state: state, bytes: bytes, right: 1})
+		c.held += bytes
 	}
-	c.entries[key] = c.order.PushFront(&cachedState{key: key, state: state, right: 1})
-	for c.order.Len() > c.size {
+	for c.order.Len() > c.size || (c.bytes > 0 && c.held > c.bytes) {
 		oldest := c.order.Back()
+		cs := oldest.Value.(*cachedState)
 		c.order.Remove(oldest)
-		delete(c.entries, oldest.Value.(*cachedState).key)
+		delete(c.entries, cs.key)
+		c.held -= cs.bytes
 	}
 }
 
@@ -134,6 +149,7 @@ func (c *stateCache) drop(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
+		c.held -= e.Value.(*cachedState).bytes
 		c.order.Remove(e)
 		delete(c.entries, key)
 	}
@@ -290,10 +306,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[M, R]
 	if err != nil {
 		cache.drop(key)
 		if len(reqs) > 1 && retryable(err) {
-			// One message spoiled the transaction for all; find which.
-			for _, r := range reqs {
-				a.record(stream, []*request[M, R]{r}, false)
-			}
+			// One message spoiled the transaction for all. Halve the group
+			// rather than take it one message at a time: a half the database
+			// accepts is recorded whole, and only a half that fails is halved
+			// again, so one bad message costs a few transactions rather than
+			// one per message. The halves are recorded in order, so each one
+			// is decided from the state every message before it left.
+			half := len(reqs) / 2
+			a.record(stream, reqs[:half], false)
+			a.record(stream, reqs[half:], false)
 			return
 		}
 		for _, r := range reqs {
@@ -303,7 +324,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) record(stream Stream, reqs []*request[M, R]
 	}
 
 	results = attempt
-	cache.put(key, after)
+	cache.put(key, after, after.snapshotBytes)
 	for i, r := range reqs {
 		if errors.Is(results[i].err, errUnchecked) {
 			a.record(stream, []*request[M, R]{r}, false)

@@ -57,7 +57,10 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	Invariants []spec.Invariant[S]
 	Models     []Refinement[S, M, R]
 
-	// Equal compares states. Defaults to reflect.DeepEqual.
+	// Equal compares states, for the replay (D5) and the snapshot round trip
+	// (D7). Defaults to reflect.DeepEqual, except that a time.Time is compared
+	// by its instant — what JSON keeps and the ledger stores — rather than by
+	// the monotonic clock reading and *Location it drops.
 	Equal func(a, b S) bool
 
 	// Steps caps the messages in one run. Defaults to 40.
@@ -143,8 +146,9 @@ func judge(rt *rapid.T, outer rapid.TB, rep *report, trace *[]string, rule spec.
 	rt.Fatalf("%s violated: %s\n  rule: %s", rule.ID, detail, rule.Statement)
 }
 
-// collectorStopped reports that Fails has already recorded a rule violation,
-// so the rest of the check proves nothing and can be skipped.
+// collectorStopped reports that Fails has already recorded a rule violation
+// or a check that died, so the rest of the check proves nothing and can be
+// skipped.
 func collectorStopped(t rapid.TB) bool {
 	if s, ok := t.(interface{ stopping() bool }); ok {
 		return s.stopping()
@@ -156,7 +160,6 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 	if collectorStopped(outer) {
 		return
 	}
-	rep.ran()
 	var trace []string
 	j := func(rule spec.Rule, v spec.Verdict) {
 		if collectorStopped(outer) {
@@ -194,6 +197,7 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 
 		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
 		j(Total, spec.Check(secondOK, "Decide panicked on its second call with %+v: %v", msg, second.panic))
+		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state on its second call for %+v", msg))
 		if ok && secondOK {
 			j(Deterministic, spec.Check(reflect.DeepEqual(decision, second.value),
 				"decided %+v, then %+v", decision, second.value))
@@ -257,8 +261,21 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		m.checkSnapshot(j, state)
 	}
 
-	replayed := m.Decider.Fold(m.Decider.Initial(), events)
-	j(Replayable, spec.Check(m.Equal(replayed, state), "folded %+v, ran to %+v", replayed, state))
+	// The replay is the call Replayable exists to judge, so a panic in it is
+	// attributed to D5 rather than escaping to rapid as an unnamed harness
+	// panic.
+	replayed, ok := guard(func() S { return m.Decider.Fold(m.Decider.Initial(), events) })
+	if !ok {
+		j(Replayable, spec.Fail("replaying the run's events panicked: %v", replayed.panic))
+		return
+	}
+	same, equalOK := guard(func() bool { return m.Equal(replayed.value, state) })
+	if !equalOK {
+		j(Replayable, spec.Fail("comparing the replayed state panicked: %v", same.panic))
+		return
+	}
+	j(Replayable, spec.Check(same.value, "folded %+v, ran to %+v", replayed.value, state))
+	rep.ran()
 }
 
 // checkState checks every invariant against one state.
@@ -276,27 +293,33 @@ func (m Machine[S, M, R, Ev, Ef]) checkSnapshot(j func(spec.Rule, spec.Verdict),
 	if !m.Snapshots {
 		return
 	}
-	data, err := json.Marshal(state)
-	var back S
-	if err == nil {
-		err = json.Unmarshal(data, &back)
-	}
-	j(Snapshottable, spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err))
+	j(Snapshottable, checked(func() spec.Verdict {
+		data, err := json.Marshal(state)
+		var back S
+		if err == nil {
+			err = json.Unmarshal(data, &back)
+		}
+		return spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err)
+	}))
 }
 
 func (m Machine[S, M, R, Ev, Ef]) checkCodecs(j func(spec.Rule, spec.Verdict), msg M, d cairn.Decision[R, Ev, Ef]) {
 	if m.Codecs == nil {
 		return
 	}
-	j(Encodable, roundTripMaybeRefused(m.Codecs.Messages, msg, d.Refused()))
+	// A codec calls the value's own marshaller, which is user code, so the
+	// round trip is wrapped like the laws and changes: a panic is a D6
+	// violation rather than an unnamed crash of the whole run.
+	encodable := func(check func() spec.Verdict) { j(Encodable, checked(check)) }
+	encodable(func() spec.Verdict { return roundTripMaybeRefused(m.Codecs.Messages, msg, d.Refused()) })
 	if !d.Refused() {
-		j(Encodable, roundTrip(m.Codecs.Results, d.Result))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Results, d.Result) })
 	}
 	for _, e := range d.Events {
-		j(Encodable, roundTrip(m.Codecs.Events, e))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Events, e) })
 	}
 	for _, e := range d.Effects {
-		j(Encodable, roundTrip(m.Codecs.Effects, e))
+		encodable(func() spec.Verdict { return roundTrip(m.Codecs.Effects, e) })
 	}
 }
 
@@ -337,7 +360,7 @@ func roundTripMaybeRefused[T any](c *codec.Codec[T], v T, refused bool) spec.Ver
 	if err != nil {
 		return spec.Fail("%v", err)
 	}
-	return spec.Check(reflect.DeepEqual(v, back), "%+v came back as %+v", v, back)
+	return spec.Check(equalRoundTripped(v, back), "%+v came back as %+v", v, back)
 }
 
 // describe renders a value with its type's short name, so a trace reads
@@ -428,12 +451,32 @@ type model[MS, S, M, R any] struct{ def Model[MS, S, M, R] }
 func (m model[MS, S, M, R]) rule() spec.Rule { return m.def.Rule }
 
 func (m model[MS, S, M, R]) start() refinementRun[S, M, R] {
-	return &modelRun[MS, S, M, R]{def: m.def, state: m.def.Initial()}
+	r := &modelRun[MS, S, M, R]{def: m.def}
+	initial, ok := guard(func() MS { return m.def.Initial() })
+	if !ok {
+		r.initial = spec.Fail("the model's Initial panicked: %v", initial.panic)
+		r.diverged = true
+		return r
+	}
+	r.state = initial.value
+	return r
+}
+
+// modelStep is one answer from a model's Step, so the call can be guarded as a
+// single value.
+type modelStep[MS, R any] struct {
+	next    MS
+	want    R
+	refusal *cairn.Refusal
 }
 
 type modelRun[MS, S, M, R any] struct {
 	def   Model[MS, S, M, R]
 	state MS
+	// initial is a failure to build the model's starting state. It is judged
+	// as the model's first comparison, so a Proposed model reports it and an
+	// Established one fails, rather than the panic escaping to rapid.
+	initial spec.Verdict
 	// diverged is set at the model's first disagreement. A proposed model's run
 	// goes on, but there is no mapping back from the machine's state, so every
 	// later comparison would only repeat the first.
@@ -441,9 +484,23 @@ type modelRun[MS, S, M, R any] struct {
 }
 
 func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict {
-	v := r.def.Agree(impl, r.state)
+	if _, failed := r.initial.Failed(); failed {
+		return r.initial
+	}
+	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(impl, r.state) })
 	_, r.diverged = v.Failed()
 	return v
+}
+
+// modelChecked runs a model's own function, turning a panic in it into a
+// violation of the model's rule, as checked does for a law, change or
+// invariant.
+func modelChecked(what string, check func() spec.Verdict) spec.Verdict {
+	v, ok := guard(check)
+	if !ok {
+		return spec.Fail("the model's %s panicked: %v", what, v.panic)
+	}
+	return v.value
 }
 
 func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
@@ -460,7 +517,14 @@ func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, af
 }
 
 func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
-	next, want, wantRefusal := r.def.Step(r.state, msg)
+	step, ok := guard(func() modelStep[MS, R] {
+		next, want, wantRefusal := r.def.Step(r.state, msg)
+		return modelStep[MS, R]{next: next, want: want, refusal: wantRefusal}
+	})
+	if !ok {
+		return []spec.Verdict{spec.Fail("the model's Step panicked on %s: %v", describe(msg), step.panic)}
+	}
+	next, want, wantRefusal := step.value.next, step.value.want, step.value.refusal
 	code := func(r *cairn.Refusal) string {
 		if r == nil {
 			return "accepted"
@@ -471,12 +535,14 @@ func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal,
 		spec.Check(code(refusal) == code(wantRefusal), "machine %s, model %s", code(refusal), code(wantRefusal)),
 	}
 	if refusal == nil && wantRefusal == nil {
-		verdicts = append(verdicts, spec.Check(r.def.SameResult(result, want), "machine returned %+v, model %+v", result, want))
+		verdicts = append(verdicts, modelChecked("SameResult", func() spec.Verdict {
+			return spec.Check(r.def.SameResult(result, want), "machine returned %+v, model %+v", result, want)
+		}))
 	}
 	if wantRefusal == nil {
 		r.state = next
 	}
-	return append(verdicts, r.def.Agree(after, r.state))
+	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(after, r.state) }))
 }
 
 // ---- report -----------------------------------------------------------------
@@ -490,15 +556,23 @@ type tally struct {
 	firstFailureTrace []string
 }
 
+// report keys a tally by the whole rule value rather than by its ID. Two
+// different rules that share an ID are then separate rules, so a vacuous one is
+// reported even when the other applies; the same rule value used by more than
+// one check still shares one tally, because it is the same rule.
 type report struct {
 	mu    sync.Mutex
 	runs  int
-	order []string
-	rules map[string]*tally
+	order []spec.Rule
+	rules map[spec.Rule]*tally
 }
 
-func newReport() *report { return &report{rules: map[string]*tally{}} }
+func newReport() *report { return &report{rules: map[spec.Rule]*tally{}} }
 
+// ran records a run rapid completed. A draw rejected with rapid.T.Skip unwinds
+// the generator before this, so the count matches rapid's valid runs rather
+// than its attempts; a short check therefore stays under vacuityRuns however
+// many draws the generator rejects.
 func (r *report) ran() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -506,17 +580,17 @@ func (r *report) ran() {
 }
 
 func (r *report) declare(rule spec.Rule) {
-	if _, ok := r.rules[rule.ID]; ok {
+	if _, ok := r.rules[rule]; ok {
 		return
 	}
-	r.order = append(r.order, rule.ID)
-	r.rules[rule.ID] = &tally{rule: rule}
+	r.order = append(r.order, rule)
+	r.rules[rule] = &tally{rule: rule}
 }
 
 func (r *report) count(rule spec.Rule, v spec.Verdict) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.rules[rule.ID]
+	t := r.rules[rule]
 	t.judged++
 	if v.Applies() {
 		t.applied++
@@ -526,7 +600,7 @@ func (r *report) count(rule spec.Rule, v spec.Verdict) {
 func (r *report) proposed(rule spec.Rule, detail string, trace []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t := r.rules[rule.ID]
+	t := r.rules[rule]
 	t.failures++
 	if !t.haveFailure || len(trace) < len(t.firstFailureTrace) {
 		t.haveFailure = true
@@ -539,10 +613,10 @@ func (r *report) log(t rapid.TB) {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString("rule health (applied / judged):\n")
-	ids := append([]string(nil), r.order...)
-	sort.SliceStable(ids, func(i, j int) bool { return r.rules[ids[i]].rule.Status < r.rules[ids[j]].rule.Status })
-	for _, id := range ids {
-		tl := r.rules[id]
+	rules := append([]spec.Rule(nil), r.order...)
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].Status < rules[j].Status })
+	for _, rule := range rules {
+		tl := r.rules[rule]
 		note := ""
 		switch {
 		case tl.applied == 0:
@@ -550,17 +624,17 @@ func (r *report) log(t rapid.TB) {
 		case tl.failures > 0:
 			note = fmt.Sprintf("  %d violations", tl.failures)
 		}
-		fmt.Fprintf(&b, "  %-6s %-11s %7d / %-7d%s\n", id, tl.rule.Status, tl.applied, tl.judged, note)
+		fmt.Fprintf(&b, "  %-6s %-11s %7d / %-7d%s\n", rule.ID, tl.rule.Status, tl.applied, tl.judged, note)
 	}
 	t.Log(b.String())
 
-	for _, id := range ids {
-		tl := r.rules[id]
+	for _, rule := range rules {
+		tl := r.rules[rule]
 		if tl.failures == 0 {
 			continue
 		}
 		t.Logf("proposed rule %s would fail: %s\n  rule: %s\n  shortest trace seen:\n    %s",
-			id, tl.firstFailure, tl.rule.Statement, strings.Join(tl.firstFailureTrace, "\n    "))
+			rule.ID, tl.firstFailure, tl.rule.Statement, strings.Join(tl.firstFailureTrace, "\n    "))
 	}
 }
 
@@ -596,20 +670,30 @@ func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
 	return ok
 }
 
+// declares reports whether the machine declares any rule with this ID.
+func (r *report) declares(id string) bool {
+	for _, rule := range r.order {
+		if rule.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // gateVacuity fails t for every established rule that never applied, unless
 // allowed names it. Proposed rules only report, so their vacuity does too.
 func (r *report) gateVacuity(t rapid.TB, allowed []string) {
 	t.Helper()
 	for _, id := range allowed {
-		if _, ok := r.rules[id]; !ok {
+		if !r.declares(id) {
 			markViolation(t)
 			t.Errorf("AllowVacuous names %s, which is not one of the machine's rules", id)
 		}
 	}
 	var vacuous []*tally
-	for _, id := range r.order {
-		tl := r.rules[id]
-		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, id) {
+	for _, rule := range r.order {
+		tl := r.rules[rule]
+		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, rule.ID) {
 			vacuous = append(vacuous, tl)
 		}
 	}
@@ -639,7 +723,7 @@ type Violation struct {
 func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	t.Helper()
 	if m.Equal == nil {
-		m.Equal = func(a, b S) bool { return reflect.DeepEqual(a, b) }
+		m.Equal = func(a, b S) bool { return equalRoundTripped(a, b) }
 	}
 	if m.Steps == 0 {
 		m.Steps = 40
@@ -656,8 +740,8 @@ func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	rep.gateVacuity(t, m.AllowVacuous)
 
 	var out []Violation
-	for _, id := range rep.order {
-		tl := rep.rules[id]
+	for _, rule := range rep.order {
+		tl := rep.rules[rule]
 		if tl.failures > 0 {
 			out = append(out, Violation{Rule: tl.rule, Detail: tl.firstFailure, Trace: tl.firstFailureTrace})
 		}

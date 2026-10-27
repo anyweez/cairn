@@ -36,7 +36,9 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// new one. Snapshots of any other version are ignored and state is rebuilt
 	// from events. Each version keeps its own snapshot, so processes running
 	// different versions side by side don't evict each other's; those of
-	// retired versions can be deleted. Empty disables snapshots.
+	// retired versions can be deleted. Empty disables snapshots. It keys
+	// snapshots together with the stream name, so it must be text the ledger
+	// can store and at most 1024 bytes; Validate refuses anything else.
 	StateVersion string
 	// SnapshotEvery is how many entries may accumulate past the last snapshot
 	// before another is taken. Defaults to 100.
@@ -54,24 +56,40 @@ type Aggregate[S, M, R, Ev, Ef any] struct {
 	// field), which then fills Meta.Actor. A message whose metadata names a
 	// different actor is not recorded, so the two can never disagree.
 	Actor func(M) string
+
+	// StreamOf, when set, returns the ID of the stream a message itself names
+	// (the entity's own ID, carried in the message). A message that names one
+	// is recorded only on that stream: a store that carries the same entity
+	// under two identifiers would otherwise let a message about one be recorded
+	// on another. Handle and Apply refuse the message with ErrStreamMismatch
+	// before it is decided or answered from an idempotency key, and nothing is
+	// recorded. A message that names no stream returns the empty string and may
+	// be recorded on any.
+	StreamOf func(M) string
 }
 
 // Stream names one of this aggregate's streams.
 func (a *Aggregate[S, M, R, Ev, Ef]) Stream(id string) Stream { return Stream{Kind: a.Kind, ID: id} }
 
 // Validate reports the first thing wrong with how the aggregate is set up: no
-// store, a kind that is empty or contains a slash, a Decider missing a
-// function, a codec missing from Codecs, or a view or entry view whose name is
-// empty or repeats another's. Every other method runs it first, so a mistake
-// is an error rather than a nil-pointer panic on the first message; call it
-// at startup to fail before then.
+// store, a kind that is empty, contains a slash or cannot be stored, a state
+// version the ledger cannot store or index, a Decider missing a function, a
+// codec missing from Codecs, or a view or entry view whose name is empty or
+// repeats another's, or whose Write is nil. Every other
+// method runs it first, so a mistake is an error rather than a nil-pointer
+// panic on the first message; call it at startup to fail before then.
 func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
-	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %q: %s", a.Kind, what) }
+	fail := func(what string) error { return fmt.Errorf("cairn: aggregate %s: %s", quoteText(a.Kind), what) }
 	switch {
 	case a.Store == nil:
 		return fail("Store is nil")
 	case a.Kind == "" || strings.Contains(a.Kind, "/"):
 		return fail("Kind must be non-empty and contain no slash")
+	case !cairn.StorableText(a.Kind):
+		// Rebuild, RebuildEntries, Streams and ReadAll pass the Kind to a text
+		// parameter without building a stream name, so an unstorable one would
+		// otherwise reach the driver and come back as a raw SQLSTATE.
+		return validStoredText(fmt.Sprintf("aggregate %s's Kind", quoteText(a.Kind)), a.Kind)
 	case a.Decider.Initial == nil || a.Decider.Decide == nil || a.Decider.Evolve == nil:
 		return fail("Decider needs Initial, Decide and Evolve")
 	case a.Codecs == nil:
@@ -85,6 +103,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 	case a.Codecs.Effects == nil:
 		return fail("Codecs.Effects is nil")
 	}
+	// The version is half the primary key of cairn.state_snapshots, so it is
+	// bounded like every other text value cairn puts in a btree index. It is
+	// also written into every snapshot row and read back to find them, so a
+	// NUL or invalid UTF-8 is refused here rather than by the driver.
+	if a.StateVersion != "" {
+		if err := validIndexedText(fmt.Sprintf("the snapshot state version %s of aggregate %s", quoteText(a.StateVersion), quoteText(a.Kind)), a.StateVersion); err != nil {
+			return err
+		}
+	}
 	// Batch attributes a failing statement to the view that queued it by name,
 	// so a view needs one of its own.
 	names := map[string]bool{}
@@ -96,6 +123,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("view " + v.Name + " has no Write")
+		}
 	}
 	for _, v := range a.EntryViews {
 		if v.Name == "" {
@@ -105,6 +135,9 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Validate() error {
 			return fail("two views are named " + v.Name)
 		}
 		names[v.Name] = true
+		if v.Write == nil {
+			return fail("entry view " + v.Name + " has no Write")
+		}
 	}
 	return nil
 }
@@ -116,6 +149,10 @@ type Loaded[S any] struct {
 	Seq    int64
 
 	snapshotSeq int64
+	// snapshotBytes is the size of the state's last snapshot, which estimates
+	// what it costs the store's cache (see StateCacheBytes). It is zero until
+	// a snapshot has been written or read.
+	snapshotBytes int
 }
 
 // Handled is what recording one message produced. The stream's state after
@@ -147,15 +184,30 @@ type options struct {
 
 // IdempotencyKey makes a message safe to retry: a second message with the same
 // key on the same stream is not decided again, and the first one's answer is
-// returned.
+// returned. A new key is stored in a btree index, so it must be text the ledger
+// can store — valid UTF-8, without a NUL — and at most 1024 bytes. Handle and
+// Apply refuse any other new key before it reaches Postgres. A key recorded
+// before that bound existed is still looked up and answered, so a retry
+// spanning its introduction gets its first answer.
 func IdempotencyKey(key string) Option { return func(o *options) { o.key = key } }
 
-func collect(opts []Option) options {
+// collect applies opts and refuses a key the ledger cannot store. A key is
+// passed to a text parameter both when it is looked up and when it is written,
+// so one with a NUL or invalid UTF-8 would otherwise come back from the driver
+// as a raw SQLSTATE. Its length is checked only when a new entry writes it
+// (queueAppend): a key stored before that bound existed must still be found by
+// its retry.
+func collect(opts []Option) (options, error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	return o
+	if o.key != "" {
+		if err := validStoredText("the idempotency key "+quoteText(o.key), o.key); err != nil {
+			return o, err
+		}
+	}
+	return o, nil
 }
 
 // Handle decides msg against the stream id and records the result, in its own
@@ -172,7 +224,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Handle(ctx context.Context, id string, msg 
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
+	o, err := collect(opts)
+	if err != nil {
+		return Handled[R]{}, err
+	}
 	r := &request[M, R]{ctx: ctx, msg: msg, o: o}
 	r.meta, r.metaErr = a.meta(ctx, msg, o)
 
@@ -323,14 +378,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 			continue
 		// A retry gets its first answer even when it lost the request's
 		// metadata: the message was attributed when it was recorded. A
-		// request that names a different actor than the entry was recorded
-		// under is refused instead: the entry's answer is that actor's.
+		// request that an identity guard refuses is refused here too, rather
+		// than answered: the entry's answer belongs to the actor and stream
+		// that recorded it.
 		case dups[i] != nil && dups[i].found:
-			if err := mismatchedActor(r.meta, dups[i].entry); err != nil {
-				results[i].err = err
-				continue
-			}
-			results[i].h, results[i].err = a.duplicateOf(dups[i].entry)
+			results[i].h, results[i].err = a.duplicateAnswer(r.msg, r.meta, dups[i].entry, stream)
 			continue
 		case r.metaErr != nil:
 			results[i].err = r.metaErr
@@ -555,7 +607,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 		if err := json.Unmarshal(p.snapshot, &state); err != nil {
 			return Loaded[S]{}, fmt.Errorf("cairn: decoding snapshot of %s: %w", p.stream, err)
 		}
-		at.State, at.snapshotSeq = state, p.snapSeq
+		at.State, at.snapshotSeq, at.snapshotBytes = state, p.snapSeq, len(p.snapshot)
 	case p.snapshot != nil:
 		// A snapshot past the stream's seq can only come from damaged data.
 		// Ignore it, and fold every entry instead.
@@ -591,7 +643,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	if err := a.Validate(); err != nil {
 		return Handled[R]{}, err
 	}
-	o := collect(opts)
+	o, err := collect(opts)
+	if err != nil {
+		return Handled[R]{}, err
+	}
 	// Resolve the metadata before the key is looked up, so a request that
 	// names an actor its metadata contradicts is refused rather than answered
 	// from that actor's entry.
@@ -608,10 +663,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 			if !answeredFromFirstEntry(metaErr) {
 				return Handled[R]{}, metaErr
 			}
-			if err := mismatchedActor(meta, dup.entry); err != nil {
-				return Handled[R]{}, err
-			}
-			return a.duplicateOf(dup.entry)
+			return a.duplicateAnswer(msg, meta, dup.entry, at.Stream)
 		}
 	}
 	if metaErr != nil {
@@ -650,27 +702,65 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Apply(ctx context.Context, tx *Tx, at *Load
 	return finish(), nil
 }
 
+// ErrStreamMismatch is returned for a message that names a stream other than
+// the one it is being recorded on. See Aggregate.StreamOf.
+var ErrStreamMismatch = errors.New("cairn: the message names a stream it is not recorded on")
+
+// streamMismatch returns ErrStreamMismatch when msg names a stream other than
+// stream. A message that names none may be recorded on any.
+func (a *Aggregate[S, M, R, Ev, Ef]) streamMismatch(msg M, stream Stream) error {
+	if a.StreamOf == nil {
+		return nil
+	}
+	if named := a.StreamOf(msg); named != "" && named != stream.ID {
+		return fmt.Errorf("%w: %s names %s", ErrStreamMismatch, stream, quoteText(named))
+	}
+	return nil
+}
+
 // queueEntry decides msg against at and queues recording the decision as an
 // entry recorded at now, with its effects. next is the stream's state after
 // it; finish returns what was recorded, once the batch has run. events are
 // the decision's.
 func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S], msg M, o options, meta Meta, now time.Time) (finish func() Handled[R], next Loaded[S], entry *Entry, events []Ev, err error) {
-	decision := a.Decider.Decide(at.State, msg)
+	if err := a.streamMismatch(msg, at.Stream); err != nil {
+		return nil, at, nil, nil, err
+	}
+	// The entry is the record of what the caller sent, so the message is
+	// encoded before Decide sees it: Go copies the message by value, but a
+	// slice, map or pointer field is a header shared with the caller, so a
+	// decider that normalises one in place — sort.Ints(m.Order), say — would
+	// otherwise change both the bytes this entry stores and the caller's own
+	// value.
+	stored, encodeErr := a.Codecs.Messages.Encode(msg)
+	// Decide is given the message decoded back from that envelope, which is the
+	// message a replay reads: Verify decodes the entry and re-decides it, so a
+	// decision and its replay cannot disagree about the message they were made
+	// against. A message that cannot be encoded has no such copy; Decide is
+	// then given it as it was handed over, and nothing is recorded (see
+	// below), so a write through a field reaches no entry.
+	decided := msg
+	if encodeErr == nil {
+		if decided, err = a.Codecs.Messages.Decode(stored); err != nil {
+			return nil, at, nil, nil, err
+		}
+	}
+	decision := a.Decider.Decide(at.State, decided)
 	if decision.Refused() && (len(decision.Events) > 0 || len(decision.Effects) > 0) {
 		return nil, at, nil, nil, fmt.Errorf("cairn: %s refused %s but returned events or effects", at.Stream, decision.Refusal.Code)
 	}
 
-	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta}
-	if entry.Message, err = a.Codecs.Messages.Encode(msg); err != nil {
+	entry = &Entry{Refusal: decision.Refusal, IdempotencyKey: o.key, Meta: meta, Message: stored}
+	if encodeErr != nil {
 		// The message cannot be stored at all, so a refusal of it cannot be
 		// recorded either. Return the decider's refusal rather than the
 		// encoding error: the caller's message was answered, and an entry that
 		// cannot hold the message would be worse than none.
 		var notStorable *codec.NotStorableError
-		if decision.Refused() && errors.As(err, &notStorable) {
+		if decision.Refused() && errors.As(encodeErr, &notStorable) {
 			return nil, at, nil, nil, decision.Refusal
 		}
-		return nil, at, nil, nil, err
+		return nil, at, nil, nil, encodeErr
 	}
 	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {
 		return nil, at, nil, nil, err
@@ -774,6 +864,20 @@ func queueDuplicate(b *Batch, stream Stream, key string) *pendingDuplicate {
 	return p
 }
 
+// duplicateAnswer answers a request from the entry its idempotency key holds,
+// unless an identity guard that would refuse the message refuses it first: the
+// entry's answer belongs to the actor and stream that recorded it, so a request
+// Handle or Apply would refuse is never answered from a key.
+func (a *Aggregate[S, M, R, Ev, Ef]) duplicateAnswer(msg M, meta Meta, e Entry, stream Stream) (Handled[R], error) {
+	if err := mismatchedActor(meta, e); err != nil {
+		return Handled[R]{}, err
+	}
+	if err := a.streamMismatch(msg, stream); err != nil {
+		return Handled[R]{}, err
+	}
+	return a.duplicateOf(e)
+}
+
 // duplicateOf answers a retry with the entry that first answered it.
 func (a *Aggregate[S, M, R, Ev, Ef]) duplicateOf(e Entry) (Handled[R], error) {
 	h := Handled[R]{Entry: e, Refusal: e.Refusal, Duplicate: true}
@@ -803,6 +907,17 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueSnapshot(b *Batch, at *Loaded[S]) erro
 	if at.Seq-at.snapshotSeq < every {
 		return nil
 	}
+	if a.StateVersion == "" {
+		return nil
+	}
+	// A snapshot is read back with json.Unmarshal, so it must hold exactly the
+	// state that was stored. CheckStorable refuses the text json.Marshal would
+	// otherwise rewrite - a string that is not valid UTF-8 becomes U+FFFD, and
+	// a NUL cannot be stored at all - so a state that would come back different
+	// is refused here, naming the field, instead of being recorded.
+	if err := codec.CheckStorable(at.State); err != nil {
+		return fmt.Errorf("cairn: the snapshot state of %s cannot be stored: %w", at.Stream, err)
+	}
 	data, err := json.Marshal(at.State)
 	if err != nil {
 		return fmt.Errorf("cairn: encoding snapshot of %s: %w", at.Stream, err)
@@ -812,5 +927,6 @@ INSERT INTO cairn.state_snapshots (stream, seq, version, state) VALUES ($1, $2, 
 ON CONFLICT (stream, version) DO UPDATE SET seq = excluded.seq, state = excluded.state, taken_at = now()`,
 		at.Stream.String(), at.Seq, a.StateVersion, jsonArg(data))
 	at.snapshotSeq = at.Seq
+	at.snapshotBytes = len(data)
 	return nil
 }

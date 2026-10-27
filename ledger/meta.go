@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -14,20 +15,40 @@ import (
 type Meta struct {
 	// Actor is an opaque ID for who sent the message. Never a name or an
 	// email: entries are append-only, so they must not hold personal data.
+	// It is indexed, so it may be at most 1024 bytes.
 	Actor string
 	// Via is the channel the message came through: "ui", "api", "mcp", an
-	// agent's name. The Dispatcher sets "outbox".
+	// agent's name. The Dispatcher sets "outbox". It is not indexed.
 	Via string
-	// CorrelationID ties together every message in one request or flow.
+	// CorrelationID ties together every message in one request or flow. It is
+	// indexed, so it may be at most 1024 bytes.
 	CorrelationID string
 	// CausationID names what directly caused this message: an entry, or an
-	// effect delivery's Key.
+	// effect delivery's Key. It is not indexed.
 	CausationID string
 	// OccurredAt is when the producer says this happened, which can be well
-	// before it was recorded. Zero when unknown.
+	// before it was recorded. Zero when unknown. It is cut to the microseconds
+	// the occurred_at column keeps, so the entry a view is handed live is the
+	// one a rebuild is handed.
 	OccurredAt time.Time
 	// Extra holds anything else worth keeping, stored as JSON.
 	Extra map[string]any
+}
+
+// decodeMetaTail fills m's OccurredAt and Extra from an entry's occurred_at
+// and extra columns, as a row selects them: a NULL occurred_at is the zero
+// time, and extra is decoded unless it is the empty object. The error is the
+// bare unmarshal error, for the caller to place in its own context.
+func decodeMetaTail(m *Meta, occurred *time.Time, extra []byte) error {
+	if occurred != nil {
+		m.OccurredAt = *occurred
+	}
+	if string(extra) != "{}" {
+		if err := json.Unmarshal(extra, &m.Extra); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // over returns m with every field set in o replacing m's, and Extra merged
@@ -83,7 +104,10 @@ func WithMeta(m Meta) Option { return func(o *options) { o.meta = o.meta.over(m)
 var ErrNoActor = errors.New("cairn: the message has no actor")
 
 // ErrActorMismatch is returned when the actor a message names disagrees with
-// the actor in its metadata: a request acting as someone it is not.
+// the actor in its metadata — a request acting as someone it is not — or when
+// an idempotency key names an entry another actor recorded. An entry's answer
+// belongs to the actor that recorded it, so only that actor, or a request
+// carrying no actor, may be answered from it.
 var ErrActorMismatch = errors.New("cairn: the message's actor disagrees with its metadata")
 
 // meta resolves the metadata for one message: the context's, then the
@@ -102,6 +126,14 @@ func (a *Aggregate[S, M, R, Ev, Ef]) meta(ctx context.Context, msg M, o options)
 			}
 			m.Actor = named
 		}
+	}
+	if !m.OccurredAt.IsZero() {
+		// occurred_at is a timestamptz, which keeps microseconds, and pgx
+		// encodes a time.Time as whole microseconds. Cut the value here, where
+		// the entry is built, so the entry a view is handed live, the one
+		// Handle returns and the one stored are the same instant; RecordedAt is
+		// cut the same way by recordingTime.
+		m.OccurredAt = m.OccurredAt.Truncate(time.Microsecond)
 	}
 	if m.Actor == "" && a.Store.requireActor {
 		return Meta{}, fmt.Errorf("%w (%s); set one with ContextWithMeta or WithMeta", ErrNoActor, a.Kind)

@@ -13,6 +13,10 @@
 // Everything nondeterministic arrives in the message: the actor, the time, the
 // IDs of new options, and — for Supersede — what the replacing decision looked
 // like when it was read under lock.
+//
+// A decision is identified by the stream it is recorded on: a Create names that
+// stream, and the ledger refuses it anywhere else, so State.ID and the stream
+// are one identifier rather than two that happen to agree.
 package decisions
 
 import (
@@ -80,7 +84,28 @@ func (s State) option(id string) bool {
 
 // ---- messages ----------------------------------------------------------------
 
-type Msg interface{ trigger() string }
+// Trigger names what a message asks of the lifecycle. The messages and the
+// table's edges are written from the same constants, so the word a message
+// asks with and the word an edge answers to cannot drift apart.
+type Trigger string
+
+const (
+	onCreate        Trigger = "create"
+	onEdit          Trigger = "edit"
+	onAddOption     Trigger = "add_option"
+	onSavePosition  Trigger = "save_position"
+	onRecordOutcome Trigger = "record_outcome"
+	onSetStatus     Trigger = "set_status"
+	onSupersede     Trigger = "supersede"
+	onAcknowledge   Trigger = "acknowledge"
+)
+
+// setStatusTrigger is the trigger a move to a status asks for. A status change
+// is one message for several edges, so the trigger carries the destination,
+// and Lifecycle spells those edges as the same expression.
+func setStatusTrigger(to Status) Trigger { return onSetStatus + ":" + Trigger(to) }
+
+type Msg interface{ trigger() Trigger }
 
 type Create struct {
 	ID      string    `json:"id"`
@@ -121,8 +146,9 @@ type SetStatus struct {
 // Supersede marks this decision replaced by another. The shell locks both
 // streams and copies what it read of the replacement into the message, so the
 // decision is made — and replayed — from facts in the ledger. With is the
-// replacement decision's ID, the identity the self-supersede guard and DR3
-// compare against.
+// replacement decision's ID, which is the stream it is recorded on, so the
+// self-supersede guard and DR3 compare it against this decision's ID like for
+// like.
 type Supersede struct {
 	By               string `json:"by"`
 	With             string `json:"with"`
@@ -135,17 +161,17 @@ type Acknowledge struct {
 	Committed bool   `json:"committed"`
 }
 
-func (Create) trigger() string        { return "create" }
-func (Edit) trigger() string          { return "edit" }
-func (AddOption) trigger() string     { return "add_option" }
-func (SavePosition) trigger() string  { return "save_position" }
-func (RecordOutcome) trigger() string { return "record_outcome" }
-func (m SetStatus) trigger() string   { return "set_status:" + string(m.To) }
-func (Supersede) trigger() string     { return "supersede" }
-func (Acknowledge) trigger() string   { return "acknowledge" }
+func (Create) trigger() Trigger        { return onCreate }
+func (Edit) trigger() Trigger          { return onEdit }
+func (AddOption) trigger() Trigger     { return onAddOption }
+func (SavePosition) trigger() Trigger  { return onSavePosition }
+func (RecordOutcome) trigger() Trigger { return onRecordOutcome }
+func (m SetStatus) trigger() Trigger   { return setStatusTrigger(m.To) }
+func (Supersede) trigger() Trigger     { return onSupersede }
+func (Acknowledge) trigger() Trigger   { return onAcknowledge }
 
-// Trigger names what a message asks of the lifecycle.
-func Trigger(m Msg) string { return m.trigger() }
+// TriggerOf names what a message asks of the lifecycle.
+func TriggerOf(m Msg) Trigger { return m.trigger() }
 
 // ---- events and effects --------------------------------------------------------
 
@@ -232,17 +258,17 @@ type Result struct {
 // Lifecycle is every status change the register allows. A settled decision
 // moves only by being superseded or explicitly reopened.
 var Lifecycle = fsm.New(
-	fsm.Edge[Status, string]{From: Uncreated, On: "create", To: Open},
-	fsm.Edge[Status, string]{From: Open, On: "record_outcome", To: Decided},
-	fsm.Edge[Status, string]{From: Open, On: "set_status:deferred", To: Deferred},
-	fsm.Edge[Status, string]{From: Open, On: "set_status:dropped", To: Dropped},
-	fsm.Edge[Status, string]{From: Deferred, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Deferred, On: "set_status:dropped", To: Dropped},
-	fsm.Edge[Status, string]{From: Dropped, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Dropped, On: "set_status:deferred", To: Deferred},
-	fsm.Edge[Status, string]{From: Decided, On: "supersede", To: Superseded},
-	fsm.Edge[Status, string]{From: Decided, On: "set_status:open", To: Open},
-	fsm.Edge[Status, string]{From: Superseded, On: "set_status:open", To: Open},
+	fsm.Edge[Status, Trigger]{From: Uncreated, On: onCreate, To: Open},
+	fsm.Edge[Status, Trigger]{From: Open, On: onRecordOutcome, To: Decided},
+	fsm.Edge[Status, Trigger]{From: Open, On: onSetStatus + ":" + Trigger(Deferred), To: Deferred},
+	fsm.Edge[Status, Trigger]{From: Open, On: onSetStatus + ":" + Trigger(Dropped), To: Dropped},
+	fsm.Edge[Status, Trigger]{From: Deferred, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Deferred, On: onSetStatus + ":" + Trigger(Dropped), To: Dropped},
+	fsm.Edge[Status, Trigger]{From: Dropped, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Dropped, On: onSetStatus + ":" + Trigger(Deferred), To: Deferred},
+	fsm.Edge[Status, Trigger]{From: Decided, On: onSupersede, To: Superseded},
+	fsm.Edge[Status, Trigger]{From: Decided, On: onSetStatus + ":" + Trigger(Open), To: Open},
+	fsm.Edge[Status, Trigger]{From: Superseded, On: onSetStatus + ":" + Trigger(Open), To: Open},
 )
 
 // ---- the decider ---------------------------------------------------------------
@@ -295,6 +321,12 @@ func decide(s State, m Msg) decision {
 	// The ledger stores text as UTF-8 and jsonb, so text it cannot hold must be
 	// refused before the message is recorded. Otherwise the codec would replace
 	// the offending bytes with U+FFFD and the caller would be told it succeeded.
+	// A time it cannot carry as the same instant is refused for the same
+	// reason: time.Time.MarshalJSON writes a zone offset only to the minute, so
+	// an offset with seconds in it (every tzdata zone before about 1900) would
+	// store a different instant, and a year outside [0,9999] cannot be written
+	// at all. The ledger encodes the message the caller sent, not this copy, so
+	// the check is on the message as sent rather than on a normalised one.
 	if err := codec.CheckStorable(m); err != nil {
 		return refuse(Invalid, "%v", err)
 	}

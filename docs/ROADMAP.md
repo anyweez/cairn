@@ -41,8 +41,3 @@
    spec corpus or reproduce a production bug locally.
 6. **LISTEN/NOTIFY.** Wake projections and dispatchers on commit instead of
    polling.
-
-## Open questions
-
-- **Effect ordering.** The outbox guarantees at-least-once delivery but not
-  ordering. Is per-stream ordering worth the cost of a per-stream cursor?
