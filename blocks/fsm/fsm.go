@@ -65,8 +65,8 @@ func (t Table[St, On]) Edges() []Edge[St, On] { return append([]Edge[St, On](nil
 // Mermaid renders the table as a Mermaid state diagram, edges sorted so the
 // output is stable and diffs cleanly. The zero state is Mermaid's initial or
 // final pseudo-state, [*], and any state that is not a plain Mermaid id is
-// given a generated id, so state and trigger values cannot become diagram
-// syntax.
+// given a generated id with its own text as the label, so state and trigger
+// values cannot become diagram syntax and still read as themselves.
 func (t Table[St, On]) Mermaid() string {
 	var zero St
 	type state struct {
@@ -129,7 +129,11 @@ func (t Table[St, On]) Mermaid() string {
 	for _, s := range order {
 		st := states[s]
 		if st.alias {
-			declarations = append(declarations, fmt.Sprintf("    state %q as %s", st.label, st.id))
+			// Mermaid shows the quoted text as the state's name, decoding only
+			// its own #NN; entities and not Go's escapes, so the quotes are
+			// written around the label rather than applied with %q: mermaidLabel
+			// has already escaped the characters that could end the string.
+			declarations = append(declarations, fmt.Sprintf("    state \"%s\" as %s", st.label, st.id))
 		}
 	}
 	for _, e := range t.edges {
@@ -159,7 +163,7 @@ func isMermaidID(s string) bool {
 	// keywords, so it has to be kept complete: a missing one renders a state
 	// as diagram syntax and loses the whole diagram.
 	case "state", "statediagram", "direction", "note", "class", "classdef", "cssclass",
-		"style", "default", "hide", "scale", "click", "acctitle", "accdescr",
+		"style", "default", "hide", "scale", "click", "href", "acctitle", "accdescr",
 		"title", "end":
 		return false
 	}

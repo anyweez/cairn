@@ -127,8 +127,9 @@ func TestAStringOptionOnAMarshalerTypeIsIgnored(t *testing.T) {
 		t.Fatalf("reference: encoding/json wrote %s, want {\"f\":\"Ts\"}", raw)
 	}
 
-	got := fields(lookedUpType(t, "stringOptionMarshaler"))
-	want := []string{"f: " + types.TypeString(lookedUpType(t, "marshalerString"), nil)}
+	declared := loadDeclaredTypes(t)
+	got := fields(declared.get(t, "stringOptionMarshaler"))
+	want := []string{"f: " + types.TypeString(declared.get(t, "marshalerString"), nil)}
 	if !slices.Equal(got, want) {
 		t.Errorf("fields() = %q; the option is ignored, so want %q", got, want)
 	}

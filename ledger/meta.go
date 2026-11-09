@@ -104,7 +104,10 @@ func WithMeta(m Meta) Option { return func(o *options) { o.meta = o.meta.over(m)
 var ErrNoActor = errors.New("cairn: the message has no actor")
 
 // ErrActorMismatch is returned when the actor a message names disagrees with
-// the actor in its metadata: a request acting as someone it is not.
+// the actor in its metadata — a request acting as someone it is not — or when
+// an idempotency key names an entry another actor recorded. An entry's answer
+// belongs to the actor that recorded it, so only that actor, or a request
+// carrying no actor, may be answered from it.
 var ErrActorMismatch = errors.New("cairn: the message's actor disagrees with its metadata")
 
 // meta resolves the metadata for one message: the context's, then the

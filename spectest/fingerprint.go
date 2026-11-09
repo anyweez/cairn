@@ -128,8 +128,9 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 			walk(&vb, iter.Value(), seen)
 			entries = append(entries, kv{kb.String(), vb.String()})
 		}
-		// Distinct keys can render alike (two pointers to equal values), so
-		// ties sort by value to keep the order independent of map iteration.
+		// Distinct keys can still render alike — no NaN equals another, so a
+		// map can hold several keys that all render "NaN" — so ties sort by
+		// value to keep the order independent of map iteration.
 		sort.Slice(entries, func(i, j int) bool {
 			if entries[i].k != entries[j].k {
 				return entries[i].k < entries[j].k

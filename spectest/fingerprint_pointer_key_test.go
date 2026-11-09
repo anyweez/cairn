@@ -9,10 +9,9 @@ import (
 	"github.com/anyweez/cairn"
 )
 
-// Two distinct map keys whose pointees are equal render alike ("&7"), and the
-// map's entries are sorted by that rendering, so the association between a key
-// and its value is lost. Swapping the two values is a change to the state's
-// content and the fingerprint must show it.
+// A pointer's identity is part of the fingerprint: two keys pointing at equal
+// values are still two keys, and swapping their values is a change to the
+// state's content, so the fingerprint must show it.
 func TestFingerprintSeesAPointerKeySwap(t *testing.T) {
 	k1, k2 := 7, 7
 	p1, p2 := &k1, &k2

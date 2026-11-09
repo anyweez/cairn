@@ -332,12 +332,60 @@ func TestRunChecksTheBase(t *testing.T) {
 	}
 }
 
+// A base that passes is not a reason to skip the write: -o still regenerates
+// the manifest it names. Here -o and -base are the same file, the natural
+// local invocation, and a compatible base leaves the regenerated manifest in
+// place.
+func TestRunWritesTheManifestWhenTheBasePasses(t *testing.T) {
+	dir := copyGoodFixture(t)
+	m, err := Extract(dir, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := encode(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(dir, "spec.manifest.yaml")
+	if err := os.WriteFile(manifest, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run(dir, "spec.manifest.yaml", manifest, []string{"./..."}); err != nil {
+		t.Fatalf("an unchanged base must pass: %v", err)
+	}
+	wrote, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("a passing run must still write the manifest: %v", err)
+	}
+	if string(wrote) != string(data) {
+		t.Error("the written manifest is not the one this run generated")
+	}
+}
+
+// A platform's own file must not read as a removal: the base was written by a
+// host that built a different set of files, and the tree is correct on both.
+func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
+	dir := constrainedModule(t)
+
+	t.Setenv("GOOS", "linux")
+	if err := run(dir, "linux.yaml", "", []string{"./..."}); err != nil {
+		t.Fatalf("writing the base on linux: %v", err)
+	}
+
+	t.Setenv("GOOS", "darwin")
+	if err := run(dir, "darwin.yaml", filepath.Join(dir, "linux.yaml"), []string{"./..."}); err != nil {
+		t.Fatalf("the manifest generated on darwin reports the base's stored types as broken: %v", err)
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}
 	}
 	v1 := []string{"a: string"}
 	v2 := []string{"a: string", "b: int"}
+	one := func(fields ...string) []Codec { return []Codec{codec(1, fields)} }
 	for _, tc := range []struct {
 		name     string
 		old, now []Codec
@@ -354,6 +402,25 @@ func TestIncompatible(t *testing.T) {
 		{"fields reordered", []Codec{codec(1, []string{"a: string", "b: int"})}, []Codec{codec(1, []string{"b: int", "a: string"})}, ""},
 		{"upcaster dropped", []Codec{codec(2, v2, 1)}, []Codec{codec(2, v2)}, "no upcaster from version 1"},
 		{"older upcaster dropped on a bump", []Codec{codec(2, v2, 1)}, []Codec{codec(3, v2, 2)}, "no upcaster from version 1"},
+
+		// A nested struct is one string in its parent's field, so its field
+		// order must be ignored the way the outer order already is.
+		{"nested fields reordered", one("o: {a: string, b: int}"), one("o: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a pointer", one("o: *{a: string, b: int}"), one("o: *{b: int, a: string}"), ""},
+		{"nested fields reordered in a slice element", one("o: []{a: string, b: int}"), one("o: []{b: int, a: string}"), ""},
+		{"nested fields reordered in a map value", one("o: map[string]{a: string, b: int}"), one("o: map[string]{b: int, a: string}"), ""},
+		{"nested fields reordered inside an anonymous struct", one("o: []{i: {a: string, b: int}, j: int}"), one("o: []{i: {b: int, a: string}, j: int}"), ""},
+		// The comma in a function signature does not separate fields.
+		{"nested fields reordered beside a function signature", one("o: {f: func(int, string) error, a: string}"), one("o: {a: string, f: func(int, string) error}"), ""},
+
+		// A real change below the top level is still a wire change.
+		{"nested field renamed", one("o: {a: string, b: int}"), one("o: {a: string, c: int}"), "changed shape without a version bump"},
+		{"nested field retyped", one("o: {a: string, b: int}"), one("o: {a: string, b: string}"), "changed shape without a version bump"},
+		{"nested field added", one("o: {a: string}"), one("o: {a: string, b: int}"), "changed shape without a version bump"},
+		{"nested field removed", one("o: {a: string, b: int}"), one("o: {a: string}"), "changed shape without a version bump"},
+		{"nested omitempty added", one("o: {a: string}"), one("o: {a?: string}"), "changed shape without a version bump"},
+		{"nested string option added", one("o: {a: int}"), one("o: {a: string(int)}"), "changed shape without a version bump"},
+		{"nested reorder hides a rename", one("o: {a: string, b: int}"), one("o: {b: int, c: string}"), "changed shape without a version bump"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := strings.Join(Incompatible(&Manifest{Codecs: tc.old}, &Manifest{Codecs: tc.now}), "\n")

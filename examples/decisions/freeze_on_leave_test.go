@@ -18,7 +18,7 @@ import (
 // check budget, which -short divides by five.
 func TestFreezeRuleCatchesOptionsChangedWhileLeavingOpen(t *testing.T) {
 	m := machine()
-	m.Messages = aimed(Open, SetStatus{By: "ana", To: Deferred})
+	m.Messages = aimed(t, Open, SetStatus{By: "ana", To: Deferred})
 	m.Decider.Decide = func(s State, msg Msg) decision {
 		if st, ok := msg.(SetStatus); ok && s.Status == Open && st.To == Deferred {
 			return decision{

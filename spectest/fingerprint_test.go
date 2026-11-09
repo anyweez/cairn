@@ -1,6 +1,7 @@
 package spectest
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -57,14 +58,14 @@ func TestFingerprintOrdersMaps(t *testing.T) {
 	}
 }
 
-// Keys that render alike (pointers to equal values) must not let map
-// iteration order leak into the fingerprint, or an untouched state would
-// fingerprint differently twice and fail Isolated.
+// Keys that render alike must not let map iteration order leak into the
+// fingerprint, or an untouched state would fingerprint differently twice and
+// fail Isolated. A NaN is the key that still collides: no NaN equals another,
+// so a map holds each as its own key, and every one renders "NaN".
 func TestFingerprintIsStableWhenKeysRenderAlike(t *testing.T) {
-	m := map[*int]string{}
+	m := map[float64]string{}
 	for i := range 8 {
-		k := 7
-		m[&k] = string(rune('a' + i))
+		m[math.NaN()] = string(rune('a' + i))
 	}
 	first := fingerprint(m)
 	for range 50 {

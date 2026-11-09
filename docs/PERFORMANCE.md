@@ -47,8 +47,17 @@ instead.
 
 A store keeps the state of up to 10,000 streams in memory by default.
 `ledger.StateCacheSize(n)` sets the size, and `StateCacheSize(0)` turns the
-cache off. Each stream that an aggregate writes has a lane in the process,
-and its messages are recorded one transaction at a time:
+cache off. That bounds the number of streams, so its cost in memory is the
+count times a state's size: a few hundred bytes a state is a few megabytes at
+most, and a megabyte a state is gigabytes. `ledger.StateCacheBytes(n)` adds a
+bound in bytes, estimated from the snapshots the store already writes, and
+evicts the least recently used streams to stay under it. It is off by
+default, because how much memory a deployment can spare is its own choice.
+The estimate is the size of a stream's last snapshot, so it trails a state
+that has grown since, and an aggregate with no `StateVersion` writes none to
+size; those keep the count as their only bound. Each stream that an aggregate
+writes has a lane in the process, and its messages are recorded one
+transaction at a time:
 
 - **A cached stream costs one round trip.** Its message is decided as soon as
   it is its turn. One batch then opens a transaction, locks the stream on
@@ -66,10 +75,13 @@ and its messages are recorded one transaction at a time:
   stored state, in two round trips. The failed attempt costs two of its own:
   the batch that raises, and the rollback of the aborted transaction it left
   behind, so the first stale `Handle` costs four. A failure that spoils a
-  shared transaction is narrowed down by recording its messages one at a
-  time. Only failures the database reported are retried. When it is unknown
-  whether a commit happened, the callers get the error; when a batch's
-  transaction is known to have committed, the error wraps `ErrRecorded`.
+  shared transaction is narrowed down by halving the group: a half the
+  database accepts is recorded whole, and only a failing half is halved
+  again, so one bad message costs a few transactions rather than one per
+  message in the group. Only failures the database reported are retried.
+  When it is unknown whether a commit happened, the callers get the error;
+  when a batch's transaction is known to have committed, the error wraps
+  `ErrRecorded`.
 - **A stream other processes write too is read before each decision.** Every
   message shows whether the cached state would have been right. One decided
   from the cache either succeeds or goes stale; one read first finds the
@@ -155,9 +167,9 @@ Already off the path: effect delivery (`Dispatcher`), projections and
 Ordered by payoff.
 
 1. **Fewer round trips for the dispatcher.** It makes about two per effect
-   (restarting the lease, then recording the outcome). That's off the path a
-   caller waits on, but it limits how fast effects are carried out over a
-   slow link.
+   (restarting the lease and counting the attempt, then recording the outcome).
+   That's off the path a caller waits on, but it limits how fast effects are
+   carried out over a slow link.
 2. **Decide whether refusals need a durable write.** A refused message costs a
    write transaction and a flush. `SET LOCAL synchronous_commit = off` for
    transactions that record only refusals would save the flush, but not a
@@ -183,6 +195,10 @@ Ordered by payoff.
   `Handle` also updates its `cairn.streams` row. A lower `fillfactor` on
   `cairn.streams` and `cairn.state_snapshots` lets those updates stay on the
   same page, which writes less.
+- **The outbox is a queue, not a log.** A dispatcher deletes an effect's row
+  as it records the delivery, so the table holds only work outstanding or
+  failed; a failed row stays with its error for an operator to look at. Without
+  that, every effect ever produced would stay in the table and in its indexes.
 
 ## Running several instances
 

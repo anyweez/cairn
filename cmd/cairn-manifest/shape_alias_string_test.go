@@ -2,11 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"go/types"
 	"slices"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // aliasedIntPtr is an alias of *int. reflect erases aliases, so encoding/json
@@ -43,30 +40,10 @@ func TestAStringOptionOnAnAliasedPointerIsRenderedLikeThePointerItNames(t *testi
 		t.Fatalf("the two declarations write different JSON, so they are not comparable: %s vs %s", viaAlias, direct)
 	}
 
-	af := fields(declaredAliasType(t, "aliasStringField"))
-	df := fields(declaredAliasType(t, "directStringField"))
+	declared := loadDeclaredTypes(t)
+	af := fields(declared.get(t, "aliasStringField"))
+	df := fields(declared.get(t, "directStringField"))
 	if !slices.Equal(af, df) {
 		t.Fatalf("both write %s, but the manifest renders the alias as %v and the pointer as %v", viaAlias, af, df)
 	}
-}
-
-// declaredAliasType loads the named type from this package, the way the other
-// shape tests reach the real declaration.
-func declaredAliasType(t *testing.T, name string) types.Type {
-	t.Helper()
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		if obj := p.Types.Scope().Lookup(name); obj != nil {
-			return obj.Type()
-		}
-	}
-	t.Fatalf("%s not found in the loaded package", name)
-	return nil
 }

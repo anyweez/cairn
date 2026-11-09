@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -55,7 +54,6 @@ func NewStore(t testing.TB, opts ...ledger.StoreOption) *ledger.Store {
 
 	t.Cleanup(func() {
 		pool.Close()
-		rollbackPrepared(context.Background(), url, name)
 		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
 		_ = admin.Close(context.Background())
 	})
@@ -65,39 +63,4 @@ func NewStore(t testing.TB, opts ...ledger.StoreOption) *ledger.Store {
 		t.Fatalf("migrating: %v", err)
 	}
 	return store
-}
-
-// rollbackPrepared rolls back any prepared transaction left in database name,
-// so the subsequent DROP cannot fail with "being used by prepared
-// transactions". A prepared transaction must be finished from the database
-// that prepared it, so this opens a connection to that database; a test
-// process killed between PREPARE and COMMIT leaves one behind even though
-// t.Cleanup never runs.
-func rollbackPrepared(ctx context.Context, url, name string) {
-	cfg, err := pgx.ParseConfig(url)
-	if err != nil {
-		return
-	}
-	cfg.Database = name
-	conn, err := pgx.ConnectConfig(ctx, cfg)
-	if err != nil {
-		return
-	}
-	defer conn.Close(ctx)
-
-	rows, err := conn.Query(ctx, `SELECT gid FROM pg_prepared_xacts WHERE database = current_database()`)
-	if err != nil {
-		return
-	}
-	var gids []string
-	for rows.Next() {
-		var gid string
-		if rows.Scan(&gid) == nil {
-			gids = append(gids, gid)
-		}
-	}
-	rows.Close()
-	for _, gid := range gids {
-		_, _ = conn.Exec(ctx, `ROLLBACK PREPARED '`+strings.ReplaceAll(gid, "'", "''")+`'`)
-	}
 }

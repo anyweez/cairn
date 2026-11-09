@@ -12,18 +12,26 @@
 set -euo pipefail
 
 source "$(dirname "$0")/containers.sh"
+. "$(dirname "$0")/lib-lock.sh"
 
 port=${CAIRN_TEST_PORT:-55871}
 name=$(fixture_name cairn-test-postgres 55871 "$port")
 
+# The check and the creation are not atomic on their own: callers that start
+# together both see no container, and one caller's `docker rm -f` can delete the
+# container another just started. Serialise them, so the loser finds the
+# winner's container instead of colliding with it on the name.
+lock_acquire cairn-test-postgres
 # The port is not the only thing fixed when the container is created: so is
 # every setting the docker run passes. A container from before
 # -c max_prepared_transactions=16 was added still reports the default 0, which
 # makes PREPARE TRANSACTION fail and the prepared-transaction test skip, so
-# recreate it as well.
+# recreate it as well. Only an explicit 0 counts: a setting that cannot be read
+# belongs to a server still starting, which another session may have just
+# launched, and removing it would kill that session's tests.
 prepared=$(container_setting "$name" max_prepared_transactions)
 if ! container_publishes "$name" 5432 "$port" ||
-   [ "${prepared:-0}" = 0 ]; then
+   [ "$prepared" = 0 ]; then
   docker rm -f "$name" >/dev/null 2>&1 || true
   # max_prepared_transactions defaults to 0, which makes PREPARE TRANSACTION
   # fail and the ledger's prepared-transaction test skip. The LEAST fence that
@@ -32,6 +40,7 @@ if ! container_publishes "$name" 5432 "$port" ||
     -e POSTGRES_PASSWORD=cairn -e POSTGRES_USER=cairn postgres:17-alpine \
     -c max_prepared_transactions=16 >/dev/null
 fi
+lock_release
 # Over TCP: during init the image runs a socket-only server that the unix
 # socket check would mistake for the real one.
 for _ in $(seq 1 60); do

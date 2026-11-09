@@ -203,8 +203,8 @@ func TestARetryThroughTheCacheGetsItsFirstAnswer(t *testing.T) {
 }
 
 // When one message's view fails in the database, it spoils the transaction
-// it shares with others. The others are then recorded one by one, and only
-// the message whose view fails is refused.
+// it shares with others. The others are still recorded, and only the message
+// whose view fails is refused.
 func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 	// Not parallel: sleeps order the writes, and load from other tests could
 	// reorder them.
@@ -252,6 +252,73 @@ func TestOnlyTheMessageWhoseViewFailsIsLost(t *testing.T) {
 	if n := writes.Load(); n <= 6 {
 		t.Fatalf("the view was written %d times: the queued messages were never recorded together", n)
 	}
+}
+
+// A message the database refuses spoils the transaction it shares with the
+// others. Retried one message at a time, a burst of 100 costs about two round
+// trips per message while the stream's lane waits; halving the group finds the
+// bad one in a handful of transactions instead.
+func TestOneBadMessageInABurstIsNarrowedDownByHalving(t *testing.T) {
+	// Not parallel: it holds the stream's lane open while the burst queues.
+	const burst = 100
+	agg, trips := tracedCounter(t, 1)
+	view := totalsView(t, agg)
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	agg.Views = []ledger.View[counter]{{Name: "counter_totals", Write: func(b *ledger.Batch, at ledger.Loaded[counter], cause ledger.Entry) error {
+		if at.State.Total == 1 {
+			// Hold the lane until the burst has queued behind this message,
+			// so the whole burst is recorded in one transaction.
+			close(holding)
+			<-release
+		}
+		return view.Write(b, at, cause)
+	}}}
+	agg.EntryViews = []ledger.EntryView[counter, event]{{Name: "refuses_one", Write: func(b *ledger.Batch, _, _ ledger.Loaded[counter], entry ledger.Entry, _ []event) error {
+		if entry.Meta.CorrelationID == "poison" {
+			b.Queue(`SELECT 1/0`)
+		}
+		return nil
+	}}}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if _, err := agg.Handle(ctx, "a", add{1, 1000}); err != nil {
+			t.Error(err)
+		}
+	})
+	<-holding
+
+	trips.reset()
+	hs := make([]ledger.Handled[int], burst)
+	errs := make([]error, burst)
+	for i := range burst {
+		c := ctx
+		if i == burst/2 {
+			c = ledger.ContextWithMeta(ctx, ledger.Meta{CorrelationID: "poison"})
+		}
+		wg.Go(func() { hs[i], errs[i] = agg.Handle(c, "a", add{1, 1000}) })
+	}
+	time.Sleep(100 * time.Millisecond) // every message of the burst joins the lane
+	close(release)
+	wg.Wait()
+
+	var failed int
+	for i := range hs {
+		if errs[i] != nil {
+			failed++
+			if !strings.Contains(errs[i].Error(), "division by zero") {
+				t.Fatalf("want the view's error, got %v", errs[i])
+			}
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("%d messages failed, want only the one whose view fails", failed)
+	}
+	if n := trips.trips.Load(); n > 80 {
+		t.Fatalf("the burst cost %d round trips; one message at a time costs about %d", n, 2*burst)
+	}
+	checkStream(t, agg, "a", burst, burst)
 }
 
 // A transaction whose last message is a refusal writes its views as of the
@@ -372,6 +439,42 @@ func TestACacheTooSmallForEveryStreamStaysCorrect(t *testing.T) {
 	for _, id := range []string{"a", "b", "c"} {
 		checkStream(t, agg, id, 6, 6)
 	}
+}
+
+// A store given a byte budget does not cache a state larger than it, so every
+// message to that stream reads the store first, as it would for an evicted
+// stream. The same state fits the same cache when only the stream count
+// bounds it.
+func TestAByteBudgetEvictsAStateTooLargeForIt(t *testing.T) {
+	t.Parallel()
+	pool, trips := tracedPool(t, 1)
+	bounded := counterOn(ledger.New(pool, ledger.RequireActor(false), ledger.StateCacheSize(10), ledger.StateCacheBytes(1)))
+	roomy := counterOn(ledger.New(pool, ledger.RequireActor(false), ledger.StateCacheSize(10), ledger.StateCacheBytes(1<<20)))
+	for _, agg := range []*ledger.Aggregate[counter, msg, int, event, effect]{bounded, roomy} {
+		agg.StateVersion, agg.SnapshotEvery = "v1", 1
+	}
+	handle := func(agg *ledger.Aggregate[counter, msg, int, event, effect], id string) int64 {
+		t.Helper()
+		trips.reset()
+		if _, err := agg.Handle(ctx, id, add{1, 100}); err != nil {
+			t.Fatal(err)
+		}
+		return trips.trips.Load()
+	}
+	// The first message to each stream is read from the store, and the next
+	// message to the roomy stream is the first on the cached path, which
+	// prepares its statements.
+	handle(bounded, "a")
+	handle(roomy, "b")
+	handle(roomy, "b")
+	if n := handle(bounded, "a"); n != 2 {
+		t.Fatalf("a state larger than the byte budget took %d round trips, want 2", n)
+	}
+	if n := handle(roomy, "b"); n != 1 {
+		t.Fatalf("a state within the byte budget took %d round trips, want 1", n)
+	}
+	checkStream(t, bounded, "a", 2, 2)
+	checkStream(t, roomy, "b", 3, 3)
 }
 
 // A state with a map in it, so that a caller holding one could change what

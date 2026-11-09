@@ -2,11 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"go/types"
 	"slices"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // numberField and stringField hold the same key, "n", and differ only in the
@@ -27,8 +24,9 @@ type stringField struct {
 // manifest identical, so the -base check stays silent while entries already in
 // the ledger stop decoding.
 func TestAJSONNumberFieldIsNotShapedAsAString(t *testing.T) {
-	numberType := lookedUpType(t, "numberField")
-	stringType := lookedUpType(t, "stringField")
+	declared := loadDeclaredTypes(t)
+	numberType := declared.get(t, "numberField")
+	stringType := declared.get(t, "stringField")
 
 	// The reference: encoding/json tells the two apart on the wire.
 	numberJSON, err := json.Marshal(numberField{N: "1"})
@@ -57,25 +55,4 @@ func TestAJSONNumberFieldIsNotShapedAsAString(t *testing.T) {
 	if problems := Incompatible(old, now); len(problems) == 0 {
 		t.Fatal("Incompatible reports nothing for a json.Number field becoming a string, so a version-less wire break passes the -base check")
 	}
-}
-
-// lookedUpType returns the declared type of the package-level type with this
-// name, as the extractor sees it.
-func lookedUpType(t *testing.T, name string) types.Type {
-	t.Helper()
-	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo, Dir: ".", Tests: true}
-	pkgs, err := packages.Load(cfg, ".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range pkgs {
-		if p.Types == nil {
-			continue
-		}
-		if obj := p.Types.Scope().Lookup(name); obj != nil {
-			return obj.Type()
-		}
-	}
-	t.Fatalf("%s not found in the loaded package", name)
-	return nil
 }

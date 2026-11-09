@@ -202,6 +202,16 @@ END $$;
 	// and after a rollback.
 	{Statements: []string{`
 ALTER TABLE cairn.state_snapshots ALTER COLUMN state TYPE json USING state::json`}},
+
+	// 3: the outbox is a queue and no longer keeps delivered effects: a
+	// dispatcher deletes an effect's row as it records the delivery, so the
+	// table holds only work outstanding or failed rather than every effect ever
+	// delivered. This clears what earlier releases left behind, which nothing
+	// reads once a row is done. Rows marked failed stay: an operator clears
+	// those. A dispatcher still treats a done row as finished, because a
+	// rolling deploy runs older and newer releases side by side.
+	{Statements: []string{`
+DELETE FROM cairn.outbox WHERE done_at IS NOT NULL`}},
 }
 
 // Migrate brings the cairn schema up to date. It is safe to call from every

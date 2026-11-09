@@ -70,7 +70,13 @@ func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 	total := 0
 	for {
 		n := 0
-		err := pgx.BeginFunc(ctx, p.Store.pool, func(tx pgx.Tx) error {
+		// READ COMMITTED is required, not the default: under REPEATABLE READ the
+		// transaction's snapshot would be taken here, before readAll measures the
+		// log fence, and a transaction committing in between would be invisible
+		// to the read while the fence had already passed it. The fence has to be
+		// the batch's first pg_stat_activity read, so the isolation is set on the
+		// BEGIN, not with a SET inside it.
+		err := pgx.BeginTxFunc(ctx, p.Store.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 			// Read the batch before touching the checkpoint row: locking it gives
 			// this transaction an ID, and the log only shows entries older than
 			// every running transaction.
@@ -114,9 +120,9 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 				strconv.FormatUint(after.TxID, 10), after.Position)
 
 			for _, e := range entries {
-				b.owner = fmt.Sprintf("%s#%d", e.Stream, e.Seq)
-				if err := p.Apply(ctx, &b, e); err != nil {
-					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, b.owner, err)
+				owner := fmt.Sprintf("%s#%d", e.Stream, e.Seq)
+				if err := b.as(owner, func() error { return p.Apply(ctx, &b, e) }); err != nil {
+					return fmt.Errorf("cairn: projection %s at %s: %w", p.Name, owner, err)
 				}
 			}
 			err = b.send(ctx, tx)

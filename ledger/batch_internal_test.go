@@ -54,6 +54,31 @@ func committedConn(t *testing.T) (context.Context, *pgxpool.Conn, func() int) {
 	return ctx, conn, count
 }
 
+// as scopes the owner to the statements its callback queues, restoring the
+// previous owner when the callback returns, its error included. The ledger's
+// own statements queued after it are left with no owner.
+func TestAsScopesTheOwnerToItsCallback(t *testing.T) {
+	t.Parallel()
+	var b Batch
+	if err := b.as("outer", func() error {
+		b.Queue(`SELECT 1`)
+		return b.as("inner", func() error {
+			b.Queue(`SELECT 2`)
+			return errors.New("stopped")
+		})
+	}); err == nil {
+		t.Fatal("as returned nil, want the callback's error")
+	}
+	b.Queue(`SELECT 3`)
+
+	want := []string{"outer", "inner", ""}
+	for i, owner := range want {
+		if got := b.items[i].owner; got != owner {
+			t.Fatalf("statement %d is owned by %q, want %q", i, got, owner)
+		}
+	}
+}
+
 // Postgres runs every statement in a batch before the caller reads any result,
 // so a handler can fail in Go — a scan or a parse — after the statements,
 // including the COMMIT, have already run. The caller gets an error either way,

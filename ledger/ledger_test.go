@@ -671,15 +671,12 @@ func TestAnExpiredClaimCannotRecordAnOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var attempts int
-	var done, failed bool
-	var lastError *string
-	if err := agg.Store.Pool().QueryRow(ctx, `SELECT attempts, done_at IS NOT NULL, failed_at IS NOT NULL, last_error
-FROM cairn.outbox`).Scan(&attempts, &done, &failed, &lastError); err != nil {
+	var left int
+	if err := agg.Store.Pool().QueryRow(ctx, `SELECT count(*) FROM cairn.outbox`).Scan(&left); err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(calls) != "[slow@1 fast@2]" || attempts != 2 || !done || failed || lastError != nil {
-		t.Fatalf("calls %v, attempts %d, done %v, failed %v, last error %v", calls, attempts, done, failed, lastError)
+	if fmt.Sprint(calls) != "[slow@1 fast@2]" || left != 0 {
+		t.Fatalf("calls %v, %d rows left in the outbox; want the delivery removed and the expired claim unable to restore it", calls, left)
 	}
 }
 

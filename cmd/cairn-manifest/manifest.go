@@ -72,6 +72,11 @@ type Edge struct {
 // error rather than a guess: a rule, table or codec registration whose values
 // aren't constants, a registration whose type comes from a generic helper's
 // type parameter, or a rule ID declared twice.
+//
+// A file the current build context excludes is read in a build that includes it,
+// so the manifest is the whole module's spec and not the spec of the platform
+// the tool happens to run on. A file no build this tool can load includes is an
+// error naming the file and its constraint.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -82,57 +87,31 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		Dir:   dir,
 		Tests: true,
 	}
-	pkgs, err := packages.Load(cfg, patterns...)
+	pkgs, err := loadPackages(cfg, patterns...)
 	if err != nil {
 		return nil, err
 	}
-	if len(pkgs) == 0 {
-		// go list can fail with its message on stderr and nothing on stdout,
-		// and x/tools reports that as no packages and a nil error: a module
-		// that declares nothing is indistinguishable from a load that read
-		// nothing. A manifest is an error rather than a guess, so ask again
-		// in a mode that surfaces the command's error and report its cause.
-		_, cause := packages.Load(&packages.Config{
-			Mode:  packages.NeedName | packages.NeedFiles,
-			Dir:   dir,
-			Tests: true,
-		}, patterns...)
-		if cause == nil {
-			cause = fmt.Errorf("no packages match %s in %s", strings.Join(patterns, " "), dir)
-		}
-		return nil, fmt.Errorf("loading packages: %w", cause)
-	}
-	var loadErrs []string
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			loadErrs = append(loadErrs, e.Error())
-		}
-	})
-	if len(loadErrs) > 0 {
-		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
-	}
 
 	x := &extractor{
-		dir: dir, seen: map[string]bool{},
+		dir: dir, seen: map[string]bool{}, loaded: map[string][]string{},
 		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
 	}
-	for _, p := range pkgs {
-		if strings.HasSuffix(p.PkgPath, ".test") {
-			continue // the generated test main
-		}
-		for _, f := range p.Syntax {
-			// A package's files appear again in its test variant.
-			name := p.Fset.File(f.Pos()).Name()
-			if x.seen[name] {
-				continue
-			}
-			x.seen[name] = true
-			x.file(p, f, name)
-		}
+	x.extract(pkgs)
+	if len(x.errs) == 0 {
+		// A file the inherited build context left out declares nothing the
+		// manifest can see, so the build-constrained half of the module is
+		// read separately. Skipped when the load already found a declaration
+		// it cannot read: the error is the answer, and a second load only
+		// spends time on it.
+		x.readBuilds(dir, patterns)
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
+		// A file read in several builds reports the same load error once per
+		// build, and a sibling of a broken file reports the error its package
+		// already reported; identical messages are one problem.
 		slices.Sort(x.errs)
+		x.errs = slices.Compact(x.errs)
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
 	}
 
@@ -154,15 +133,106 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	return m, nil
 }
 
+// loadPackages loads patterns and refuses a result the manifest cannot be read
+// from: no packages at all, and any package carrying an error. The manifest
+// states what the type checker resolved, so a package go/packages reports with
+// errors is partial type information and everything read from it would be a
+// guess -- an unresolved field renders as "invalid type", and a registration
+// the checker could not instantiate has no type arguments at all.
+//
+// Both loads the tool performs go through here: the inherited build's, and the
+// build that includes a file the inherited one left out.
+func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return nil, fmt.Errorf("loading packages: %w", err)
+	}
+	if len(pkgs) == 0 {
+		// go list can fail with its message on stderr and nothing on stdout,
+		// and x/tools reports that as no packages and a nil error: a module
+		// that declares nothing is indistinguishable from a load that read
+		// nothing. A manifest is an error rather than a guess, so ask again
+		// in a mode that surfaces the command's error and report its cause.
+		cause := &packages.Config{
+			Mode:       packages.NeedName | packages.NeedFiles,
+			Dir:        cfg.Dir,
+			Tests:      cfg.Tests,
+			Env:        cfg.Env,
+			BuildFlags: cfg.BuildFlags,
+		}
+		if _, err := packages.Load(cause, patterns...); err != nil {
+			return nil, fmt.Errorf("loading packages: %w", err)
+		}
+		return nil, fmt.Errorf("loading packages: no packages match %s in %s", strings.Join(patterns, " "), cfg.Dir)
+	}
+	var loadErrs []string
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		for _, e := range p.Errors {
+			loadErrs = append(loadErrs, e.Error())
+		}
+	})
+	if len(loadErrs) > 0 {
+		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
+	}
+	return pkgs, nil
+}
+
 type upcast struct {
 	sum, name string
 	from      int
 	pos       string
 }
 
+// extract adds the declarations in pkgs to x. A package's files appear again in
+// its test variant, so each file is read once, and the files its build context
+// left out are remembered for readBuilds.
+func (x *extractor) extract(pkgs []*packages.Package) {
+	for _, p := range pkgs {
+		if generatedTestMain(p) {
+			continue
+		}
+		for _, name := range p.IgnoredFiles {
+			if strings.HasSuffix(name, ".go") {
+				x.ignored = append(x.ignored, name)
+			}
+		}
+		for _, f := range p.Syntax {
+			name := p.Fset.File(f.Pos()).Name()
+			if x.seen[name] {
+				continue
+			}
+			x.seen[name] = true
+			x.file(p, f, name)
+		}
+	}
+}
+
+// generatedTestMain reports whether p is the main package the go command
+// builds to run another package's tests. Its import path ends in ".test",
+// which is also a legal ending for a real package's path, so the path alone
+// does not tell them apart: the generated package is named main and has no
+// source file of its own in its directory, its one file being generated into
+// the build's working directory.
+func generatedTestMain(p *packages.Package) bool {
+	if p.Name != "main" || !strings.HasSuffix(p.PkgPath, ".test") {
+		return false
+	}
+	for _, name := range p.GoFiles {
+		if filepath.Dir(name) == p.Dir {
+			return false
+		}
+	}
+	return true
+}
+
 type extractor struct {
 	dir     string
 	seen    map[string]bool
+	ignored []string
+	// loaded holds, per build and package directory, the errors that build's
+	// load reported -- nil when it read the package. A sibling file needing the
+	// same build costs no second load, and still learns why the build failed.
+	loaded  map[string][]string
 	rules   []Rule
 	ruleAt  map[string]string
 	tables  []Table
@@ -178,10 +248,15 @@ func (x *extractor) errorf(fset *token.FileSet, pos token.Pos, format string, ar
 
 func (x *extractor) position(fset *token.FileSet, pos token.Pos) string {
 	p := fset.Position(pos)
-	if rel, err := filepath.Rel(x.dir, p.Filename); err == nil {
-		p.Filename = rel
+	return fmt.Sprintf("%s:%d", x.rel(p.Filename), p.Line)
+}
+
+// rel names path the way the module's own files are named in errors.
+func (x *extractor) rel(path string) string {
+	if rel, err := filepath.Rel(x.dir, path); err == nil {
+		return rel
 	}
-	return fmt.Sprintf("%s:%d", p.Filename, p.Line)
+	return path
 }
 
 func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
@@ -344,7 +419,15 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
-		inst := info.Instances[callee(call)]
+		inst, ok := info.Instances[callee(call)]
+		if !ok || inst.TypeArgs == nil || inst.TypeArgs.Len() < 2 {
+			// A registration the type checker could not instantiate has no
+			// entry in Instances, and its type arguments are the only place
+			// the stored type and the codec are written. There is nothing to
+			// record, so this is an error rather than a zero value.
+			x.errorf(p.Fset, call.Pos(), "codec.Register: the type checker could not instantiate this call, so the type an entry is stored as cannot be read")
+			return
+		}
 		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
 		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
 		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
@@ -379,19 +462,26 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		x.codecAt[c.key()] = at
 		x.codecs[c.key()] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
-		// The codec can be named through an alias of *codec.Codec[T], which
-		// go/types keeps as an *types.Alias until it is resolved; unalias before
-		// and after the pointer test so the receiver is *codec.Codec[T].
-		recv := types.Unalias(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv())
-		if ptr, ok := recv.(*types.Pointer); ok {
-			recv = types.Unalias(ptr.Elem())
+		// The declaring receiver is *codec.Codec[T] whether the caller names it
+		// directly, through an alias, or promotes it from an embedded codec;
+		// the selection's own receiver is only whatever the caller spelled.
+		recv, _ := methodRecv(info, call)
+		named, ok := recv.(*types.Named)
+		if !ok || named.TypeArgs().Len() != 1 {
+			x.errorf(p.Fset, call.Pos(), "Upcast: cannot read which codec this call registers on")
+			return
 		}
-		sum := recv.(*types.Named).TypeArgs().At(0)
+		sum := named.TypeArgs().At(0)
 		if !x.concrete(p, call.Pos(), sum, "Upcast", "the codec this upcaster belongs to comes from the caller's type argument") {
 			return
 		}
-		name, okName := x.constant(p, call.Args[0])
-		from, okFrom := x.constant(p, call.Args[1])
+		// A method expression passes the codec as its first argument.
+		first := 0
+		if info.Selections[call.Fun.(*ast.SelectorExpr)].Kind() == types.MethodExpr {
+			first = 1
+		}
+		name, okName := x.constant(p, call.Args[first])
+		from, okFrom := x.constant(p, call.Args[first+1])
 		if !okName || !okFrom {
 			x.errorf(p.Fset, call.Pos(), "Upcast: the name and version must be constants")
 			return
@@ -403,6 +493,8 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			from: int(n),
 			pos:  x.position(p.Fset, call.Pos()),
 		})
+	case unattributedUpcast(info, call):
+		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
 	}
 }
 
@@ -535,22 +627,104 @@ func isFunc(info *types.Info, call *ast.CallExpr, pkg, name string) bool {
 		fn.Type().(*types.Signature).Recv() == nil
 }
 
+// methodRecv returns the receiver type a selected method declares, with an
+// alias and a pointer resolved. A selection's receiver is the type the caller
+// wrote -- an alias, or the outer type of a promoted method -- so it names a
+// codec only for the forms the extractor anticipates. The method's own
+// receiver names the same codec however the call is written.
+func methodRecv(info *types.Info, call *ast.CallExpr) (types.Type, bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil, false
+	}
+	s, ok := info.Selections[sel]
+	if !ok {
+		return nil, false
+	}
+	fn, ok := s.Obj().(*types.Func)
+	if !ok {
+		return nil, false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return nil, false
+	}
+	r := types.Unalias(sig.Recv().Type())
+	if ptr, ok := r.(*types.Pointer); ok {
+		r = types.Unalias(ptr.Elem())
+	}
+	return r, true
+}
+
 func isMethod(info *types.Info, call *ast.CallExpr, pkg, recv, name string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
 	s, ok := info.Selections[sel]
-	if !ok || s.Kind() != types.MethodVal {
+	if !ok {
 		return false
 	}
-	fn := s.Obj().(*types.Func)
-	// The receiver can be named through an alias of *codec.Codec[T], which
-	// go/types keeps as an *types.Alias; unalias before and after the pointer
-	// test, or the pointer never matches and isNamed sees the alias.
-	r := types.Unalias(s.Recv())
-	if ptr, ok := r.(*types.Pointer); ok {
-		r = types.Unalias(ptr.Elem())
+	fn, ok := s.Obj().(*types.Func)
+	if !ok {
+		return false
 	}
-	return fn.Pkg() != nil && fn.Pkg().Path() == pkg && fn.Name() == name && isNamed(r, pkg, recv)
+	r, ok := methodRecv(info, call)
+	return ok && fn.Pkg() != nil && fn.Pkg().Path() == pkg && fn.Name() == name && isNamed(r, pkg, recv)
+}
+
+// unattributedUpcast reports a call to an Upcast method on a type that embeds a
+// codec but does not use the codec's method. A promoted call is the codec's own
+// method and was read above. A wrapper that declares its own Upcast hides the
+// codec's, and only that method knows what it does with the name and version,
+// so the extractor refuses rather than silently records nothing.
+func unattributedUpcast(info *types.Info, call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	s, ok := info.Selections[sel]
+	if !ok {
+		return false
+	}
+	fn, ok := s.Obj().(*types.Func)
+	if !ok || fn.Name() != "Upcast" {
+		return false
+	}
+	if fn.Pkg() != nil && fn.Pkg().Path() == codecPath {
+		return false
+	}
+	return embedsCodec(s.Recv())
+}
+
+// embedsCodec reports whether t carries a *codec.Codec in an embedded field, at
+// any depth. It tells a wrapper that declares its own Upcast apart from an
+// unrelated type that happens to have a method of that name.
+func embedsCodec(t types.Type) bool {
+	return embedsCodecIn(t, map[types.Type]bool{})
+}
+
+func embedsCodecIn(t types.Type, seen map[types.Type]bool) bool {
+	t = types.Unalias(t)
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(ptr.Elem())
+	}
+	if isNamed(t, codecPath, "Codec") {
+		return true
+	}
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	for i := range st.NumFields() {
+		f := st.Field(i)
+		if f.Embedded() && embedsCodecIn(f.Type(), seen) {
+			return true
+		}
+	}
+	return false
 }
