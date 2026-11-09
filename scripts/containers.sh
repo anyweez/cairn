@@ -14,6 +14,24 @@ fixture_name() {
   fi
 }
 
+# fixture_port DEFAULT_PORT DEFAULT_KEY KEY [OVERRIDE] prints the host port a
+# companion fixture publishes. A companion's container name is keyed by the
+# fixture port it belongs to (fixture_name), so its host port has to be keyed
+# the same way: left at the default, a session on another CAIRN_TEST_PORT leaves
+# a differently named container holding the port the next default session asks
+# for, and Docker refuses to start it. The port keeps its distance from the key
+# (55873 is two above the Postgres default 55871), so the default session gets
+# the documented port and any other key gets a host port of its own. An
+# explicit override still wins.
+fixture_port() {
+  local default_port=$1 default_key=$2 key=$3 override=${4:-}
+  if [ -n "$override" ]; then
+    printf '%s' "$override"
+  else
+    printf '%s' $(( default_port + key - default_key ))
+  fi
+}
+
 # container_publishes NAME CONTAINER_PORT HOST_PORT succeeds only when NAME is
 # running and publishes CONTAINER_PORT on 127.0.0.1:HOST_PORT. A container
 # found by name alone may have been created with a different port, and then
