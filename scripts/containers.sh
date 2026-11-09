@@ -24,3 +24,13 @@ container_publishes() {
   mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) || return 1
   [ "$mapping" = "127.0.0.1:${host_port}" ]
 }
+
+# container_setting NAME SETTING prints the value the Postgres running in NAME
+# reports for SETTING, or nothing when it cannot be read. A -c flag passed to
+# docker run is fixed when the container is created, so a container the fixture
+# started before that flag existed keeps the old value: asking the server is
+# the only way a reuse check sees it.
+container_setting() {
+  local name=$1 setting=$2
+  docker exec "$name" psql -U cairn -d postgres -Atc "SHOW ${setting}" 2>/dev/null || true
+}
