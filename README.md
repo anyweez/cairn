@@ -377,6 +377,12 @@ host, so the committed file is current everywhere and `-base` never reads a
 type that one platform stores and another does not as removed. A file no build
 includes is an error naming the file and its constraint.
 
+A registration or an upcaster written in a constrained file carries that
+constraint into the manifest, so the manifest says which builds can decode the
+entries. Moving one from one platform's file to another's changes no name,
+version or shape, but it takes the code path away from a build that already
+stored entries, so `-base` reports it.
+
 Each of these must be stated with constants. A rule, table or registration
 the tool can't read exactly is an error, not a guess. So is a registration
 inside a generic helper: its type argument is the helper's parameter, not the
@@ -397,9 +403,10 @@ would fail to decode.
 
 CI fails when the manifest is stale. On a pull request it also compares the
 codecs with the base branch's manifest and fails if a stored type was
-removed, went back a version, changed shape without a version bump, or was
-bumped without an upcaster from each earlier version. Any of these would
-leave entries already in the ledger unreadable.
+removed, went back a version, changed shape without a version bump, was bumped
+without an upcaster from each earlier version, or stopped being registered or
+upcast in a build that already stored its entries. Any of these would leave
+entries already in the ledger unreadable.
 
 ## Performance
 

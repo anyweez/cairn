@@ -268,6 +268,85 @@ func buildExpr(path string) constraint.Expr {
 	return expr
 }
 
+// fileBuild returns the constraint selecting the builds that include path, as
+// the manifest records it, or "" when every build includes the file.
+//
+// The constraint is the file's own -- the suffix of its name and its build
+// line -- rather than the context this run read it in, so the same tree records
+// the same membership on every host. A registration that moves from one
+// platform's file to another's is then a change -base can see, where the
+// whole-module list of registrations alone would be identical.
+func fileBuild(path string) string {
+	name, line := fileNameExpr(path), buildExpr(path)
+	switch {
+	case name == nil:
+		if line == nil {
+			return ""
+		}
+		return line.String()
+	case line == nil:
+		return name.String()
+	case name.String() == line.String():
+		// foo_linux.go with //go:build linux names the same build twice.
+		return name.String()
+	default:
+		return (&constraint.AndExpr{X: name, Y: line}).String()
+	}
+}
+
+// fileNameExpr returns the constraint a file name states, or nil when it states
+// none. The go command ties a file to a build by a _GOOS, _GOARCH or
+// _GOOS_GOARCH suffix after a non-empty prefix; linux.go alone is not
+// constrained, and foo_linux_test.go is.
+func fileNameExpr(path string) constraint.Expr {
+	name, _, _ := strings.Cut(filepath.Base(path), ".")
+	i := strings.Index(name, "_")
+	if i < 0 {
+		return nil
+	}
+	parts := strings.Split(name[i:], "_")
+	if n := len(parts); n > 0 && parts[n-1] == "test" {
+		parts = parts[:n-1]
+	}
+	goosTags, goarchTags := knownPlatformTags()
+	n := len(parts)
+	if n >= 2 && goosTags[parts[n-2]] && goarchTags[parts[n-1]] {
+		return &constraint.AndExpr{
+			X: &constraint.TagExpr{Tag: parts[n-2]},
+			Y: &constraint.TagExpr{Tag: parts[n-1]},
+		}
+	}
+	if n >= 1 && (goosTags[parts[n-1]] || goarchTags[parts[n-1]]) {
+		return &constraint.TagExpr{Tag: parts[n-1]}
+	}
+	return nil
+}
+
+// parseBuild parses a constraint the manifest records. The manifest writes the
+// expression without the //go:build prefix the go command requires.
+func parseBuild(s string) (constraint.Expr, error) {
+	return constraint.Parse("//go:build " + s)
+}
+
+// orBuilds combines two build constraints for one upcaster version: it is
+// registered in the builds either one selects. An empty constraint selects
+// every build, so it absorbs the other.
+func orBuilds(a, b string) string {
+	if a == "" || b == "" {
+		return ""
+	}
+	if a == b {
+		return a
+	}
+	ax, errA := parseBuild(a)
+	bx, errB := parseBuild(b)
+	if errA != nil || errB != nil {
+		// Both come from fileBuild, which only returns constraints it parsed.
+		return a
+	}
+	return (&constraint.OrExpr{X: ax, Y: bx}).String()
+}
+
 // buildLine returns path's //go:build line, or the legacy // +build line
 // before it, as it is written. Every comment line is scanned rather than the
 // header alone: a line that parses as a build constraint is one, and the search
@@ -336,6 +415,25 @@ var (
 	pairsOnce sync.Once
 	pairsAll  [][2]string
 )
+
+var (
+	platformTagsOnce sync.Once
+	knownOS          map[string]bool
+	knownArch        map[string]bool
+)
+
+// knownPlatformTags lists the GOOS and GOARCH names the toolchain knows, which
+// are the suffixes a file name can use to select a build.
+func knownPlatformTags() (map[string]bool, map[string]bool) {
+	platformTagsOnce.Do(func() {
+		knownOS, knownArch = map[string]bool{}, map[string]bool{}
+		for _, pair := range platformPairs() {
+			knownOS[pair[0]] = true
+			knownArch[pair[1]] = true
+		}
+	})
+	return knownOS, knownArch
+}
 
 // platformPairs lists the GOOS/GOARCH pairs the toolchain can target, the
 // inherited build first. It asks `go tool dist list` rather than carrying its

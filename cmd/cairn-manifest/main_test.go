@@ -379,6 +379,39 @@ func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
 	}
 }
 
+// A stored type, or an upcaster, can move between builds without changing its
+// name, version or shape. The whole-module manifest is identical either way, so
+// the build membership the extractor records is the only place -base can see
+// that a platform lost the code path that reads its entries.
+func TestIncompatibleBuildMembership(t *testing.T) {
+	codec := func(build string, upcasts []int, upcastBuilds []UpcastBuild) Codec {
+		return Codec{Sum: "x.Event", Name: "x.happened", Version: 2, Build: build, Upcasts: upcasts, UpcastBuilds: upcastBuilds}
+	}
+	for _, tc := range []struct {
+		name     string
+		old, now Codec
+		want     string
+	}{
+		{"registration unchanged in a constrained build", codec("linux", nil, nil), codec("linux", nil, nil), ""},
+		{"registration moved to another platform", codec("linux", nil, nil), codec("!linux", nil, nil), "moved out of a build that stored it"},
+		{"registration narrowed to one architecture", codec("linux", nil, nil), codec("linux && amd64", nil, nil), "moved out of a build that stored it"},
+		{"registration widened to every build", codec("linux", nil, nil), codec("", nil, nil), ""},
+		{"registration widened to a superset", codec("linux", nil, nil), codec("!windows", nil, nil), ""},
+		{"registration narrowed from every build", codec("", nil, nil), codec("windows", nil, nil), "moved out of a build that stored it"},
+		{"upcaster unchanged in a constrained build", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), ""},
+		{"upcaster moved to another platform", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "windows"}}), "upcaster from version 1 is registered only in"},
+		{"one of two upcasters moved", codec("", []int{1, 2}, nil), codec("", []int{1, 2}, []UpcastBuild{{Version: 2, Build: "windows"}}), "upcaster from version 2"},
+		{"upcaster widened to every build", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "windows"}}), codec("", []int{1}, nil), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Join(Incompatible(&Manifest{Codecs: []Codec{tc.old}}, &Manifest{Codecs: []Codec{tc.now}}), "\n")
+			if tc.want == "" && got != "" || !strings.Contains(got, tc.want) {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}

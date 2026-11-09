@@ -86,23 +86,24 @@ func init() {
 		t.Fatal(err)
 	}
 
-	// Check what the extractor says: it reads the Windows file in a Windows
-	// build, so the module-wide manifest still lists the upcaster and is
-	// byte-identical to the base. That is why -base cannot see the move.
-	old, err := Extract(dir, "./...")
+	// Check what the extractor says: it still lists the upcaster, because the
+	// Windows file is read in a Windows build, but the manifest now records
+	// that version 1 is upcast only there. That difference is what -base reads.
+	m, err := Extract(dir, "./...")
 	if err != nil {
 		t.Fatalf("extracting the new release: %v", err)
 	}
-	raw, err := os.ReadFile(base)
-	if err != nil {
-		t.Fatal(err)
+	var recorded bool
+	for _, c := range m.Codecs {
+		if c.Name != "moved.created" {
+			continue
+		}
+		for _, u := range c.UpcastBuilds {
+			recorded = recorded || u.Version == 1 && u.Build == "windows"
+		}
 	}
-	now, err := encode(old)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(now) != string(raw) {
-		t.Fatalf("the two releases' manifests differ, so this reproduction is not testing a build-membership change:\n%s", now)
+	if !recorded {
+		t.Fatalf("the extractor records nothing about which build registers the upcaster, so -base cannot see the move: %+v", m.Codecs)
 	}
 
 	if err := run(dir, "new.yaml", base, []string{"./..."}); err == nil {
