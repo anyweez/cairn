@@ -169,13 +169,19 @@ func describeBuild(build string) string {
 	return "builds where " + build
 }
 
-// maxCoverTags bounds the tags covers reasons about together. Past it the
-// search is too large to decide exactly, and the two constraints must match.
+// maxCoverTags bounds the free tags covers enumerates both ways for each real
+// build. Past it the search is too large to decide exactly, and the two
+// constraints must match.
 const maxCoverTags = 12
 
 // covers reports whether the builds now selects include every build was
 // selects, so a registration or upcaster a build had before is still there. An
 // empty constraint selects every build.
+//
+// It asks the question one real GOOS/GOARCH pair at a time, because the tags a
+// build satisfies are not free to vary: GOOS=android also satisfies linux,
+// GOOS=ios darwin, GOOS=illumos solaris, and a unix-like GOOS satisfies unix.
+// Only the tags none of those decide are enumerated both ways.
 func covers(now, was string) bool {
 	switch {
 	case now == was:
@@ -193,24 +199,26 @@ func covers(now, was string) bool {
 	if err != nil {
 		return false
 	}
-	tags := constraintTags(oldExpr, newExpr)
-	if len(tags) > maxCoverTags {
+	goosTags, goarchTags := knownPlatformTags()
+	var free []string
+	for _, tag := range constraintTags(oldExpr, newExpr) {
+		if !goosTags[tag] && !goarchTags[tag] && tag != "unix" {
+			free = append(free, tag)
+		}
+	}
+	if len(free) > maxCoverTags {
 		return false
 	}
-	goosTags, goarchTags := knownPlatformTags()
-	for bits := 0; bits < 1<<len(tags); bits++ {
-		set := make(map[string]bool, len(tags))
-		for i, tag := range tags {
-			set[tag] = bits&(1<<i) != 0
-		}
-		// A build has one GOOS and one GOARCH, so an assignment that turns on
-		// two of either describes no build at all.
-		if !atMostOne(set, goosTags) || !atMostOne(set, goarchTags) {
-			continue
-		}
-		selects := func(tag string) bool { return set[tag] }
-		if oldExpr.Eval(selects) && !newExpr.Eval(selects) {
-			return false
+	for _, pair := range platformPairs() {
+		for bits := 0; bits < 1<<len(free); bits++ {
+			set := buildTags(pair[0], pair[1])
+			for i, tag := range free {
+				set[tag] = bits&(1<<i) != 0
+			}
+			selects := func(tag string) bool { return set[tag] }
+			if oldExpr.Eval(selects) && !newExpr.Eval(selects) {
+				return false
+			}
 		}
 	}
 	return true
@@ -244,20 +252,6 @@ func constraintTags(exprs ...constraint.Expr) []string {
 	}
 	slices.Sort(tags)
 	return tags
-}
-
-// atMostOne reports whether set turns on at most one of the tags in of.
-func atMostOne(set, of map[string]bool) bool {
-	n := 0
-	for tag := range of {
-		if set[tag] {
-			n++
-			if n > 1 {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // sameFields compares shapes by field, not by order: decoding matches JSON

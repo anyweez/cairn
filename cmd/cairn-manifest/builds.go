@@ -435,6 +435,44 @@ func knownPlatformTags() (map[string]bool, map[string]bool) {
 	return knownOS, knownArch
 }
 
+// unixOS lists the GOOS values the go command satisfies the "unix" build tag
+// for. go/build keeps the same table in its internal syslist package, which a
+// module cannot import, so TestBuildTagsMatchTheGoCommand compares this copy
+// with go/build itself.
+var unixOS = map[string]bool{
+	"aix":       true,
+	"android":   true,
+	"darwin":    true,
+	"dragonfly": true,
+	"freebsd":   true,
+	"hurd":      true,
+	"illumos":   true,
+	"ios":       true,
+	"linux":     true,
+	"netbsd":    true,
+	"openbsd":   true,
+	"solaris":   true,
+}
+
+// buildTags lists the tags the go command satisfies for one GOOS/GOARCH pair:
+// the two names, the OS the GOOS implies, and "unix" for a unix-like GOOS.
+// Every other tag a constraint names is free: a build may or may not have it.
+func buildTags(goos, goarch string) map[string]bool {
+	tags := map[string]bool{goos: true, goarch: true}
+	switch goos {
+	case "android":
+		tags["linux"] = true
+	case "ios":
+		tags["darwin"] = true
+	case "illumos":
+		tags["solaris"] = true
+	}
+	if unixOS[goos] {
+		tags["unix"] = true
+	}
+	return tags
+}
+
 // platformPairs lists the GOOS/GOARCH pairs the toolchain can target, the
 // inherited build first. It asks `go tool dist list` rather than carrying its
 // own copy of the list, so a platform added to a later toolchain is searched
