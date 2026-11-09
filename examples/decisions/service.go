@@ -3,6 +3,7 @@ package decisions
 import (
 	"context"
 	"crypto/rand"
+	"strings"
 	"time"
 
 	"github.com/anyweez/cairn"
@@ -36,26 +37,33 @@ func NewService(store *ledger.Store) *Service {
 
 // sender is the member a message names as its sender. The ledger records it
 // as the entry's actor, and refuses a request whose metadata names anyone else.
+// A sender that is only whitespace trims to nothing, so it names nobody: it is
+// reported as empty, and decide refuses it the way it refuses an empty one.
+// Any other name is kept verbatim, so "ana" and " ana" stay different members.
 func sender(m Msg) string {
+	var by string
 	switch m := m.(type) {
 	case Create:
-		return m.By
+		by = m.By
 	case Edit:
-		return m.By
+		by = m.By
 	case AddOption:
-		return m.By
+		by = m.By
 	case SavePosition:
-		return m.By
+		by = m.By
 	case RecordOutcome:
-		return m.By
+		by = m.By
 	case SetStatus:
-		return m.By
+		by = m.By
 	case Supersede:
-		return m.By
+		by = m.By
 	case Acknowledge:
-		return m.By
+		by = m.By
 	}
-	return ""
+	if strings.TrimSpace(by) == "" {
+		return ""
+	}
+	return by
 }
 
 // decisionOf is the decision a message names for itself: a Create names the
