@@ -111,6 +111,81 @@ func TestTheRefusalShowsTheOffsetSecondsThatWouldGoMissing(t *testing.T) {
 	}
 }
 
+// A map key is rendered through MarshalText and read back with UnmarshalText,
+// not through a time.Time's MarshalJSON, so a time key needs its own round
+// trip. A named type over time.Time and one that embeds it both delegate that
+// text to time.
+type namedTimeKey time.Time
+
+func (t namedTimeKey) MarshalText() ([]byte, error) { return time.Time(t).MarshalText() }
+
+type embeddedTimeKey struct{ time.Time }
+
+// survivesJSONMapKey reports whether an object keyed by at comes back as the
+// same instant, the way an entry does: the reference the key check is written
+// against.
+func survivesJSONMapKey(at time.Time) bool {
+	data, err := json.Marshal(map[time.Time]int{at: 1})
+	if err != nil {
+		return false
+	}
+	var back map[time.Time]int
+	if err := json.Unmarshal(data, &back); err != nil {
+		return false
+	}
+	for key := range back {
+		return len(back) == 1 && key.Equal(at)
+	}
+	return false
+}
+
+// A time map key the JSON codec cannot carry is refused as surely as a time in
+// a field: the key would be read back at a different instant.
+func TestATimeMapKeyTheJSONCodecCannotCarryIsNotStorable(t *testing.T) {
+	at := time.Date(1900, time.January, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32))
+	if survivesJSONMapKey(at) {
+		t.Fatalf("encoding/json carries %v unchanged; nothing to refuse", at)
+	}
+	for name, value := range map[string]any{
+		"time.Time key":            map[time.Time]int{at: 1},
+		"named time.Time key":      map[namedTimeKey]int{namedTimeKey(at): 1},
+		"embedded time.Time key":   map[embeddedTimeKey]int{{Time: at}: 1},
+		"pointer to time.Time key": map[*time.Time]int{&at: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := codec.CheckStorable(value)
+			var notStorable *codec.NotStorableError
+			if !errors.As(err, &notStorable) {
+				t.Fatalf("CheckStorable(%v) = %v, want a NotStorableError", value, err)
+			}
+			if notStorable.Path != "value key" {
+				t.Fatalf("path %q, want %q", notStorable.Path, "value key")
+			}
+		})
+	}
+}
+
+// A map keyed by a time JSON carries unchanged is still storable, including a
+// key type that delegates its text to time.
+func TestATimeMapKeyTheJSONCodecCarriesIsStorable(t *testing.T) {
+	at := time.Date(2026, time.March, 4, 5, 6, 7, 0, time.FixedZone("IST", 5*60*60+30*60))
+	if !survivesJSONMapKey(at) {
+		t.Fatalf("encoding/json does not carry %v; the case is not the storable one", at)
+	}
+	for name, value := range map[string]any{
+		"time.Time key":            map[time.Time]int{at: 1},
+		"named time.Time key":      map[namedTimeKey]int{namedTimeKey(at): 1},
+		"embedded time.Time key":   map[embeddedTimeKey]int{{Time: at}: 1},
+		"pointer to time.Time key": map[*time.Time]int{&at: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := codec.CheckStorable(value); err != nil {
+				t.Fatalf("CheckStorable(%v) = %v, want storable", value, err)
+			}
+		})
+	}
+}
+
 // Encode refuses the same values the walk does, so a decider that does not
 // call CheckStorable itself still fails with a NotStorableError rather than
 // json's own error after it has said yes.
