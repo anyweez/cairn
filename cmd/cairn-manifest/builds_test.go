@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"go/build"
 	"os"
 	"path/filepath"
 	"slices"
@@ -212,6 +213,95 @@ func TestABuildConstrainedDeclarationIsInTheManifestOnEveryPlatform(t *testing.T
 	}
 	if !bytes.Equal(linux, darwin) {
 		t.Errorf("one source tree produced two manifests:\n--- linux\n%s\n--- darwin\n%s", linux, darwin)
+	}
+}
+
+// TestTheManifestRecordsTheBuildsThatRegisterAStoredType holds the manifest to
+// the other half of the build search: reading every declaration is not enough
+// when a stored type moves off a platform, because the module-wide list is then
+// unchanged and -base would see no removal. Each codec records the builds its
+// registration is written for, taken from the file so every host agrees.
+func TestTheManifestRecordsTheBuildsThatRegisterAStoredType(t *testing.T) {
+	dir := constrainedModule(t)
+	want := map[string]string{
+		"constrained.common":      "",       // an unconstrained file is in every build
+		"constrained.linux":       "linux",  // //go:build linux
+		"constrained.other":       "!linux", // //go:build !linux
+		"constrained.darwin_only": "darwin",
+	}
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Setenv("GOOS", goos)
+		m, err := Extract(dir, "./...")
+		if err != nil {
+			t.Fatalf("extracting for %s: %v", goos, err)
+		}
+		for _, c := range m.Codecs {
+			if w, ok := want[c.Name]; ok && c.Build != w {
+				t.Errorf("%s extracted on %s records build %q, want %q", c.Name, goos, c.Build, w)
+			}
+		}
+	}
+}
+
+// A file name ties a file to a build only after a non-empty prefix: the go
+// command reads foo_linux.go as Linux-only, and linux.go as a file for every
+// build. A build line narrows the name further.
+func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
+	for _, tc := range []struct{ name, src, want string }{
+		{"foo_linux.go", "package x\n", "linux"},
+		{"foo_linux_amd64.go", "package x\n", "linux && amd64"},
+		{"foo_linux_test.go", "package x\n", "linux"},
+		{"linux.go", "package x\n", ""},
+		{"foo.go", "//go:build linux || darwin\n\npackage x\n", "linux || darwin"},
+		{"foo_linux.go", "//go:build linux\n\npackage x\n", "linux"},
+	} {
+		path := filepath.Join(t.TempDir(), tc.name)
+		if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := fileBuild(path); got != tc.want {
+			t.Errorf("%s: build %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The tags a build satisfies are the go command's rule, not this tool's: the
+// target's GOOS and GOARCH, the OS they imply, and "unix" for a unix-like
+// GOOS. buildTags carries a copy of go/build's unix table because the module
+// cannot import it, so this compares that copy with go/build itself rather
+// than with a second reading of the same docs.
+func TestBuildTagsMatchTheGoCommand(t *testing.T) {
+	goosTags, goarchTags := knownPlatformTags()
+	probes := []string{"unix"}
+	for tag := range goosTags {
+		probes = append(probes, tag)
+	}
+	for tag := range goarchTags {
+		probes = append(probes, tag)
+	}
+	slices.Sort(probes)
+
+	// The tag is not the last _segment of the name, so the file name states no
+	// constraint of its own and only the build line decides.
+	dir := t.TempDir()
+	for _, tag := range probes {
+		src := "//go:build " + tag + "\n\npackage probe\n"
+		if err := os.WriteFile(filepath.Join(dir, tag+"_probe.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pair := range platformPairs() {
+		ctxt := build.Context{GOOS: pair[0], GOARCH: pair[1], Compiler: "gc"}
+		tags := buildTags(pair[0], pair[1])
+		for _, tag := range probes {
+			match, err := ctxt.MatchFile(dir, tag+"_probe.go")
+			if err != nil {
+				t.Fatalf("%s/%s: %v", pair[0], pair[1], err)
+			}
+			if match != tags[tag] {
+				t.Errorf("%s/%s: go/build says %q is %t, buildTags says %t", pair[0], pair[1], tag, match, tags[tag])
+			}
+		}
 	}
 }
 

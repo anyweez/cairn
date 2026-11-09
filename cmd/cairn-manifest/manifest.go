@@ -44,15 +44,48 @@ type Codec struct {
 	Name    string `yaml:"name"`
 	Version int    `yaml:"version"`
 	Type    string `yaml:"type"`
+	// Build is the constraint the builds that register this codec share, when
+	// it is not registered in every build: "linux", "windows && amd64". It
+	// comes from the file the registration is written in, so a tree records
+	// the same membership on every host. Empty means every build. A build that
+	// does not register the codec cannot decode the entries it stored, so
+	// -base fails when this narrows.
+	Build string `yaml:"build,omitempty"`
 	// Upcasts lists the versions that have an upcaster to the next one.
 	Upcasts []int `yaml:"upcasts,omitempty"`
+	// UpcastBuilds records, for an upcaster registered in only some builds,
+	// the version it upcasts from and that build. An upcaster this does not
+	// list is registered in every build.
+	UpcastBuilds []UpcastBuild `yaml:"upcast_builds,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
 	// "?" after the name of an omitempty field. A literal "?" in the name is
 	// doubled so it can't be read as that marker.
 	Fields []string `yaml:"fields"`
 }
 
+// UpcastBuild is one upcaster's build membership: the version it upcasts from,
+// and the constraint selecting the builds that register it.
+type UpcastBuild struct {
+	Version int    `yaml:"version"`
+	Build   string `yaml:"build"`
+}
+
 func (c Codec) key() string { return c.Sum + " " + c.Name }
+
+// upcastBuild returns the constraint the builds that register the upcaster
+// from version share, and whether the codec has one at all. An upcaster that is
+// not listed in UpcastBuilds is registered in every build.
+func (c Codec) upcastBuild(from int) (string, bool) {
+	if !slices.Contains(c.Upcasts, from) {
+		return "", false
+	}
+	for _, u := range c.UpcastBuilds {
+		if u.Version == from {
+			return u.Build, true
+		}
+	}
+	return "", true
+}
 
 // Table is one fsm table declared as a package-level variable.
 type Table struct {
@@ -76,7 +109,9 @@ type Edge struct {
 // A file the current build context excludes is read in a build that includes it,
 // so the manifest is the whole module's spec and not the spec of the platform
 // the tool happens to run on. A file no build this tool can load includes is an
-// error naming the file and its constraint.
+// error naming the file and its constraint. A registration or an upcaster in a
+// file that only some builds select records that constraint, so -base can see
+// one that moved off a build that already stored its entries.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -119,6 +154,9 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 	for _, c := range x.codecs {
 		slices.Sort(c.Upcasts)
 		c.Upcasts = slices.Compact(c.Upcasts) // a version upcast twice is replaced, not chained
+		slices.SortFunc(c.UpcastBuilds, func(a, b UpcastBuild) int {
+			return cmp.Or(cmp.Compare(a.Version, b.Version), cmp.Compare(a.Build, b.Build))
+		})
 		m.Codecs = append(m.Codecs, *c)
 	}
 	if m.Rules == nil {
@@ -181,6 +219,9 @@ type upcast struct {
 	sum, name string
 	from      int
 	pos       string
+	// build is the constraint selecting the builds that register the upcaster,
+	// derived from the file the call is written in. Empty means every build.
+	build string
 }
 
 // extract adds the declarations in pkgs to x. A package's files appear again in
@@ -289,9 +330,10 @@ func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
 	if strings.HasSuffix(name, "_test.go") {
 		return
 	}
+	build := fileBuild(name)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
-			x.codecCall(p, call)
+			x.codecCall(p, call, build)
 		}
 		return true
 	})
@@ -415,7 +457,7 @@ func (x *extractor) table(p *packages.Package, ident *ast.Ident, value ast.Expr)
 	x.tables = append(x.tables, t)
 }
 
-func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
+func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build string) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
@@ -452,6 +494,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			Name:    constant.StringVal(name),
 			Version: int(n),
 			Type:    types.TypeString(types.Unalias(v), nil),
+			Build:   build,
 			Fields:  fields(v),
 		}
 		at := x.position(p.Fset, call.Pos())
@@ -488,10 +531,11 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		}
 		n, _ := constant.Int64Val(from)
 		x.upcasts = append(x.upcasts, upcast{
-			sum:  types.TypeString(types.Unalias(sum), nil),
-			name: constant.StringVal(name),
-			from: int(n),
-			pos:  x.position(p.Fset, call.Pos()),
+			sum:   types.TypeString(types.Unalias(sum), nil),
+			name:  constant.StringVal(name),
+			from:  int(n),
+			pos:   x.position(p.Fset, call.Pos()),
+			build: build,
 		})
 	case unattributedUpcast(info, call):
 		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
@@ -499,6 +543,9 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 }
 
 func (x *extractor) upcastsToCodecs() {
+	// A version can be upcast from more than one file -- one per build that
+	// registers it -- so its membership is the union of those files' builds.
+	builds := map[string]map[int]string{}
 	for _, u := range x.upcasts {
 		c, ok := x.codecs[Codec{Sum: u.sum, Name: u.name}.key()]
 		if !ok {
@@ -506,6 +553,27 @@ func (x *extractor) upcastsToCodecs() {
 			continue
 		}
 		c.Upcasts = append(c.Upcasts, u.from)
+		byVersion := builds[c.key()]
+		if byVersion == nil {
+			byVersion = map[int]string{}
+			builds[c.key()] = byVersion
+		}
+		// A missing entry is not "every build": only a recorded empty
+		// constraint is. Combine only with another call's membership.
+		if prev, ok := byVersion[u.from]; ok {
+			byVersion[u.from] = orBuilds(prev, u.build)
+		} else {
+			byVersion[u.from] = u.build
+		}
+	}
+	for key, byVersion := range builds {
+		c := x.codecs[key]
+		for from, build := range byVersion {
+			if build == "" { // every build registers it, so there is nothing to record
+				continue
+			}
+			c.UpcastBuilds = append(c.UpcastBuilds, UpcastBuild{Version: from, Build: build})
+		}
 	}
 }
 

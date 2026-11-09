@@ -18,13 +18,15 @@
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is
 // already in the ledger: removed, moved back a version, reshaped without a
-// version bump, or bumped without an upcaster.
+// version bump, bumped without an upcaster, or no longer registered or upcast
+// in a build that already stored its entries.
 package main
 
 import (
 	"bytes"
 	"flag"
 	"fmt"
+	"go/build/constraint"
 	"os"
 	"path/filepath"
 	"slices"
@@ -124,6 +126,11 @@ func Incompatible(old, m *Manifest) []string {
 		case c.Version == was.Version && !sameFields(c.Fields, was.Fields):
 			problems = append(problems, fmt.Sprintf("%s changed shape without a version bump (still version %d)", c.Name, c.Version))
 		}
+		// A build that no longer registers the codec cannot decode the entries
+		// it stored, even though the module-wide list still names them.
+		if !covers(c.Build, was.Build) {
+			problems = append(problems, fmt.Sprintf("%s (%s) moved out of a build that stored it: its registration went from %s to %s, so entries already stored by a build that lost it can't be decoded", c.Name, c.Sum, describeBuild(was.Build), describeBuild(c.Build)))
+		}
 		// Entries may be stored at any version the base could read, so each
 		// needs its path to the current version: the base's upcasters, and one
 		// from every version since.
@@ -135,10 +142,116 @@ func Incompatible(old, m *Manifest) []string {
 		for _, v := range slices.Compact(needed) {
 			if !slices.Contains(c.Upcasts, v) {
 				problems = append(problems, fmt.Sprintf("%s is version %d but has no upcaster from version %d", c.Name, c.Version, v))
+				continue
+			}
+			// An upcaster is how an entry stored at v stays readable, so it has
+			// to serve every build that can hold one: the builds the base
+			// registered it in, or -- for one the bump adds -- the builds the
+			// base registered the codec in.
+			wasBuild, had := was.upcastBuild(v)
+			if !had {
+				wasBuild = was.Build
+			}
+			if nowBuild, _ := c.upcastBuild(v); !covers(nowBuild, wasBuild) {
+				problems = append(problems, fmt.Sprintf("%s is version %d but its upcaster from version %d is registered only in %s, so entries already stored at version %d by a build that lost it can't be decoded", c.Name, c.Version, v, describeBuild(nowBuild), v))
 			}
 		}
 	}
 	return problems
+}
+
+// describeBuild names a build constraint in a -base message; an empty one
+// selects every build.
+func describeBuild(build string) string {
+	if build == "" {
+		return "every build"
+	}
+	return "builds where " + build
+}
+
+// maxCoverTags bounds the free tags covers enumerates both ways for each real
+// build. Past it the search is too large to decide exactly, and the two
+// constraints must match.
+const maxCoverTags = 12
+
+// covers reports whether the builds now selects include every build was
+// selects, so a registration or upcaster a build had before is still there. An
+// empty constraint selects every build.
+//
+// It asks the question one real GOOS/GOARCH pair at a time, because the tags a
+// build satisfies are not free to vary: GOOS=android also satisfies linux,
+// GOOS=ios darwin, GOOS=illumos solaris, and a unix-like GOOS satisfies unix.
+// Only the tags none of those decide are enumerated both ways.
+func covers(now, was string) bool {
+	switch {
+	case now == was:
+		return true
+	case was == "":
+		return false // every build had it, and now is narrower
+	case now == "":
+		return true
+	}
+	oldExpr, err := parseBuild(was)
+	if err != nil {
+		return false
+	}
+	newExpr, err := parseBuild(now)
+	if err != nil {
+		return false
+	}
+	goosTags, goarchTags := knownPlatformTags()
+	var free []string
+	for _, tag := range constraintTags(oldExpr, newExpr) {
+		if !goosTags[tag] && !goarchTags[tag] && tag != "unix" {
+			free = append(free, tag)
+		}
+	}
+	if len(free) > maxCoverTags {
+		return false
+	}
+	for _, pair := range platformPairs() {
+		for bits := 0; bits < 1<<len(free); bits++ {
+			set := buildTags(pair[0], pair[1])
+			for i, tag := range free {
+				set[tag] = bits&(1<<i) != 0
+			}
+			selects := func(tag string) bool { return set[tag] }
+			if oldExpr.Eval(selects) && !newExpr.Eval(selects) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// constraintTags lists every tag the expressions name, sorted so covers'
+// search is deterministic.
+func constraintTags(exprs ...constraint.Expr) []string {
+	seen := map[string]bool{}
+	var walk func(constraint.Expr)
+	walk = func(e constraint.Expr) {
+		switch e := e.(type) {
+		case *constraint.TagExpr:
+			seen[e.Tag] = true
+		case *constraint.NotExpr:
+			walk(e.X)
+		case *constraint.AndExpr:
+			walk(e.X)
+			walk(e.Y)
+		case *constraint.OrExpr:
+			walk(e.X)
+			walk(e.Y)
+		}
+	}
+	for _, e := range exprs {
+		walk(e)
+	}
+	tags := make([]string, 0, len(seen))
+	for tag := range seen {
+		tags = append(tags, tag)
+	}
+	slices.Sort(tags)
+	return tags
 }
 
 // sameFields compares shapes by field, not by order: decoding matches JSON
