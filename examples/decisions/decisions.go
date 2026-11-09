@@ -334,10 +334,10 @@ func decide(s State, m Msg) decision {
 		return refuse(NotFound, "no such decision")
 	}
 	// The shell stamps the entry's actor and time; it does not fill in the
-	// message the caller sent. A message that names no sender would be recorded
-	// in the log under the request's actor while the state it evolves names
-	// nobody, so it is refused here. Create and RecordOutcome check their own
-	// time where they store it.
+	// message the caller sent. A message that names no sender — empty, or only
+	// whitespace — would be recorded in the log under the request's actor while
+	// the state it evolves names nobody, so it is refused here. Create and
+	// RecordOutcome check their own time where they store it.
 	if sender(m) == "" {
 		return refuse(Invalid, "a message needs a sender")
 	}
