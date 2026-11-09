@@ -119,6 +119,23 @@ func TestRegisterRejectsTypesOutsideTheSum(t *testing.T) {
 	codec.Register[struct{ X int }](codec.New[shape](), "nope", 1)
 }
 
+func TestRegisterRejectsANameTheLedgerCannotStore(t *testing.T) {
+	for name, bad := range map[string]string{
+		"invalid utf8": "circle\xff",
+		"nul":          "cir\x00cle",
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				p := recover()
+				if p == nil || !strings.Contains(p.(string), "cannot store") {
+					t.Fatalf("expected a panic naming the unstorable name, got %v", p)
+				}
+			}()
+			codec.Register[circle](codec.New[shape](), bad, 1)
+		})
+	}
+}
+
 func TestRegistrationsDescribeTheCodec(t *testing.T) {
 	c := codec.New[shape]()
 	codec.Register[square](c, "square", 2)

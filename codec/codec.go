@@ -56,11 +56,15 @@ func New[T any]() *Codec[T] {
 
 // Register adds V to c under name, at version (1 for a type that has never
 // changed shape). V must implement T. Register panics on a duplicate name or
-// type: registration happens once, at startup, and a mistake there is a bug.
+// type, and on a name the ledger cannot store: registration happens once, at
+// startup, and a mistake there is a bug.
 func Register[V, T any](c *Codec[T], name string, version int) {
 	var zero V
 	if _, ok := any(zero).(T); !ok {
 		panic(fmt.Sprintf("codec: %T does not implement %s", zero, reflect.TypeFor[T]()))
+	}
+	if !cairn.StorableText(name) {
+		panic(fmt.Sprintf("codec: %q is not valid UTF-8 or contains a NUL, so the ledger cannot store it", name))
 	}
 	if version < 1 {
 		panic(fmt.Sprintf("codec: %s: version must be at least 1", name))
