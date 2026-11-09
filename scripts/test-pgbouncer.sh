@@ -18,7 +18,10 @@ scripts/test-postgres.sh >/dev/null
 network=cairn-test
 pg_port=${CAIRN_TEST_PORT:-55871}
 postgres=$(fixture_name cairn-test-postgres 55871 "$pg_port")
-port=${CAIRN_TEST_PGBOUNCER_PORT:-55873}
+# The PgBouncer publishes beside the Postgres it fronts, keyed the same way its
+# container name is: a session on another CAIRN_TEST_PORT gets a host port of
+# its own, so its container never holds the port the default session asks for.
+port=$(fixture_port 55873 55871 "$pg_port" "${CAIRN_TEST_PGBOUNCER_PORT:-}")
 name=$(fixture_name cairn-test-pgbouncer 55873 "$port")
 # DB_HOST is fixed when the container is created, so a PgBouncer in front of a
 # different Postgres must be a different container.
