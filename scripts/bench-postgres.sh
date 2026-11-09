@@ -20,11 +20,13 @@ postgres=$(fixture_name cairn-test-postgres 55871 "$pg_port")
 # container name is: a session on another CAIRN_TEST_PORT gets host ports of
 # its own, so its container never holds the ports the default session asks for.
 proxy_port=$(fixture_port 55872 55871 "$pg_port" "${CAIRN_TOXIPROXY_PORT:-}")
-# A toxiproxy publishes its API beside the proxy, and both are fixed when the
-# container is created. A session that moves the proxy port has to move the API
-# port with it: otherwise it asks for the port the default session already
-# bound and starts no container at all.
-api_port=$(fixture_port 8474 55872 "$proxy_port" "${CAIRN_TOXIPROXY_API_PORT:-}")
+# A toxiproxy publishes its control API beside the proxy, and both ports are
+# fixed when the container is created. A session that moves the proxy port has
+# to move the API port with it: otherwise it asks for 8474, which the default
+# session already bound. The API steps over the port PgBouncer publishes for the
+# same Postgres, since one session may run both fixtures.
+pgbouncer_port=$(fixture_port 55873 55871 "$pg_port" "${CAIRN_TEST_PGBOUNCER_PORT:-}")
+api_port=$(fixture_port_beside 8474 55872 "$proxy_port" "${CAIRN_TOXIPROXY_API_PORT:-}" "$pgbouncer_port")
 proxy=$(fixture_name cairn-toxiproxy 55872 "$proxy_port")
 # The proxy's upstream is fixed when the container is created, so a toxiproxy
 # in front of a different Postgres must be a different container.
