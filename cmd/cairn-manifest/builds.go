@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"go/build"
 	"go/build/constraint"
@@ -246,26 +247,31 @@ func isPlatformTag(tag string) bool {
 }
 
 // buildConstraint names the constraint that keeps path out of this run's build:
-// its //go:build line when it has one, and its name otherwise, which is where
-// the go command reads the rest of them.
+// its //go:build line when it has one, the equivalent line for the legacy
+// // +build lines it writes instead, and its name when it states neither.
 func buildConstraint(path string) string {
-	if line := buildLine(path); line != "" {
-		return line
+	header, goBuild := buildHeader(path)
+	if goBuild != "" {
+		return goBuild
+	}
+	if expr := plusBuildExpr(header); expr != nil {
+		return "//go:build " + expr.String()
 	}
 	return fmt.Sprintf("file name %q", filepath.Base(path))
 }
 
-// buildExpr parses path's build constraint, or returns nil when it has none.
+// buildExpr parses path's build constraint as the go command reads it, or
+// returns nil when it has none.
 func buildExpr(path string) constraint.Expr {
-	line := buildLine(path)
-	if line == "" {
-		return nil
+	header, goBuild := buildHeader(path)
+	if goBuild != "" {
+		expr, err := constraint.Parse(goBuild)
+		if err != nil {
+			return nil
+		}
+		return expr
 	}
-	expr, err := constraint.Parse(line)
-	if err != nil {
-		return nil
-	}
-	return expr
+	return plusBuildExpr(header)
 }
 
 // fileBuild returns the constraint selecting the builds that include path, as
@@ -347,25 +353,84 @@ func orBuilds(a, b string) string {
 	return (&constraint.OrExpr{X: ax, Y: bx}).String()
 }
 
-// buildLine returns path's //go:build line, or the legacy // +build line
-// before it, as it is written. Every comment line is scanned rather than the
-// header alone: a line that parses as a build constraint is one, and the search
-// it feeds verifies the file itself before anything is read from it.
-func buildLine(path string) string {
+// buildHeader returns the file's header as go/build reads it for a build
+// directive, and the //go:build line in it if there is one. The header is the
+// leading run of // comments and blank lines, which must be followed by a
+// blank line; a //go:build line inside a block comment is not a directive, and
+// nothing after the first line that is neither is read. A leading UTF-8 BOM is
+// not part of the source, as the go command's reader has it.
+func buildHeader(path string) (header []byte, goBuild string) {
 	src, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return nil, ""
 	}
-	for _, line := range strings.Split(string(src), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "//") {
+	src = bytes.TrimPrefix(src, []byte{0xef, 0xbb, 0xbf})
+	end, p := 0, src
+	ended := false
+	inBlock := false
+	for len(p) > 0 {
+		line := p
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			line, p = line[:i], p[i+1:]
+		} else {
+			p = p[len(p):]
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 && !ended { // Blank line
+			end = len(src) - len(p)
 			continue
 		}
-		if _, err := constraint.Parse(line); err == nil {
-			return line
+		if !bytes.HasPrefix(line, []byte("//")) { // Not comment line
+			ended = true
+		}
+		if !inBlock && goBuild == "" && constraint.IsGoBuild(string(line)) {
+			goBuild = string(line)
+		}
+		for len(line) > 0 {
+			if inBlock {
+				i := bytes.Index(line, []byte("*/"))
+				if i < 0 {
+					break
+				}
+				inBlock = false
+				line = bytes.TrimSpace(line[i+2:])
+				continue
+			}
+			if bytes.HasPrefix(line, []byte("//")) {
+				break
+			}
+			if bytes.HasPrefix(line, []byte("/*")) {
+				inBlock = true
+				line = bytes.TrimSpace(line[2:])
+				continue
+			}
+			// Found non-comment text.
+			return src[:end], goBuild
 		}
 	}
-	return ""
+	return src[:end], goBuild
+}
+
+// plusBuildExpr ANDs the legacy // +build lines in a file header, one per
+// conjunct, as the go command does. It returns nil when the header has none.
+func plusBuildExpr(header []byte) constraint.Expr {
+	var expr constraint.Expr
+	for _, line := range strings.Split(string(header), "\n") {
+		line = strings.TrimSpace(line)
+		if !constraint.IsPlusBuild(line) {
+			continue
+		}
+		x, err := constraint.Parse(line)
+		if err != nil {
+			continue
+		}
+		if expr == nil {
+			expr = x
+		} else {
+			expr = &constraint.AndExpr{X: expr, Y: x}
+		}
+	}
+	return expr
 }
 
 // moduleGoFiles lists every Go file in the module rooted at dir, skipping the
