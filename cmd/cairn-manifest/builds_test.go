@@ -420,6 +420,61 @@ type Detail struct {
 	}
 }
 
+// A file that declares a package its directory's other files do not is in no
+// build of that directory: the generator behind //go:build ignore, the tools
+// file in a package of its own. The go command keeps it out of every build of
+// the package beside it and go build ./... accepts the module, so the load that
+// enables its tag can only ever fail. The file is read with the other package
+// hidden: the module gets its manifest, and a rule declared in the file is in it
+// rather than dropped with a load that could never work.
+func TestAFileBesideAnotherPackageIsRead(t *testing.T) {
+	for _, tc := range []struct{ name, constraint string }{
+		{"a generator behind the ignore tag", "//go:build ignore\n\npackage main\n"},
+		{"a tools file in its own package", "//go:build tools\n\npackage tools\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeModule(t, `module example.com/beside
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+				"lib.go": `package beside
+
+import "github.com/anyweez/cairn/spec"
+
+var GoodRule = spec.Rule{ID: "G1", Kind: spec.Can, Status: spec.Proposed, Statement: "Read from the package."}
+`,
+				"lib_test.go": `package beside_test
+
+import (
+	"testing"
+
+	"example.com/beside"
+)
+
+func TestNothing(t *testing.T) { _ = beside.GoodRule }
+`,
+				"never.go": tc.constraint + `
+import "github.com/anyweez/cairn/spec"
+
+var NeverBuiltRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, Statement: "Declared in a file no build includes."}
+`,
+			})
+
+			m, err := Extract(dir, "./...")
+			if err != nil {
+				t.Fatalf("a module with %s cannot produce a manifest: %v", tc.name, err)
+			}
+			if got := ruleIDs(m); !slices.Equal(got, []string{"G1", "N1"}) {
+				t.Errorf("rules: %v, want the package's rule and the one declared beside it", got)
+			}
+		})
+	}
+}
+
 func mustRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")

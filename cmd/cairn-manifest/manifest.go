@@ -108,7 +108,9 @@ type Edge struct {
 //
 // A file the current build context excludes is read in a build that includes it,
 // so the manifest is the whole module's spec and not the spec of the platform
-// the tool happens to run on. A file no build this tool can load includes is an
+// the tool happens to run on. A file that shares no build with the package
+// beside it is read with that package hidden, since the go command never
+// builds the two together. A file no build this tool can load includes is an
 // error naming the file and its constraint. A registration or an upcaster in a
 // file that only some builds select records that constraint, so -base can see
 // one that moved off a build that already stored its entries.
