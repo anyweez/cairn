@@ -78,14 +78,18 @@ module=$2
 mountpoint=$3
 
 mkdir -p "$mountpoint"
-if ! mount -t tmpfs -o size=16k tmpfs "$mountpoint"; then
+if ! mount -t tmpfs -o size=64k tmpfs "$mountpoint"; then
 	echo "no tmpfs available to make the write fail deterministically" >&2
 	exit 2
 fi
 
 # Leave less free space than the manifest needs, without filling the whole
 # filesystem: the file the tool truncates still fits, the manifest does not.
-head -c 8192 /dev/zero >"$mountpoint/filler"
+# The filesystem must hold the manifest and the base it replaces at once on the
+# retry -- tmpfs charges a page per file, so 16k is not enough for a manifest
+# that is itself over 16k -- and 64k leaves the first write short as long as the
+# filler is in place.
+head -c 57344 /dev/zero >"$mountpoint/filler"
 printf 'rules: []\ncodecs: []\ntables: []\n' >"$mountpoint/spec.manifest.yaml"
 before=$(wc -c <"$mountpoint/spec.manifest.yaml")
 
