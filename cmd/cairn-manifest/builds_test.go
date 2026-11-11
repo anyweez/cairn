@@ -497,6 +497,36 @@ var NeverBuiltRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, 
 	}
 }
 
+// A codec is a duplicate only when one build selects both its files. The
+// recorded constraints are go build constraints, so two files can be exclusive
+// without naming opposite tags: linux and windows never meet, while linux and
+// amd64 do on every linux/amd64 build.
+func TestBuildsOverlap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"every build and a platform", "", "linux", true},
+		{"two platforms", "linux", "windows", false},
+		{"a platform and a narrower build", "linux", "linux && amd64", true},
+		{"an OS and an architecture", "linux", "amd64", true},
+		{"an OS the other implies", "linux", "android", true},
+		{"a build and its negation", "linux", "!linux", false},
+		{"two disjoint narrow builds", "linux && amd64", "windows || darwin", false},
+		{"a free tag and a narrower build", "tools", "tools && linux", true},
+		{"one free tag on two platforms", "tools && linux", "tools && windows", false},
+		{"the unix tag and windows", "unix", "windows", false},
+		{"the unix tag and a unix OS", "unix", "darwin", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildsOverlap(tc.a, tc.b); got != tc.want {
+				t.Errorf("buildsOverlap(%q, %q) = %t, want %t", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
 func mustRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")

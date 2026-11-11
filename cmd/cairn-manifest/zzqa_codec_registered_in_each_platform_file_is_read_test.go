@@ -73,12 +73,17 @@ func init() {
 	if err != nil {
 		t.Fatalf("a module that registers the same codec once per platform was refused: %v", err)
 	}
-	var names []string
-	for _, c := range m.Codecs {
-		names = append(names, c.Name)
+	if len(m.Codecs) != 1 {
+		t.Fatalf("codecs: got %+v, want one platform.created", m.Codecs)
 	}
-	slices.Sort(names)
-	if want := []string{"platform.created"}; !slices.Equal(names, want) {
-		t.Fatalf("codecs: got %v, want %v", names, want)
+	c := m.Codecs[0]
+	if c.Name != "platform.created" {
+		t.Errorf("name: got %q, want platform.created", c.Name)
+	}
+	if want := "linux || windows"; c.Build != want {
+		t.Errorf("build: got %q, want %q, the union of the two files' constraints", c.Build, want)
+	}
+	if want := []string{"path: string"}; !slices.Equal(c.Fields, want) {
+		t.Errorf("fields: got %q, want %q", c.Fields, want)
 	}
 }

@@ -227,6 +227,17 @@ func covers(now, was string) bool {
 	return true
 }
 
+// buildsOverlap reports whether some build selects both a and b, which is what
+// makes two registrations a duplicate rather than one written once per
+// platform. A build selects both exactly when it selects a but not the builds b
+// excludes, so this is the complement of covers asked whether a's builds are
+// all outside b. An empty constraint selects every build, and a constraint the
+// search cannot parse is treated as overlapping: refusing a module is
+// recoverable, merging a real duplicate is not.
+func buildsOverlap(a, b string) bool {
+	return !covers("!("+b+")", a)
+}
+
 // constraintTags lists every tag the expressions name, sorted so covers'
 // search is deterministic.
 func constraintTags(exprs ...constraint.Expr) []string {

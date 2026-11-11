@@ -443,9 +443,9 @@ func parseBuild(s string) (constraint.Expr, error) {
 	return constraint.Parse("//go:build " + s)
 }
 
-// orBuilds combines two build constraints for one upcaster version: it is
-// registered in the builds either one selects. An empty constraint selects
-// every build, so it absorbs the other.
+// orBuilds combines two build constraints for one registration or upcaster
+// version: it is registered in the builds either one selects. An empty
+// constraint selects every build, so it absorbs the other.
 func orBuilds(a, b string) string {
 	if a == "" || b == "" {
 		return ""
