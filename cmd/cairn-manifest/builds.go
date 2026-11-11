@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/build"
 	"go/build/constraint"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,6 +109,18 @@ func (x *extractor) readInBuild(dir, path string) {
 	if rel != "." {
 		pattern = "./" + filepath.ToSlash(rel)
 	}
+	// A file that declares a package its directory's other files do not shares
+	// no build with them: the go command builds a directory's files as one
+	// package, and keeps such a file out of every build -- the generator behind
+	// //go:build ignore, the tools file in its own package. Hiding the other
+	// package's files is what lets that file be read instead of refused.
+	hide := otherPackage(path)
+	overlay, cleanup, err := hideOverlay(hide)
+	if err != nil {
+		x.errs = append(x.errs, fmt.Sprintf("%s: %v", x.rel(path), err))
+		return
+	}
+	defer cleanup()
 	tried := 0
 	var loadErrs []string
 	for _, ctx := range contexts(path) {
@@ -115,12 +130,17 @@ func (x *extractor) readInBuild(dir, path string) {
 		// A sibling needing the same build has already read this package, or
 		// already failed to; either way that load's errors are this file's.
 		key := ctx.key() + " " + pkgDir
+		if len(hide) > 0 {
+			// Another package's files are hidden from this load, so it stands
+			// apart from the one the directory's own files share.
+			key += " hiding for " + path
+		}
 		if errs, done := x.loaded[key]; done {
 			loadErrs = append(loadErrs, errs...)
 			continue
 		}
 		tried++
-		errs := x.loadBuild(dir, ctx, pattern)
+		errs := x.loadBuild(dir, ctx, pattern, overlay)
 		x.loaded[key] = errs
 		loadErrs = append(loadErrs, errs...)
 		if x.seen[path] {
@@ -141,8 +161,9 @@ func (x *extractor) readInBuild(dir, path string) {
 // loadBuild reads pattern in the build ctx describes and adds what it declares
 // to x. It returns the errors the load reported, which the caller reports
 // against the file that made it try: a build the tool cannot read leaves that
-// file unread, and reporting the loader's message says why.
-func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []string {
+// file unread, and reporting the loader's message says why. overlay, when set,
+// is a go list flag that removes the files the directory cannot build with.
+func (x *extractor) loadBuild(dir string, ctx buildContext, pattern, overlay string) []string {
 	cfg := &packages.Config{
 		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:   dir,
@@ -152,12 +173,100 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []st
 	if len(ctx.tags) > 0 {
 		cfg.BuildFlags = []string{"-tags=" + strings.Join(ctx.tags, ",")}
 	}
+	if overlay != "" {
+		cfg.BuildFlags = append(cfg.BuildFlags, overlay)
+	}
 	pkgs, err := loadPackages(cfg, pattern)
 	if err != nil {
 		return []string{err.Error()}
 	}
 	x.extract(pkgs)
 	return nil
+}
+
+// otherPackage returns the files in path's directory that declare a package
+// path's does not, when there are any. A directory's non-test files are one
+// package to the go command, so a file whose package clause differs from a
+// sibling's is in no build that includes the sibling: it is the generator kept
+// out of every build by //go:build ignore, or the tools file tagged for go mod
+// tidy in a package of its own. go build ./... and go vet ./... accept the
+// directory, so the module is valid; the file's declarations are still source,
+// so the tool reads it with the ones it cannot be built with hidden rather than
+// refusing the module or dropping what it declares.
+//
+// A test file being read is exempt: package foo_test beside package foo is how
+// the go command spells an external test package, and the two are read in one
+// load. Test files of the other package are hidden like its others, because go
+// list reports a package clash against them too.
+func otherPackage(path string) (hide []string) {
+	pkg, err := packageClause(path)
+	if err != nil || pkg == "" || strings.HasSuffix(filepath.Base(path), "_test.go") {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		sibling := filepath.Join(dir, e.Name())
+		if e.IsDir() || !isGoFile(e.Name()) || sibling == path {
+			continue
+		}
+		if other, err := packageClause(sibling); err == nil && other != pkg {
+			hide = append(hide, sibling)
+		}
+	}
+	return hide
+}
+
+// isGoFile reports whether name is a Go file the go command reads, rather than
+// one it ignores for its name.
+func isGoFile(name string) bool {
+	return strings.HasSuffix(name, ".go") && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, ".")
+}
+
+// packageClause returns the package name a Go file declares.
+func packageClause(path string) (string, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly)
+	if err != nil {
+		return "", err
+	}
+	return f.Name.Name, nil
+}
+
+// hideOverlay writes a go list overlay that removes hide from its directory's
+// build, and returns the flag that applies it and a func removing the file. An
+// empty backing file is how the go command spells a file that does not exist.
+func hideOverlay(hide []string) (flag string, cleanup func(), err error) {
+	if len(hide) == 0 {
+		return "", func() {}, nil
+	}
+	replace := make(map[string]string, len(hide))
+	for _, path := range hide {
+		replace[path] = ""
+	}
+	data, err := json.Marshal(struct {
+		Replace map[string]string
+	}{replace})
+	if err != nil {
+		return "", func() {}, err
+	}
+	f, err := os.CreateTemp("", "cairn-manifest-overlay-*.json")
+	if err != nil {
+		return "", func() {}, err
+	}
+	name := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", func() {}, fmt.Errorf("writing the overlay: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", func() {}, fmt.Errorf("writing the overlay: %w", err)
+	}
+	return "-overlay=" + name, func() { os.Remove(name) }, nil
 }
 
 // contexts lists the builds that include path, the inherited build first, so a
@@ -463,7 +572,7 @@ func moduleGoFiles(dir string) ([]string, error) {
 				}
 				continue
 			}
-			if !strings.HasSuffix(name, ".go") || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			if !isGoFile(name) {
 				continue
 			}
 			out = append(out, filepath.Join(path, name))

@@ -11,8 +11,11 @@
 //
 // The manifest does not depend on the host's platform: a file a build
 // constraint excludes is read in a build that includes it, and a file no build
-// includes is an error naming the file and the constraint. A file that build
-// reads but that does not type-check under it is an error carrying the loader's
+// includes is an error naming the file and the constraint. A file that shares
+// no build with the package beside it -- a generator behind //go:build ignore,
+// a tools file in a package of its own -- is read with that package hidden,
+// since the go command never builds the two together. A file that build reads
+// but that does not type-check under it is an error carrying the loader's
 // message naming the file, not a shape read from partial type information.
 //
 // With -base, the manifest is also compared with an earlier one, and the

@@ -344,10 +344,11 @@ are reported with the shortest trace found. The rule-health table shows how
 often each rule actually applied. An established rule that never applies
 fails the check as vacuous, because a check that is never exercised proves
 nothing: make the generator reach it, or list it in `AllowVacuous` if it
-genuinely can't apply to this machine. Vacuity is only enforced on a
-full-length check (rapid's default 100 runs). Under `-short` or a lowered
-`-rapid.checks` it is only reported, since a rarely applied rule can miss a
-short check by chance.
+genuinely can't apply to this machine. An entry names one rule, so an ID that
+two different rules carry is refused rather than exempting both. Vacuity is
+only enforced on a full-length check (rapid's default 100 runs). Under
+`-short` or a lowered `-rapid.checks` it is only reported, since a rarely
+applied rule can miss a short check by chance.
 
 ## The spec manifest
 
@@ -372,10 +373,13 @@ is declared, whether or not a test uses it. It reads:
 
 A file the build context leaves out — one whose `//go:build` line or name ties
 it to another platform, or one that needs a tag such as `tools` — is read in a
-build that includes it. A tree therefore produces the same manifest on every
-host, so the committed file is current everywhere and `-base` never reads a
-type that one platform stores and another does not as removed. A file no build
-includes is an error naming the file and its constraint.
+build that includes it. A file that shares no build with the package beside it
+— a generator behind `//go:build ignore`, a tools file in a package of its own —
+is read with that package's files hidden, since the go command never builds the
+two together. A tree therefore produces the same manifest on every host, so the
+committed file is current everywhere and `-base` never reads a type that one
+platform stores and another does not as removed. A file no build includes is an
+error naming the file and its constraint.
 
 A registration or an upcaster written in a constrained file carries that
 constraint into the manifest, so the manifest says which builds can decode the
