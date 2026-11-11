@@ -78,6 +78,19 @@ func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 			mutate: always(cairn.Accept[int, event, effect](3, []event{added{3}}, announce{99})),
 		},
 		{
+			// The stored refusal is inert, so the same code with an effect is
+			// still a divergence rather than a consequence of the verdict.
+			name: "a same-code refusal gains effects", aspect: ledger.Effected, seq: 1,
+			setup: func(t *testing.T, agg counterAgg) { record(t, agg, add{9, 4}) },
+			mutate: func(agg counterAgg) {
+				agg.Decider.Decide = func(counter, msg) cairn.Decision[int, event, effect] {
+					d := cairn.Refuse[int, event, effect]("over_cap", "no")
+					d.Effects = []effect{announce{1}}
+					return d
+				}
+			},
+		},
+		{
 			name: "the message no longer decodes", aspect: ledger.Undecodable, seq: 1,
 			setup: func(t *testing.T, agg counterAgg) { record(t, agg, add{3, 100}) },
 			mutate: func(agg counterAgg) {

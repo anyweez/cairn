@@ -28,9 +28,9 @@ const (
 	Refused Aspect = "refusal"
 	// Returned: the accepted decisions returned different results.
 	Returned Aspect = "result"
-	// Emitted: the accepted decisions emitted different events.
+	// Emitted: the decisions emitted different events.
 	Emitted Aspect = "events"
-	// Effected: the accepted decisions queued different effects.
+	// Effected: the decisions queued different effects.
 	Effected Aspect = "effects"
 	// Undecodable: the stored message or result no longer decodes, so it
 	// could not be re-decided or compared.
@@ -88,6 +88,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 
 		d := a.Decider.Decide(state, msg)
 
+		verdictDiffers := true
 		switch {
 		case e.Refusal != nil && d.Refusal == nil:
 			diverge(Refused, e.Refusal.Code, "accepted")
@@ -95,22 +96,30 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 			diverge(Refused, "accepted", d.Refusal.Code)
 		case e.Refusal != nil && d.Refusal != nil && e.Refusal.Code != d.Refusal.Code:
 			diverge(Refused, e.Refusal.Code, d.Refusal.Code)
+		default:
+			verdictDiffers = false
 		}
 
 		// Once the verdict differs, so must everything that follows from it;
-		// the refusal is the one divergence worth reading.
-		if e.Refusal == nil && d.Refusal == nil {
-			now, err := a.Codecs.Results.Encode(d.Result)
-			if err != nil {
-				return out, err
-			}
-			switch stored, err := a.storedResult(e); {
-			case err != nil:
-				diverge(Undecodable, "result", err)
-			case e.Result.Type != now.Type:
-				diverge(Returned, e.Result.Type, now.Type)
-			case !coversJSON(stored, now.Data):
-				diverge(Returned, string(stored), string(now.Data))
+		// the refusal is the one divergence worth reading. When it does not
+		// differ, the rest is compared. A stored refusal is inert — the
+		// schema's CHECK holds it to no events or effects, and Handle will not
+		// record one that has either — so a same-code refusal today must be
+		// inert too, and one that gained events or effects is a divergence.
+		if !verdictDiffers {
+			if e.Refusal == nil {
+				now, err := a.Codecs.Results.Encode(d.Result)
+				if err != nil {
+					return out, err
+				}
+				switch stored, err := a.storedResult(e); {
+				case err != nil:
+					diverge(Undecodable, "result", err)
+				case e.Result.Type != now.Type:
+					diverge(Returned, e.Result.Type, now.Type)
+				case !coversJSON(stored, now.Data):
+					diverge(Returned, string(stored), string(now.Data))
+				}
 			}
 			if !sameSlice(storedEvents, d.Events) {
 				diverge(Emitted, storedEvents, d.Events)

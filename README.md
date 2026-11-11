@@ -320,7 +320,8 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   from the stored events, so one divergence doesn't cascade. A stored result
   is upcast and compared on the fields it carries, so a field added to the
   result since an entry was recorded is checked only when its upcaster can
-  fill it in.
+  fill it in. A refusal is stored without events or effects, so a re-decided
+  refusal with the same code that now carries either is reported too.
 
 The library owns the `cairn` schema. Applications read from it through this
 package and never write to it directly.
