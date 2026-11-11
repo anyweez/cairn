@@ -344,10 +344,11 @@ are reported with the shortest trace found. The rule-health table shows how
 often each rule actually applied. An established rule that never applies
 fails the check as vacuous, because a check that is never exercised proves
 nothing: make the generator reach it, or list it in `AllowVacuous` if it
-genuinely can't apply to this machine. Vacuity is only enforced on a
-full-length check (rapid's default 100 runs). Under `-short` or a lowered
-`-rapid.checks` it is only reported, since a rarely applied rule can miss a
-short check by chance.
+genuinely can't apply to this machine. An entry names one rule, so an ID that
+two different rules carry is refused rather than exempting both. Vacuity is
+only enforced on a full-length check (rapid's default 100 runs). Under
+`-short` or a lowered `-rapid.checks` it is only reported, since a rarely
+applied rule can miss a short check by chance.
 
 ## The spec manifest
 
