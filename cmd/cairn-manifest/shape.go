@@ -13,9 +13,15 @@ import (
 // fields renders the JSON shape of a registered type, one entry per field, as
 // encoding/json writes it. A type that isn't a struct is one entry, "=".
 //
-// An omitempty or omitzero field is marked with "?" after its name. A name
-// that itself contains "?" is escaped by doubling it, so a literal "?" is
-// never mistaken for the marker.
+// A field's omission options are marked after its name with "?" and the
+// options the tag carries: "a?empty" for omitempty, "a?zero" for omitzero,
+// and "a?empty,zero" for both. They are three different wire formats, because
+// encoding/json's omitempty omits a value that is empty in the old sense and
+// never omits a zero struct, while omitzero omits anything IsZero or
+// reflect.Value.IsZero reports zero. The bare "?" still means omitempty
+// alone, so a manifest written before omitzero was told apart compares equal
+// for every field that has not changed. A name that itself contains "?" is
+// escaped by doubling it, so a literal "?" never starts the marker.
 //
 // codec.Encode marshals the registered value itself, which is not
 // addressable, so a marshaler with a pointer receiver on that type is not
@@ -150,7 +156,7 @@ type jsonField struct {
 	name   string // the JSON key
 	index  []int  // path from the root struct: its depth and output order
 	tagged bool   // the JSON tag named it, which breaks a depth tie
-	entry  string // "name: shape", with "?" after an omitempty name
+	entry  string // "name: shape", with the omission marker in name
 }
 
 // structFields follows encoding/json: exported fields only, renamed or
@@ -256,14 +262,27 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 				if display == "" {
 					display = f.Name()
 				}
-				// "?" after the name marks omitempty/omitzero, but "?" is also
-				// a legal JSON key character, so a field tagged `json:"a?"`
-				// would render exactly like `json:"a,omitempty"`: different
-				// wire formats, one manifest entry. Double a literal "?" in
-				// the rendered entry so the marker is the only single "?"; the
-				// dominance key stays the raw JSON name encoding/json compares.
+				// "?" after the name starts the omission marker, but "?" is
+				// also a legal JSON key character, so a field tagged
+				// `json:"a?"` would render exactly like `json:"a,omitempty"`:
+				// different wire formats, one manifest entry. Double a literal
+				// "?" in the rendered entry so the marker is the only single
+				// "?"; the dominance key stays the raw JSON name encoding/json
+				// compares.
 				entry := strings.ReplaceAll(display, "?", "??")
-				if hasOption(opts, "omitempty") || hasOption(opts, "omitzero") {
+				// Name the options, because omitempty and omitzero omit
+				// different values: a switch between them changes what
+				// encoding/json writes, and one "?" for "may be absent" would
+				// make that switch invisible to -base. The bare "?" keeps
+				// meaning omitempty alone, so manifests written before the two
+				// were told apart still compare equal for unchanged fields.
+				empty, zero := hasOption(opts, "omitempty"), hasOption(opts, "omitzero")
+				switch {
+				case empty && zero:
+					entry += "?empty,zero"
+				case zero:
+					entry += "?zero"
+				case empty:
 					entry += "?"
 				}
 				shape := s.shape(f.Type(), q.addr)

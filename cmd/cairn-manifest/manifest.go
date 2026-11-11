@@ -58,8 +58,10 @@ type Codec struct {
 	// list is registered in every build.
 	UpcastBuilds []UpcastBuild `yaml:"upcast_builds,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
-	// "?" after the name of an omitempty field. A literal "?" in the name is
-	// doubled so it can't be read as that marker.
+	// the field's omission options after the name: "?" for omitempty, "?zero"
+	// for omitzero, and "?empty,zero" for both, since the three rules omit
+	// different values. A literal "?" in the name is doubled so it can't be
+	// read as that marker.
 	Fields []string `yaml:"fields"`
 }
 
