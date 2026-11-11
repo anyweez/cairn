@@ -88,6 +88,64 @@ func (*zzqaAdded) UnmarshalJSON([]byte) error {
 	return errors.New("zzqaAdded refuses every payload")
 }
 
+// The same defect on the sibling path: an effect is only decoded later, by the
+// dispatcher, so an undecodable one would be committed and then retry for ever.
+// Handle must refuse it instead, leaving nothing recorded and the stream
+// loadable.
+func TestAnEffectThatCannotBeDecodedIsNotRecorded(t *testing.T) {
+	t.Parallel()
+	store := ledgertest.NewStore(t)
+	msgs := codec.New[zzqaMsg]()
+	codec.Register[zzqaAdd](msgs, "zzqa.add", 1)
+	events := codec.New[zzqaEvent]()
+	codec.Register[zzqaAdded](events, "zzqa.added", 1)
+	effects := codec.New[zzqaEffect]()
+	codec.Register[zzqaStuckEffect](effects, "zzqa.stuck-effect", 1)
+	results := codec.New[zzqaResult]()
+	codec.Register[zzqaResult](results, "zzqa.result", 1)
+
+	agg := &ledger.Aggregate[zzqaState, zzqaMsg, zzqaResult, zzqaEvent, zzqaEffect]{
+		Store: store, Kind: "zzqa-effect",
+		Decider: cairn.Decider[zzqaState, zzqaMsg, zzqaResult, zzqaEvent, zzqaEffect]{
+			Initial: func() zzqaState { return zzqaState{} },
+			Decide: func(zzqaState, zzqaMsg) cairn.Decision[zzqaResult, zzqaEvent, zzqaEffect] {
+				return cairn.Accept[zzqaResult, zzqaEvent, zzqaEffect](1, nil, zzqaStuckEffect{})
+			},
+			Evolve: func(s zzqaState, _ zzqaEvent) zzqaState { return s },
+		},
+		Codecs: &codec.Set[zzqaMsg, zzqaResult, zzqaEvent, zzqaEffect]{
+			Messages: msgs, Results: results, Events: events, Effects: effects,
+		},
+	}
+
+	if _, err := agg.Handle(ctx, "a", zzqaAdd{}); err == nil {
+		t.Fatal("Handle recorded an effect it cannot decode")
+	}
+	entries, err := store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Handle refused the message but recorded %d entries", len(entries))
+	}
+	if _, err := agg.Load(ctx, "a"); err != nil {
+		t.Fatalf("the stream cannot be loaded after the refusal: %v", err)
+	}
+}
+
 type zzqaEffect interface{ isZZQAEffect() }
+
+// zzqaStuckEffect has the same gap as zzqaAdded, on the outbox path: an effect
+// is decoded only by the dispatcher, after the entry carrying it is committed.
+// Recorded, it would fail to decode on every delivery attempt.
+type zzqaStuckEffect struct{}
+
+func (zzqaStuckEffect) isZZQAEffect() {}
+
+func (zzqaStuckEffect) MarshalJSON() ([]byte, error) { return []byte(`{"stuck":true}`), nil }
+
+func (*zzqaStuckEffect) UnmarshalJSON([]byte) error {
+	return errors.New("zzqaStuckEffect refuses every payload")
+}
 
 type zzqaResult int
