@@ -260,6 +260,8 @@ func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
 		{"foo.go", "package x\n\nconst s = `\n//go:build linux\n`\n", ""},
 		// Nor is one inside a block comment, and a BOM is not source.
 		{"foo.go", "/*\n//go:build linux\n*/\n\npackage x\n", ""},
+		// go/build ignores a legacy line that follows a block comment.
+		{"foo.go", "/* c */\n// +build linux\n\npackage x\n", ""},
 		{"foo.go", "\ufeff//go:build linux\n\npackage x\n", "linux"},
 	} {
 		path := filepath.Join(t.TempDir(), tc.name)
