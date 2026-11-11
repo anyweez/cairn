@@ -383,7 +383,11 @@ error naming the file and its constraint.
 
 A registration or an upcaster written in a constrained file carries that
 constraint into the manifest, so the manifest says which builds can decode the
-entries. Moving one from one platform's file to another's changes no name,
+entries. A registration written once in each of several files that no build
+includes together — one per platform — is one entry whose `build` is the union
+of their constraints. Two calls one build does include together are a
+duplicate, as are calls that disagree about the version, type or shape under
+one name. Moving one from one platform's file to another's changes no name,
 version or shape, but it takes the code path away from a build that already
 stored entries, so `-base` reports it.
 

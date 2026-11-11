@@ -46,10 +46,11 @@ type Codec struct {
 	Type    string `yaml:"type"`
 	// Build is the constraint the builds that register this codec share, when
 	// it is not registered in every build: "linux", "windows && amd64". It
-	// comes from the file the registration is written in, so a tree records
-	// the same membership on every host. Empty means every build. A build that
-	// does not register the codec cannot decode the entries it stored, so
-	// -base fails when this narrows.
+	// comes from the files the registration is written in, unioned when no
+	// build selects two of them, so a tree records the same membership on
+	// every host. Empty means every build. A build that does not register the
+	// codec cannot decode the entries it stored, so -base fails when this
+	// narrows.
 	Build string `yaml:"build,omitempty"`
 	// Upcasts lists the versions that have an upcaster to the next one.
 	Upcasts []int `yaml:"upcasts,omitempty"`
@@ -113,7 +114,9 @@ type Edge struct {
 // builds the two together. A file no build this tool can load includes is an
 // error naming the file and its constraint. A registration or an upcaster in a
 // file that only some builds select records that constraint, so -base can see
-// one that moved off a build that already stored its entries.
+// one that moved off a build that already stored its entries. A registration
+// written in more than one file no build includes together records the union of
+// their constraints, since every build that needs it still registers it.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -131,7 +134,7 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 
 	x := &extractor{
 		dir: dir, seen: map[string]bool{}, loaded: map[string][]string{},
-		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
+		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string][]codecSite{},
 	}
 	x.extract(pkgs)
 	if len(x.errs) == 0 {
@@ -150,6 +153,13 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		slices.Sort(x.errs)
 		x.errs = slices.Compact(x.errs)
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
+	}
+
+	// A codec registered once in each of several files no build includes
+	// together is one registration, and its membership is the union of those
+	// files' builds.
+	for key, sites := range x.codecAt {
+		x.codecs[key].Build = mergeBuilds(sites)
 	}
 
 	m := &Manifest{Rules: x.rules, Tables: x.tables, Codecs: []Codec{}}
@@ -226,6 +236,14 @@ type upcast struct {
 	build string
 }
 
+// codecSite is one codec.Register call: the build its file selects and where
+// it is written. A second call under the same sum and name is a duplicate only
+// if a build selects both, so the extractor keeps every call's membership.
+type codecSite struct {
+	build string
+	pos   string
+}
+
 // extract adds the declarations in pkgs to x. A package's files appear again in
 // its test variant, so each file is read once, and the files its build context
 // left out are remembered for readBuilds.
@@ -280,7 +298,7 @@ type extractor struct {
 	ruleAt  map[string]string
 	tables  []Table
 	codecs  map[string]*Codec
-	codecAt map[string]string
+	codecAt map[string][]codecSite
 	upcasts []upcast
 	errs    []string
 }
@@ -500,12 +518,24 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			Fields:  fields(v),
 		}
 		at := x.position(p.Fset, call.Pos())
-		if prev, dup := x.codecAt[c.key()]; dup {
-			x.errorf(p.Fset, call.Pos(), "%s is also registered at %s", c.Name, prev)
+		key := c.key()
+		sites := x.codecAt[key]
+		for _, prev := range sites {
+			if buildsOverlap(prev.build, c.Build) {
+				x.errorf(p.Fset, call.Pos(), "%s is also registered at %s", c.Name, prev.pos)
+				return
+			}
+		}
+		if prev, ok := x.codecs[key]; ok {
+			if why := codecDisagreement(prev, c); why != "" {
+				x.errorf(p.Fset, call.Pos(), "%s is registered at %s, but the two calls disagree: %s", c.Name, sites[0].pos, why)
+				return
+			}
+			x.codecAt[key] = append(sites, codecSite{build: c.Build, pos: at})
 			return
 		}
-		x.codecAt[c.key()] = at
-		x.codecs[c.key()] = c
+		x.codecAt[key] = []codecSite{{build: c.Build, pos: at}}
+		x.codecs[key] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
 		// The declaring receiver is *codec.Codec[T] whether the caller names it
 		// directly, through an alias, or promotes it from an embedded codec;
@@ -542,6 +572,42 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 	case unattributedUpcast(info, call):
 		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
 	}
+}
+
+// codecDisagreement explains why c cannot share a manifest entry with a call
+// already recorded under the same sum and name, or "" when the two agree. Calls
+// no build includes together are one registration only if they say the same
+// thing: one entry cannot carry two versions, types or field shapes.
+func codecDisagreement(prev, c *Codec) string {
+	switch {
+	case prev.Version != c.Version:
+		return fmt.Sprintf("version %d there and version %d here", prev.Version, c.Version)
+	case prev.Type != c.Type:
+		return fmt.Sprintf("type %s there and type %s here", prev.Type, c.Type)
+	case !sameFields(prev.Fields, c.Fields):
+		return fmt.Sprintf("fields [%s] there and [%s] here", strings.Join(prev.Fields, ", "), strings.Join(c.Fields, ", "))
+	}
+	return ""
+}
+
+// mergeBuilds returns the constraint selecting the builds any of sites selects.
+// The builds are sorted first so the same tree records the same union on every
+// host.
+func mergeBuilds(sites []codecSite) string {
+	builds := make([]string, len(sites))
+	for i, s := range sites {
+		builds[i] = s.build
+	}
+	slices.Sort(builds)
+	builds = slices.Compact(builds)
+	if len(builds) == 0 || builds[0] == "" {
+		return ""
+	}
+	union := builds[0]
+	for _, b := range builds[1:] {
+		union = orBuilds(union, b)
+	}
+	return union
 }
 
 func (x *extractor) upcastsToCodecs() {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -189,6 +190,139 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	if n := strings.Count(err.Error(), "\n") + 1; n != 11 {
 		t.Errorf("got %d errors, want 11:\n%v", n, err)
 	}
+}
+
+// A registration repeated in files one build includes together is a duplicate
+// even when the second file is also constrained: every linux/amd64 build sees
+// both calls.
+func TestExtractRefusesCodecRegisteredInBuildsOneBuildSelects(t *testing.T) {
+	dir := codecBuildModule(t, codecBuildEvents+codecBuildCreated, map[string]string{
+		"linux.go": registerOnlyInBuild("linux", "Created", 1),
+		"amd64.go": registerOnlyInBuild("linux && amd64", "Created", 1),
+	})
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("a codec registered in two files one build includes together must be refused")
+	}
+	for _, want := range []string{"builds.created", "is also registered at", "linux.go", "amd64.go"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in:\n%v", want, err)
+		}
+	}
+}
+
+// Two calls no build includes together are one registration only when they say
+// the same thing. A different version, type or field shape is refused naming
+// both files and the disagreement, rather than folded into one entry.
+func TestExtractRefusesCodecRegistrationsThatDisagree(t *testing.T) {
+	path := "Path string `json:\"path\"`"
+	for _, tc := range []struct {
+		name           string
+		linux, windows string
+		want           []string
+	}{
+		{
+			"version",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Created", path, 2),
+			[]string{"version 1", "version 2"},
+		},
+		{
+			"type",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Published", path, 1),
+			[]string{"example.com/builds.Created", "example.com/builds.Published", "type "},
+		},
+		{
+			"field shape",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Created", "Name string `json:\"name\"`", 1),
+			[]string{"fields [", "path: string", "name: string"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := codecBuildModule(t, codecBuildEvents, map[string]string{"linux.go": tc.linux, "windows.go": tc.windows})
+			_, err := Extract(dir, "./...")
+			if err == nil {
+				t.Fatal("codec registrations that disagree under one name must be refused")
+			}
+			for _, want := range append([]string{"builds.created", "linux.go", "windows.go", "disagree"}, tc.want...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("missing %q in:\n%v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// codecBuildModule writes a module whose shared file is events, with the given
+// platform files registering into it.
+func codecBuildModule(t *testing.T, events string, files map[string]string) string {
+	t.Helper()
+	files["events.go"] = events
+	return writeModule(t, `module example.com/builds
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, files)
+}
+
+const codecBuildEvents = `package builds
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+func Codecs() *codec.Codec[Event] { return codecs }
+
+var codecs = codec.New[Event]()
+`
+
+const codecBuildCreated = `
+type Created struct {
+	Path string ` + "`json:\"path\"`" + `
+}
+
+func (Created) isEvent() {}
+`
+
+// registerOnlyInBuild writes a file selecting build that registers an existing
+// type under one name.
+func registerOnlyInBuild(build, typ string, version int) string {
+	return fmt.Sprintf(`//go:build %s
+
+package builds
+
+import "github.com/anyweez/cairn/codec"
+
+func init() {
+	codec.Register[%s, Event](Codecs(), "builds.created", %d)
+}
+`, build, typ, version)
+}
+
+// registerInBuild writes a file selecting build that registers typ under one
+// name.
+func registerInBuild(build, typ, fields string, version int) string {
+	return fmt.Sprintf(`//go:build %s
+
+package builds
+
+import "github.com/anyweez/cairn/codec"
+
+type %s struct {
+	%s
+}
+
+func (%s) isEvent() {}
+
+func init() {
+	codec.Register[%s, Event](Codecs(), "builds.created", %d)
+}
+`, build, typ, fields, typ, typ, version)
 }
 
 // A registration reached through a generic helper writes the helper's type
