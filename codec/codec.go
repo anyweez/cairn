@@ -899,12 +899,14 @@ func sortRegistrations(rs []Registration) {
 
 // goTypeString renders a runtime type as go/types does for the manifest: a
 // named type with its full import path, a basic type by name, an unnamed type
-// in go/types' own spelling. reflect's Type.String is not that spelling — it
-// writes `interface {}` and `struct { X int }` where go/types writes `any` and
-// `struct{X int}` — so an unnamed composite is built here rather than borrowed
-// from it. `cmd/cairn-manifest` renders the other half with types.TypeString,
-// and a sum type the two name differently fails codec.CheckRegistrations in
-// both directions for one correct codec.
+// in go/types' own spelling, and an instantiated generic's type arguments
+// separated as go/types separates them. reflect's Type.String is not that
+// spelling — it writes `interface {}` and `struct { X int }` where go/types
+// writes `any` and `struct{X int}`, and joins a generic's type arguments with
+// "," where go/types writes ", " — so an unnamed composite is built here and a
+// name is normalized rather than borrowed from it. `cmd/cairn-manifest` renders
+// the other half with types.TypeString, and a sum type the two name differently
+// fails codec.CheckRegistrations in both directions for one correct codec.
 func goTypeString(t reflect.Type) string {
 	// A defined type is named however its kind looks: `type Listing []string`
 	// is example.com/x.Listing to go/types, not []string. Ask for the name
@@ -912,9 +914,9 @@ func goTypeString(t reflect.Type) string {
 	// cross-check names a different type than the static half.
 	if t.Name() != "" {
 		if t.PkgPath() == "" {
-			return t.Name()
+			return goTypeArgsString(t.Name())
 		}
-		return t.PkgPath() + "." + t.Name()
+		return goTypeArgsString(t.PkgPath() + "." + t.Name())
 	}
 	switch t.Kind() {
 	case reflect.Pointer:
@@ -941,6 +943,54 @@ func goTypeString(t reflect.Type) string {
 		return goInterfaceString(t)
 	}
 	return t.String()
+}
+
+// goTypeArgsString rewrites the type-argument list of an instantiated generic
+// name in go/types' spelling. reflect renders `Pair[Key,string]` where go/types
+// writes `Pair[Key, string]`, so without this a generic sum is named differently
+// by the two halves of the manifest cross-check. reflect exposes the type
+// arguments only as the text of Name(), so each is rewritten in place; recursing
+// into an argument reaches a multi-argument instantiation nested inside another.
+func goTypeArgsString(name string) string {
+	open := strings.IndexByte(name, '[')
+	if open < 0 {
+		return name
+	}
+	args, end, ok := splitTypeArgs(name, open)
+	if !ok {
+		return name
+	}
+	for i, arg := range args {
+		args[i] = goTypeArgsString(strings.TrimSpace(arg))
+	}
+	return name[:open+1] + strings.Join(args, ", ") + name[end:]
+}
+
+// splitTypeArgs splits the type-argument list that starts at name[open] and
+// returns its arguments with the index of the closing bracket. Brackets,
+// parens and braces are counted so a comma inside a nested list is not a
+// separator.
+func splitTypeArgs(name string, open int) ([]string, int, bool) {
+	depth := 0
+	start := open + 1
+	var args []string
+	for i := open; i < len(name); i++ {
+		switch c := name[i]; c {
+		case '[', '(', '{':
+			depth++
+		case ']', ')', '}':
+			depth--
+			if depth == 0 {
+				return append(args, name[start:i]), i, true
+			}
+		case ',':
+			if depth == 1 {
+				args = append(args, name[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 // goInterfaceString writes an interface as `any` or `interface{M() int}`.
