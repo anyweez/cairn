@@ -43,7 +43,7 @@ func TestExtractReadsEverything(t *testing.T) {
 		"status: string",                         // a named string is a string
 		"-: string",                              // json:"-," names the field "-"
 		"Untagged: int",                          //
-		"extra?: map[string]string",              // omitzero
+		"extra?zero: map[string]string",          // omitzero
 		"count: string(int)",                     // ,string writes the number inside a string
 		"labels: []string",                       // ,string applies only to scalars
 		"inline: {a: int}",                       // not addressable: the pointer marshaler is unused
@@ -591,6 +591,11 @@ func TestIncompatible(t *testing.T) {
 		{"nested field added", one("o: {a: string}"), one("o: {a: string, b: int}"), "changed shape without a version bump"},
 		{"nested field removed", one("o: {a: string, b: int}"), one("o: {a: string}"), "changed shape without a version bump"},
 		{"nested omitempty added", one("o: {a: string}"), one("o: {a?: string}"), "changed shape without a version bump"},
+		{"nested omitzero added", one("o: {a: string}"), one("o: {a?zero: string}"), "changed shape without a version bump"},
+		// omitempty and omitzero omit different values, so a switch between
+		// them is a wire change the -base check must report.
+		{"nested omitempty switched to omitzero", one("o: {a?: string}"), one("o: {a?zero: string}"), "changed shape without a version bump"},
+		{"nested omitzero added to omitempty", one("o: {a?: string}"), one("o: {a?empty,zero: string}"), "changed shape without a version bump"},
 		{"nested string option added", one("o: {a: int}"), one("o: {a: string(int)}"), "changed shape without a version bump"},
 		{"nested reorder hides a rename", one("o: {a: string, b: int}"), one("o: {b: int, c: string}"), "changed shape without a version bump"},
 	} {
