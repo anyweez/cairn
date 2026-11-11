@@ -373,10 +373,13 @@ is declared, whether or not a test uses it. It reads:
 
 A file the build context leaves out — one whose `//go:build` line or name ties
 it to another platform, or one that needs a tag such as `tools` — is read in a
-build that includes it. A tree therefore produces the same manifest on every
-host, so the committed file is current everywhere and `-base` never reads a
-type that one platform stores and another does not as removed. A file no build
-includes is an error naming the file and its constraint.
+build that includes it. A file that shares no build with the package beside it
+— a generator behind `//go:build ignore`, a tools file in a package of its own —
+is read with that package's files hidden, since the go command never builds the
+two together. A tree therefore produces the same manifest on every host, so the
+committed file is current everywhere and `-base` never reads a type that one
+platform stores and another does not as removed. A file no build includes is an
+error naming the file and its constraint.
 
 A registration or an upcaster written in a constrained file carries that
 constraint into the manifest, so the manifest says which builds can decode the
