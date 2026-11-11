@@ -14,14 +14,14 @@ import (
 // encoding/json writes it. A type that isn't a struct is one entry, "=".
 //
 // A field's omission options are marked after its name with "?" and the
-// options the tag carries: "a?empty" for omitempty, "a?zero" for omitzero,
-// and "a?empty,zero" for both. They are three different wire formats, because
+// options the tag carries: "a?" for omitempty, "a?zero" for omitzero, and
+// "a?empty,zero" for both. They are three different wire formats, because
 // encoding/json's omitempty omits a value that is empty in the old sense and
 // never omits a zero struct, while omitzero omits anything IsZero or
-// reflect.Value.IsZero reports zero. The bare "?" still means omitempty
-// alone, so a manifest written before omitzero was told apart compares equal
-// for every field that has not changed. A name that itself contains "?" is
-// escaped by doubling it, so a literal "?" never starts the marker.
+// reflect.Value.IsZero reports zero. Naming omitempty "a?" rather than
+// "a?empty" means a manifest written before omitzero was told apart compares
+// equal for every field that has not changed. A name that itself contains "?"
+// is escaped by doubling it, so a literal "?" never starts the marker.
 //
 // codec.Encode marshals the registered value itself, which is not
 // addressable, so a marshaler with a pointer receiver on that type is not
