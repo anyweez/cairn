@@ -254,6 +254,15 @@ func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
 		{"linux.go", "package x\n", ""},
 		{"foo.go", "//go:build linux || darwin\n\npackage x\n", "linux || darwin"},
 		{"foo_linux.go", "//go:build linux\n\npackage x\n", "linux"},
+		// The go command ANDs every legacy // +build line in the header.
+		{"foo.go", "// +build linux\n// +build amd64\n\npackage x\n", "linux && amd64"},
+		// A constraint-looking line after the package clause is not one.
+		{"foo.go", "package x\n\nconst s = `\n//go:build linux\n`\n", ""},
+		// Nor is one inside a block comment, and a BOM is not source.
+		{"foo.go", "/*\n//go:build linux\n*/\n\npackage x\n", ""},
+		// go/build ignores a legacy line that follows a block comment.
+		{"foo.go", "/* c */\n// +build linux\n\npackage x\n", ""},
+		{"foo.go", "\ufeff//go:build linux\n\npackage x\n", "linux"},
 	} {
 		path := filepath.Join(t.TempDir(), tc.name)
 		if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
@@ -262,6 +271,19 @@ func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
 		if got := fileBuild(path); got != tc.want {
 			t.Errorf("%s: build %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// extraTags feeds the build search: a custom tag that only a later legacy
+// // +build line names must still be offered, or the file is never read.
+func TestExtraTagsReadsEveryLegacyBuildLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "foo.go")
+	src := "// +build linux\n// +build cairnqa\n\npackage x\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := extraTags(path); !slices.Equal(got, []string{"cairnqa"}) {
+		t.Errorf("extra tags %v, want [cairnqa]", got)
 	}
 }
 
