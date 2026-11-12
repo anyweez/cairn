@@ -26,6 +26,11 @@ export CAIRN_TEST_DATABASE_URL
 export CAIRN_REQUIRE_DATABASE=1
 go test -race ./...
 
+# The fixture scripts' lock library is shell, so no Go test reaches its
+# failure paths: without these, a regression shows up as a hung fixture.
+bash scripts/lib-lock_test.sh
+bash scripts/zzqa_lock_acquire_ends_when_its_directory_is_unusable_test.sh
+
 go -C cmd/cairn-manifest vet ./...
 go -C cmd/cairn-manifest test ./...
 
