@@ -215,3 +215,128 @@ func TestEncodeRefusesATimeItCannotCarry(t *testing.T) {
 		t.Fatalf("stored %v, want the instant sent %v", back.At, moved)
 	}
 }
+
+// A type over time.Time may encode its time deliberately another way — the
+// date, the year, an object around it. That is an encoding of its own, not
+// time's, so only its text is checked and the instant it drops is not a reason
+// to refuse it.
+type dateOnlyTime time.Time
+
+func (t dateOnlyTime) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Time(t).Format("2006-01-02"))
+}
+
+type yearOnlyTime time.Time
+
+func (t yearOnlyTime) MarshalText() ([]byte, error) {
+	return []byte(time.Time(t).Format("2006")), nil
+}
+
+type dateOnlyHolder struct {
+	At dateOnlyTime `json:"at"`
+}
+
+type yearOnlyHolder struct {
+	At yearOnlyTime `json:"at"`
+}
+
+func TestATimeLikeTypeWithItsOwnEncodingIsCheckedAsText(t *testing.T) {
+	at := time.Date(1900, time.January, 1, 12, 0, 0, 0, time.FixedZone("AMT", 19*60+32))
+	for name, value := range map[string]any{
+		"JSON that writes the date only": dateOnlyHolder{At: dateOnlyTime(at)},
+		"text that writes the year only": yearOnlyHolder{At: yearOnlyTime(at)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := codec.CheckStorable(value); err != nil {
+				t.Fatalf("a type with an encoding of its own was refused: %v", err)
+			}
+		})
+	}
+}
+
+// A wrapped time is held to the range check a plain time.Time gets: time's own
+// marshaller refuses a year JSON cannot write, and a type defined over a
+// time.Time or embedding one must reach that refusal rather than failing later
+// in Encode, after Decide has said yes.
+type namedRangeTime time.Time
+
+func (t namedRangeTime) MarshalJSON() ([]byte, error) { return time.Time(t).MarshalJSON() }
+
+type embeddedRangeTime struct{ time.Time }
+
+type namedRangeHolder struct {
+	At namedRangeTime `json:"at"`
+}
+
+type embeddedRangeHolder struct {
+	At embeddedRangeTime `json:"at"`
+}
+
+// Exported so the embedding field is exported too: reflect cannot read an
+// unexported embedded field, though json promotes its marshaller either way.
+type ExportedNamedRange time.Time
+
+func (t ExportedNamedRange) MarshalJSON() ([]byte, error) { return time.Time(t).MarshalJSON() }
+
+type embeddedNamedTime struct{ ExportedNamedRange }
+
+type embeddedNamedHolder struct {
+	At embeddedNamedTime `json:"at"`
+}
+
+// A type over time.Time may write time's own RFC 3339 at a coarser precision.
+// Its offset is exact but the fraction of a second is not, so an instant with
+// nanoseconds comes back as a different one, and the refusal should name that
+// rather than the zone offset it did not lose.
+type truncatedTime time.Time
+
+func (t truncatedTime) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Time(t).Format(time.RFC3339))
+}
+
+type truncatedTimeHolder struct {
+	At truncatedTime `json:"at"`
+}
+
+func TestAWrappedTimeThatDropsTheFractionIsRefusedForThatReason(t *testing.T) {
+	at := time.Date(2026, time.March, 4, 5, 6, 7, 123456789, time.UTC)
+	err := codec.CheckStorable(truncatedTimeHolder{At: truncatedTime(at)})
+	var notStorable *codec.NotStorableError
+	if !errors.As(err, &notStorable) {
+		t.Fatalf("CheckStorable(%v) = %v, want a NotStorableError", at, err)
+	}
+	if notStorable.Path != "value.At" {
+		t.Fatalf("path %q, want %q", notStorable.Path, "value.At")
+	}
+	if !strings.Contains(notStorable.Why, "fraction of a second") {
+		t.Fatalf("the refusal %q does not name the fraction of a second", notStorable.Why)
+	}
+	if strings.Contains(notStorable.Why, "zone offset") {
+		t.Fatalf("the refusal %q blames the zone offset, which is exact", notStorable.Why)
+	}
+
+	whole := at.Truncate(time.Second)
+	if err := codec.CheckStorable(truncatedTimeHolder{At: truncatedTime(whole)}); err != nil {
+		t.Fatalf("CheckStorable(%v) = %v, want storable", whole, err)
+	}
+}
+
+func TestATimeJSONCannotWriteIsRefusedInAWrappedType(t *testing.T) {
+	at := time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for name, value := range map[string]any{
+		"a type defined over time.Time":   namedRangeHolder{At: namedRangeTime(at)},
+		"a struct embedding time.Time":    embeddedRangeHolder{At: embeddedRangeTime{at}},
+		"a struct embedding a named time": embeddedNamedHolder{At: embeddedNamedTime{ExportedNamedRange(at)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := codec.CheckStorable(value)
+			var notStorable *codec.NotStorableError
+			if !errors.As(err, &notStorable) {
+				t.Fatalf("CheckStorable(%v) = %v, want a NotStorableError", at, err)
+			}
+			if notStorable.Path != "value.At" {
+				t.Fatalf("path %q, want %q", notStorable.Path, "value.At")
+			}
+		})
+	}
+}
