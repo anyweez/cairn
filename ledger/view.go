@@ -31,6 +31,13 @@ import (
 // zero: the entry is written in the same round trip as the view, so they are
 // not known yet.
 //
+// Write must not change at. It is the state the store's state cache keeps, and
+// the next message on the stream is decided from it; changing a slice, map or
+// pointer inside at changes that decision, with nothing reporting it until
+// Verify. Loaded is a struct and is copied when it is passed, but the
+// references inside it are not, so a view that needs to reorder or edit the
+// state must copy it first.
+//
 // Write queues its statements in b instead of running them. They are sent with
 // the message's own writes and its commit, in one round trip, while the
 // stream is locked; a view that ran its own would add a round trip per
