@@ -17,9 +17,21 @@
 // A decision is identified by the stream it is recorded on: a Create names that
 // stream, and the ledger refuses it anywhere else, so State.ID and the stream
 // are one identifier rather than two that happen to agree.
+//
+// The register's words — the question, option titles, position bodies and the
+// outcome's rationale — live in the application's own mutable table (Content),
+// and the ledger records only the Ref that names each row. So do the names
+// behind the Member ids. Entries are append-only, so a name or a comment
+// written into one could never be erased; the data stays outside the log,
+// where a deletion request is an ordinary DELETE. See README.md ("Personal
+// data") and docs/REDACTION.md. Everything a message, event, effect or state
+// carries here is a reference or an id, never the text it names: read a
+// decision's words back from the same table, by the refs its state carries
+// (Content.Text), never by looking for them in an entry.
 package decisions
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"time"
@@ -45,16 +57,29 @@ const (
 // Settled reports whether the status carries an outcome.
 func (s Status) Settled() bool { return s == Decided || s == Superseded }
 
+// Ref names a row in the register's own mutable table (Content), which holds
+// the text. The ledger stores the reference and never the words: entries are
+// append-only, so anything an entry held could never be erased. Read a
+// decision's question, position bodies and rationale by looking up the refs
+// its state carries.
+type Ref string
+
+// Member is a person's opaque id. The name it was minted for lives in the
+// register's own table (Content), never in the ledger: entries are append-only
+// and an entry's Actor is permanent, so a name or an address there could not be
+// erased.
+type Member string
+
 type Option struct {
 	ID    string `json:"id"`
-	Title string `json:"title"`
+	Title Ref    `json:"title"`
 }
 
 // Position is where one member stands. An empty Option means they weighed in
 // without endorsing any option.
 type Position struct {
 	Option string `json:"option,omitempty"`
-	Body   string `json:"body"`
+	Body   Ref    `json:"body"`
 	// Committed is the member's answer to the outcome: committing to it, or
 	// maintaining their objection. Nil until they answer.
 	Committed *bool `json:"committed,omitempty"`
@@ -62,18 +87,18 @@ type Position struct {
 
 type Outcome struct {
 	Chosen    string    `json:"chosen"`
-	Rationale string    `json:"rationale"`
-	DecidedBy string    `json:"decided_by"`
+	Rationale Ref       `json:"rationale"`
+	DecidedBy Member    `json:"decided_by"`
 	DecidedAt time.Time `json:"decided_at"`
 }
 
 // State is one decision.
 type State struct {
 	ID           string              `json:"id"`
-	Title        string              `json:"title"`
+	Title        Ref                 `json:"title"`
 	Status       Status              `json:"status"`
 	Options      []Option            `json:"options"`
-	Positions    map[string]Position `json:"positions"`
+	Positions    map[Member]Position `json:"positions"`
 	Outcome      *Outcome            `json:"outcome,omitempty"`
 	SupersededBy string              `json:"superseded_by,omitempty"`
 }
@@ -109,37 +134,37 @@ type Msg interface{ trigger() Trigger }
 
 type Create struct {
 	ID      string    `json:"id"`
-	By      string    `json:"by"`
+	By      Member    `json:"by"`
 	At      time.Time `json:"at"`
-	Title   string    `json:"title"`
+	Title   Ref       `json:"title"`
 	Options []Option  `json:"options"`
 }
 
 type Edit struct {
-	By    string `json:"by"`
-	Title string `json:"title"`
+	By    Member `json:"by"`
+	Title Ref    `json:"title"`
 }
 
 type AddOption struct {
-	By     string `json:"by"`
+	By     Member `json:"by"`
 	Option Option `json:"option"`
 }
 
 type SavePosition struct {
-	By     string `json:"by"`
+	By     Member `json:"by"`
 	Option string `json:"option,omitempty"`
-	Body   string `json:"body"`
+	Body   Ref    `json:"body"`
 }
 
 type RecordOutcome struct {
-	By        string    `json:"by"`
+	By        Member    `json:"by"`
 	At        time.Time `json:"at"`
 	Chosen    string    `json:"chosen"`
-	Rationale string    `json:"rationale"`
+	Rationale Ref       `json:"rationale"`
 }
 
 type SetStatus struct {
-	By string `json:"by"`
+	By Member `json:"by"`
 	To Status `json:"to"`
 }
 
@@ -150,14 +175,14 @@ type SetStatus struct {
 // self-supersede guard and DR3 compare it against this decision's ID like for
 // like.
 type Supersede struct {
-	By               string `json:"by"`
+	By               Member `json:"by"`
 	With             string `json:"with"`
 	WithStatus       Status `json:"with_status"`
 	WithSupersededBy string `json:"with_superseded_by,omitempty"`
 }
 
 type Acknowledge struct {
-	By        string `json:"by"`
+	By        Member `json:"by"`
 	Committed bool   `json:"committed"`
 }
 
@@ -179,14 +204,14 @@ type Event interface{ isEvent() }
 
 type Created struct {
 	ID      string    `json:"id"`
-	Title   string    `json:"title"`
+	Title   Ref       `json:"title"`
 	Options []Option  `json:"options"`
-	By      string    `json:"by"`
+	By      Member    `json:"by"`
 	At      time.Time `json:"at"`
 }
 
 type Edited struct {
-	Title string `json:"title"`
+	Title Ref `json:"title"`
 }
 
 type OptionAdded struct {
@@ -194,9 +219,9 @@ type OptionAdded struct {
 }
 
 type PositionSaved struct {
-	Member string `json:"member"`
+	Member Member `json:"member"`
 	Option string `json:"option,omitempty"`
-	Body   string `json:"body"`
+	Body   Ref    `json:"body"`
 }
 
 type DecisionRecorded struct {
@@ -220,7 +245,7 @@ type SupersededBy struct {
 }
 
 type Acknowledged struct {
-	Member    string `json:"member"`
+	Member    Member `json:"member"`
 	Committed bool   `json:"committed"`
 }
 
@@ -237,13 +262,17 @@ func (Acknowledged) isEvent()     {}
 type Effect interface{ isEffect() }
 
 // IndexReferences asks the reference index to re-read the decision's text.
-// It is an effect rather than a write in the transaction because the index is
-// another service; the outbox delivers it at least once and not in order, so a
-// consumer must ignore a delivery older than the text it holds. The delivery
-// carries the producing entry's seq for that; see ReferenceIndex.
+// The effect names the rows in the application's own table that hold it — the
+// question, and the rationale once an outcome is recorded — and never the
+// words themselves: entries are append-only. It is an effect rather than a
+// write in the transaction because the index is another service; the outbox
+// delivers it at least once and not in order, so a consumer must ignore a
+// delivery older than the text it holds. The delivery carries the producing
+// entry's seq for that; see ReferenceIndex.
 type IndexReferences struct {
-	Decision string `json:"decision"`
-	Text     string `json:"text"`
+	Decision  string `json:"decision"`
+	Title     Ref    `json:"title"`
+	Rationale Ref    `json:"rationale,omitempty"`
 }
 
 func (IndexReferences) isEffect() {}
@@ -297,17 +326,18 @@ func accept(s State, events ...Event) decision {
 	return cairn.Accept[Result, Event, Effect](Result{Status: s.Status}, events)
 }
 
-// indexText is the text the reference index holds for a decision: its title,
-// and its rationale once an outcome is recorded. Every message that changes
-// that text derives the effect's Text from the state it produces, so the text
-// the index is told is the decision's current text. Delivery order is not the
+// indexOf is the reference index's view of a decision: the refs naming its
+// question, and its rationale once an outcome is recorded. Every message that
+// changes that text derives the effect from the state it produces, so the
+// index is told the rows the decision now names. Delivery order is not the
 // decider's to give: a retried effect can arrive after a newer one, so the
 // consumer drops a delivery older than the text it holds (ReferenceIndex).
-func indexText(s State) string {
-	if s.Outcome == nil {
-		return s.Title
+func indexOf(s State) IndexReferences {
+	ir := IndexReferences{Decision: s.ID, Title: s.Title}
+	if s.Outcome != nil {
+		ir.Rationale = s.Outcome.Rationale
 	}
-	return s.Title + "\n" + s.Outcome.Rationale
+	return ir
 }
 
 // Decider is the register.
@@ -347,7 +377,7 @@ func decide(s State, m Msg) decision {
 		if s.Status != Uncreated {
 			return refuse(Exists, "decision %s already exists", s.ID)
 		}
-		title := strings.TrimSpace(m.Title)
+		title := Ref(strings.TrimSpace(string(m.Title)))
 		if title == "" || m.ID == "" {
 			return refuse(Invalid, "a decision needs a question")
 		}
@@ -357,7 +387,7 @@ func decide(s State, m Msg) decision {
 		options := []Option{}
 		seen := map[string]bool{}
 		for _, o := range m.Options {
-			title := strings.TrimSpace(o.Title)
+			title := Ref(strings.TrimSpace(string(o.Title)))
 			if title == "" || o.ID == "" {
 				return refuse(Invalid, "an option needs a title")
 			}
@@ -371,11 +401,11 @@ func decide(s State, m Msg) decision {
 		return decision{
 			Result:  Result{Status: Open},
 			Events:  []Event{created},
-			Effects: []Effect{IndexReferences{Decision: m.ID, Text: indexText(evolve(s, created))}},
+			Effects: []Effect{indexOf(evolve(s, created))},
 		}
 
 	case Edit:
-		title := strings.TrimSpace(m.Title)
+		title := Ref(strings.TrimSpace(string(m.Title)))
 		if title == "" {
 			return refuse(Invalid, "a decision needs a question")
 		}
@@ -386,14 +416,14 @@ func decide(s State, m Msg) decision {
 		return decision{
 			Result:  Result{Status: s.Status},
 			Events:  []Event{edited},
-			Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, edited))}},
+			Effects: []Effect{indexOf(evolve(s, edited))},
 		}
 
 	case AddOption:
 		if s.Status != Open {
 			return refuse(Frozen, "this decision is %s, so its options can no longer change", s.Status)
 		}
-		title := strings.TrimSpace(m.Option.Title)
+		title := Ref(strings.TrimSpace(string(m.Option.Title)))
 		if title == "" || m.Option.ID == "" {
 			return refuse(Invalid, "an option needs a title")
 		}
@@ -403,7 +433,7 @@ func decide(s State, m Msg) decision {
 		return accept(s, OptionAdded{Option: Option{ID: m.Option.ID, Title: title}})
 
 	case SavePosition:
-		body := strings.TrimSpace(m.Body)
+		body := Ref(strings.TrimSpace(string(m.Body)))
 		if body == "" {
 			return refuse(Invalid, "a position needs a body")
 		}
@@ -416,7 +446,7 @@ func decide(s State, m Msg) decision {
 		return accept(s, PositionSaved{Member: m.By, Option: m.Option, Body: body})
 
 	case RecordOutcome:
-		rationale := strings.TrimSpace(m.Rationale)
+		rationale := Ref(strings.TrimSpace(string(m.Rationale)))
 		if rationale == "" || m.Chosen == "" {
 			return refuse(Invalid, "recording a decision requires a chosen option and a rationale")
 		}
@@ -434,7 +464,7 @@ func decide(s State, m Msg) decision {
 		return decision{
 			Result:  Result{Status: Decided},
 			Events:  []Event{recorded},
-			Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, recorded))}},
+			Effects: []Effect{indexOf(evolve(s, recorded))},
 		}
 
 	case SetStatus:
@@ -451,7 +481,7 @@ func decide(s State, m Msg) decision {
 		if s.Status.Settled() {
 			reopened := Reopened{From: s.Status, ClearedOutcome: s.Outcome, ClearedSupersededBy: s.SupersededBy}
 			return decision{Result: Result{Status: to}, Events: []Event{reopened},
-				Effects: []Effect{IndexReferences{Decision: s.ID, Text: indexText(evolve(s, reopened))}}}
+				Effects: []Effect{indexOf(evolve(s, reopened))}}
 		}
 		return decision{Result: Result{Status: to}, Events: []Event{StatusChanged{From: s.Status, To: to}}}
 
@@ -487,7 +517,7 @@ func evolve(s State, e Event) State {
 	case Created:
 		s.ID, s.Title, s.Status = e.ID, e.Title, Open
 		s.Options = slices.Clone(e.Options)
-		s.Positions = map[string]Position{}
+		s.Positions = map[Member]Position{}
 	case Edited:
 		s.Title = e.Title
 	case OptionAdded:
@@ -502,7 +532,7 @@ func evolve(s State, e Event) State {
 		s.Status = e.To
 	case Reopened:
 		s.Status, s.Outcome, s.SupersededBy = Open, nil, ""
-		positions := make(map[string]Position, len(s.Positions))
+		positions := make(map[Member]Position, len(s.Positions))
 		for member, p := range s.Positions {
 			p.Committed = nil
 			positions[member] = p
@@ -557,6 +587,22 @@ func Codecs() *codec.Set[Msg, Result, Event, Effect] {
 	codec.Register[Acknowledged](events, "decision.acknowledged", 1)
 
 	effects := codec.New[Effect]()
-	codec.Register[IndexReferences](effects, "decision.index_references", 1)
+	codec.Register[IndexReferences](effects, "decision.index_references", 2)
+	// Version 1 stored the decision's text in one field: the words themselves.
+	// Version 2 names the rows in the application's table that hold them, and
+	// there is no such row for text an entry wrote before that table existed.
+	// The old value is kept as the title's reference rather than dropped, so a
+	// stored entry still decodes to what the index was last told; it names a row
+	// the index cannot resolve, which is visible rather than silent.
+	effects.Upcast("decision.index_references", 1, func(old json.RawMessage) (json.RawMessage, error) {
+		var v1 struct {
+			Decision string `json:"decision"`
+			Text     string `json:"text"`
+		}
+		if err := json.Unmarshal(old, &v1); err != nil {
+			return nil, err
+		}
+		return json.Marshal(IndexReferences{Decision: v1.Decision, Title: Ref(v1.Text)})
+	})
 	return &codec.Set[Msg, Result, Event, Effect]{Messages: msgs, Results: results, Events: events, Effects: effects}
 }

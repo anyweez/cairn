@@ -46,8 +46,10 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 			}
 			// The retried create effect arrives after the edit's. The index
 			// drops it because its entry is older, not because of the order it
-			// is handed.
-			index.Apply(dl.Seq, dl.Effect.(IndexReferences))
+			// is handed. The effect names the rows the text lives in; reading
+			// them is the application's job, since the ledger holds no words.
+			ir := dl.Effect.(IndexReferences)
+			index.Apply(dl.Seq, ir.Decision, svc.Content.IndexedText(ir.Title, ir.Rationale))
 			applied++
 			return nil
 		},
@@ -70,7 +72,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := indexText(state)
+	want := svc.Content.Text(state.Title)
 	if got := index.Text(id); got != want {
 		t.Fatalf("the index holds %q, but the decision's text is %q", got, want)
 	}

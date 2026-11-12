@@ -1,6 +1,7 @@
 package decisions
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -36,5 +37,23 @@ func TestCodecsMatchManifest(t *testing.T) {
 	}
 	if problems := codec.CheckRegistrations(want, Codecs().Registrations()); len(problems) > 0 {
 		t.Fatalf("spec.manifest.yaml and the built codecs disagree:\n  %s", strings.Join(problems, "\n  "))
+	}
+}
+
+// IndexReferences went from naming the decision's text to naming the rows that
+// hold it, so its version went up. An effect stored before that still has to
+// decode: the upcaster keeps the old text as the title's reference, which is
+// the only place it can go once the ledger no longer holds the words.
+func TestAnOlderIndexEffectStillDecodes(t *testing.T) {
+	t.Parallel()
+	env := codec.Envelope{Type: "decision.index_references", Version: 1,
+		Data: json.RawMessage(`{"decision":"d-1","text":"ship it?\nthe bugs are cosmetic"}`)}
+	got, err := Codecs().Effects.Decode(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := IndexReferences{Decision: "d-1", Title: Ref("ship it?\nthe bugs are cosmetic")}
+	if got != want {
+		t.Fatalf("decoded %+v, want %+v", got, want)
 	}
 }
