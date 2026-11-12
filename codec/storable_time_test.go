@@ -284,6 +284,43 @@ type embeddedNamedHolder struct {
 	At embeddedNamedTime `json:"at"`
 }
 
+// A type over time.Time may write time's own RFC 3339 at a coarser precision.
+// Its offset is exact but the fraction of a second is not, so an instant with
+// nanoseconds comes back as a different one, and the refusal should name that
+// rather than the zone offset it did not lose.
+type truncatedTime time.Time
+
+func (t truncatedTime) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Time(t).Format(time.RFC3339))
+}
+
+type truncatedTimeHolder struct {
+	At truncatedTime `json:"at"`
+}
+
+func TestAWrappedTimeThatDropsTheFractionIsRefusedForThatReason(t *testing.T) {
+	at := time.Date(2026, time.March, 4, 5, 6, 7, 123456789, time.UTC)
+	err := codec.CheckStorable(truncatedTimeHolder{At: truncatedTime(at)})
+	var notStorable *codec.NotStorableError
+	if !errors.As(err, &notStorable) {
+		t.Fatalf("CheckStorable(%v) = %v, want a NotStorableError", at, err)
+	}
+	if notStorable.Path != "value.At" {
+		t.Fatalf("path %q, want %q", notStorable.Path, "value.At")
+	}
+	if !strings.Contains(notStorable.Why, "fraction of a second") {
+		t.Fatalf("the refusal %q does not name the fraction of a second", notStorable.Why)
+	}
+	if strings.Contains(notStorable.Why, "zone offset") {
+		t.Fatalf("the refusal %q blames the zone offset, which is exact", notStorable.Why)
+	}
+
+	whole := at.Truncate(time.Second)
+	if err := codec.CheckStorable(truncatedTimeHolder{At: truncatedTime(whole)}); err != nil {
+		t.Fatalf("CheckStorable(%v) = %v, want storable", whole, err)
+	}
+}
+
 func TestATimeJSONCannotWriteIsRefusedInAWrappedType(t *testing.T) {
 	at := time.Date(300000, time.January, 1, 0, 0, 0, 0, time.UTC)
 	for name, value := range map[string]any{

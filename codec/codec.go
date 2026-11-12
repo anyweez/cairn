@@ -575,10 +575,17 @@ func checkMarshalledTime(data []byte, t time.Time, path string) error {
 // checkTimeSurvived reports a time that time's encoding writes as a different
 // instant. Both of time's encodings carry a zone offset only to the minute, so
 // an offset with seconds in it decodes as a value that is not Equal to the one
-// sent, with no error along the way.
+// sent, with no error along the way. A type that writes its time at a coarser
+// RFC 3339 precision loses the fraction of a second instead, and the refusal
+// says which part moved so the caller is not sent after the wrong cause.
 func checkTimeSurvived(t, back time.Time, path string) error {
 	if back.Equal(t) {
 		return nil
+	}
+	if t.Truncate(time.Second).Equal(back) {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf(
+			"it is %s, whose encoding drops the fraction of a second, so it would be stored as %s",
+			t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
 	}
 	return &NotStorableError{Path: path, Why: fmt.Sprintf(
 		"it is %s, whose zone offset time's encoding writes only to the minute, so it would be stored as %s",
