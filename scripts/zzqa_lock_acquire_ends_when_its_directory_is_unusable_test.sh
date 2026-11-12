@@ -72,9 +72,8 @@ if [ "$code" -ne 0 ]; then
 fi
 chmod 700 "$root"; rm -rf "$root"; root=
 
-# A lock left behind in a directory the caller cannot write: the takeover's
-# rm -rf removes the metadata and then fails to remove the directory itself, so
-# the lock can be neither removed nor created.
+# A lock left behind in a directory the caller cannot write: a takeover cannot
+# remove it, so the lock can be neither removed nor created.
 root=$(mktemp -d)
 mkdir "$root/$name.lock"
 printf '%s\n' 99999999 >"$root/$name.lock/pid" # a pid no process has
@@ -86,6 +85,27 @@ cat "$logs/err"
 if [ "$code" -ne 0 ]; then
   grep -q -- "$name.lock" "$logs/err" ||
     fail "lock_acquire exited $code without naming the directory it could not use"
+  [ "$(cat "$root/$name.lock/pid" 2>/dev/null)" = 99999999 ] ||
+    fail "the failed takeover destroyed the lock's pid before reporting"
+  [ -f "$root/$name.lock/at" ] ||
+    fail "the failed takeover destroyed the lock's at file before reporting"
+fi
+chmod 700 "$root"; rm -rf "$root"; root=
+
+# A leftover lock with no pid, in a directory the caller cannot write, must be
+# reported at once rather than waiting out the one-minute window first.
+root=$(mktemp -d)
+mkdir "$root/$name.lock"
+printf '%s\n' 0 >"$root/$name.lock/at"
+chmod 500 "$root"
+acquire_for "$root" 5 ||
+  fail "lock_acquire spun forever on a lock with no pid it could not remove ($root/$name.lock); a fixture script would hang here after a minute"
+cat "$logs/err"
+if [ "$code" -ne 0 ]; then
+  grep -q -- "$name.lock" "$logs/err" ||
+    fail "lock_acquire exited $code without naming the directory it could not use"
+  [ -f "$root/$name.lock/at" ] ||
+    fail "the failed takeover destroyed the lock's at file before reporting"
 fi
 chmod 700 "$root"; rm -rf "$root"; root=
 

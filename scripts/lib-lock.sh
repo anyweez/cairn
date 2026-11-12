@@ -28,10 +28,49 @@
 _lock_dir=
 _lock_held=
 
+# A stale lock is moved aside before it is deleted. Renaming is one step, so
+# the lock name is free even if the moved directory cannot be deleted, and a
+# failed move leaves the pid and at files where the takeover logic reads them.
+_lock_takeover() {
+  local stale="$1.stale.$$"
+  mv "$1" "$stale" 2>/dev/null || return 1
+  rm -rf "$stale" 2>/dev/null || true
+  return 0
+}
+
+# An empty lock is aged before takeover, so this checks now whether that
+# takeover could ever work. A lock left in a directory the caller cannot write
+# is reported in seconds instead of after the one-minute window.
+_lock_takeover_possible() {
+  local parent=${1%/*}
+  [ -w "$parent" ] && [ -x "$parent" ] || return 1
+  # A sticky parent such as /tmp only lets its owner move a directory out of
+  # it, so a leftover from another user cannot be taken over there.
+  if [ -k "$parent" ] && [ ! -O "$1" ]; then
+    return 1
+  fi
+  return 0
+}
+
 lock_acquire() {
   local dir=${TMPDIR:-/tmp}/$1.lock
-  local pid now seen=
+  local pid now seen= missing=0
   while ! mkdir "$dir" 2>/dev/null; do
+    if [ ! -d "$dir" ]; then
+      # mkdir failed with no lock directory to inspect. Either the directory
+      # holding the lock is unusable, or another caller released the lock
+      # between the mkdir and here. Report the former; retry the latter.
+      missing=$((missing + 1))
+      if [ -e "$dir" ] || [ -L "$dir" ] || [ ! -d "${dir%/*}" ] ||
+         [ ! -w "${dir%/*}" ] || [ ! -x "${dir%/*}" ] ||
+         [ "$missing" -gt 10 ]; then
+        echo "lock $dir: cannot create the lock directory" >&2
+        return 1
+      fi
+      sleep 0.1
+      continue
+    fi
+    missing=0
     now=$(date +%s)
     pid=$(cat "$dir/pid" 2>/dev/null || true)
     if [ -n "$pid" ]; then
@@ -41,15 +80,25 @@ lock_acquire() {
       seen=
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "lock $dir: holder $pid is gone, taking it" >&2
-        rm -rf "$dir"
+        if ! _lock_takeover "$dir"; then
+          echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
+          return 1
+        fi
       fi
     else
       # A holder killed between mkdir and recording itself leaves no PID to
       # check, so age the lock from when this caller first saw it empty.
       [ -n "$seen" ] || seen=$now
+      if ! _lock_takeover_possible "$dir"; then
+        echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
+        return 1
+      fi
       if [ "$((now - seen))" -gt 60 ]; then
         echo "lock $dir: no holder recorded for more than 60s, taking it" >&2
-        rm -rf "$dir"
+        if ! _lock_takeover "$dir"; then
+          echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
+          return 1
+        fi
       fi
     fi
     sleep 0.1
