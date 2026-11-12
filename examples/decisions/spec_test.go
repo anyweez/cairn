@@ -36,7 +36,7 @@ var (
 		Statement: "A member whose position endorsed the chosen option records a disagree-and-commit answer."}
 )
 
-var members = []string{"ana", "ben", "cy"}
+var members = []Member{"ana", "ben", "cy"}
 
 func messages(t *rapid.T, s State) Msg {
 	// Mostly a real option, sometimes none or one that does not exist.
@@ -50,9 +50,9 @@ func messages(t *rapid.T, s State) Msg {
 	// Mostly a member, sometimes nobody: decide refuses a message that names no
 	// sender, and the spec has to draw one to keep that refusal honest.
 	senders := append(slices.Clone(members), "")
-	member := func() string { return rapid.SampledFrom(senders).Draw(t, "by") }
+	member := func() Member { return rapid.SampledFrom(senders).Draw(t, "by") }
 	// Mostly a member who has a position, sometimes anyone.
-	positioned := func() string {
+	positioned := func() Member {
 		candidates := slices.Clone(members)
 		for m := range s.Positions {
 			candidates = append(candidates, m, m, m)
@@ -60,8 +60,8 @@ func messages(t *rapid.T, s State) Msg {
 		slices.Sort(candidates)
 		return rapid.SampledFrom(candidates).Draw(t, "by")
 	}
-	text := func(label string) string {
-		return rapid.SampledFrom([]string{"", "  ", "ship it", "wait a quarter", "ship it "}).Draw(t, label)
+	text := func(label string) Ref {
+		return Ref(rapid.SampledFrom([]string{"", "  ", "ship it", "wait a quarter", "ship it "}).Draw(t, label))
 	}
 	at := func() time.Time {
 		// Sometimes the zero time, so a message that carries no time is refused
@@ -104,9 +104,9 @@ func messages(t *rapid.T, s State) Msg {
 			// every Create is refused and runs rarely reach the settled
 			// states the mutants need. A small share stays blank or repeats
 			// o1, so the new refusals are still exercised.
-			title := fmt.Sprintf("option %d", i+1)
+			title := Ref(fmt.Sprintf("option %d", i+1))
 			if rapid.IntRange(1, 8).Draw(t, "blank option title") == 1 {
-				title = rapid.SampledFrom([]string{"", "  "}).Draw(t, "option title")
+				title = text("option title")
 			}
 			id := fmt.Sprintf("o%d", i+1)
 			if i > 0 && rapid.IntRange(1, 8).Draw(t, "repeated option id") == 1 {
@@ -192,8 +192,8 @@ func machine() spectest.Machine[State, Msg, Result, Event, Effect] {
 				if before.Status == Uncreated && after.Status == Open {
 					return spec.NA
 				}
-				stances := func(s State) map[string]Position {
-					out := map[string]Position{}
+				stances := func(s State) map[Member]Position {
+					out := map[Member]Position{}
 					for m, p := range s.Positions {
 						out[m] = Position{Option: p.Option, Body: p.Body}
 					}
@@ -350,11 +350,11 @@ func TestRegisterSpecCatchesMutants(t *testing.T) {
 		// otherwise well formed, so only DR2 can catch it.
 		"incomplete outcome": {"DR2", func(s State, m Msg) decision {
 			r, ok := m.(RecordOutcome)
-			rationale := strings.TrimSpace(r.Rationale)
+			rationale := Ref(strings.TrimSpace(string(r.Rationale)))
 			if ok && s.Status == Open && s.option(r.Chosen) && rationale != "" {
 				outcome := Outcome{Chosen: r.Chosen, Rationale: rationale, DecidedBy: r.By, DecidedAt: r.At}
 				return decision{Result: Result{Status: Decided}, Events: []Event{DecisionRecorded{Outcome: outcome}},
-					Effects: []Effect{IndexReferences{Decision: s.ID, Text: s.Title + "\n" + rationale}}}
+					Effects: []Effect{IndexReferences{Decision: s.ID, Title: s.Title, Rationale: rationale}}}
 			}
 			return decide(s, m)
 		}, Open, RecordOutcome{By: "ben", At: time.Time{}, Chosen: "o1", Rationale: "done"}},

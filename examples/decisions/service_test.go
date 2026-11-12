@@ -70,7 +70,7 @@ func TestRegisterOnTheLedger(t *testing.T) {
 
 	state, err = svc.Get(ctx, first)
 	must(t, err)
-	if state.Status != Superseded || state.SupersededBy != second || state.Positions["ben"].Committed == nil {
+	if state.Status != Superseded || state.SupersededBy != second || state.Positions[svc.Content.Member("ben")].Committed == nil {
 		t.Fatalf("first decision: %+v", state)
 	}
 
@@ -78,14 +78,16 @@ func TestRegisterOnTheLedger(t *testing.T) {
 	must(t, svc.SetStatus(ctx, first, "ana", Open))
 	state, err = svc.Get(ctx, first)
 	must(t, err)
-	if state.Status != Open || state.Outcome != nil || state.SupersededBy != "" || state.Positions["ben"].Committed != nil {
+	if state.Status != Open || state.Outcome != nil || state.SupersededBy != "" || state.Positions[svc.Content.Member("ben")].Committed != nil {
 		t.Fatalf("reopened decision: %+v", state)
 	}
 
-	// Each entry is attributed to the member its message names.
+	// Each entry is attributed to the member its message names: the opaque id
+	// the shell minted for them, never the name itself.
 	entries, err := svc.Register.Store.ReadStream(ctx, svc.Register.Stream(first), 0)
 	must(t, err)
-	if entries[0].Meta.Actor != "ana" || entries[2].Meta.Actor != "ben" || entries[3].Meta.Actor != "cy" {
+	ana, ben, cy := string(svc.Content.Member("ana")), string(svc.Content.Member("ben")), string(svc.Content.Member("cy"))
+	if entries[0].Meta.Actor != ana || entries[2].Meta.Actor != ben || entries[3].Meta.Actor != cy {
 		t.Fatalf("actors: %q %q %q", entries[0].Meta.Actor, entries[2].Meta.Actor, entries[3].Meta.Actor)
 	}
 

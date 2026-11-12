@@ -34,7 +34,7 @@ func TestABlankSenderIsNoMember(t *testing.T) {
 		}
 		_, after := Decider.Step(state, SavePosition{By: "  \u00a0 ", Option: "o1", Body: "yes"})
 		for member := range after.Positions {
-			if strings.TrimSpace(member) == "" {
+			if strings.TrimSpace(string(member)) == "" {
 				t.Fatalf("a position was filed under member %q, which is blank: %+v", member, after.Positions)
 			}
 		}
