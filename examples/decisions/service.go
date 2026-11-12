@@ -3,6 +3,7 @@ package decisions
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -113,6 +114,18 @@ func (s *Service) forget(refs ...Ref) {
 	}
 }
 
+// forgetUnlessRecorded keeps text for a message the ledger recorded. An error
+// wrapping ledger.ErrRecorded says the transaction committed but its result
+// could not be read, so the entry exists and names these refs; deleting the
+// rows would leave the entry pointing at text nothing can restore. Every other
+// error means nothing was recorded, so the cleanup runs as before.
+func (s *Service) forgetUnlessRecorded(err error, refs ...Ref) {
+	if errors.Is(err, ledger.ErrRecorded) {
+		return
+	}
+	s.forget(refs...)
+}
+
 // Create files a decision with its seed options and returns its ID.
 func (s *Service) Create(ctx context.Context, by, title string, options ...string) (string, error) {
 	id := s.NewID("d-")
@@ -133,7 +146,7 @@ func (s *Service) Create(ctx context.Context, by, title string, options ...strin
 	}
 	_, err = s.Register.Handle(ctx, id, Create{ID: id, By: s.Content.Member(by), At: s.Now().UTC(), Title: titleRef, Options: seeded})
 	if err != nil {
-		s.forget(refs...)
+		s.forgetUnlessRecorded(err, refs...)
 	}
 	return id, err
 }
@@ -147,7 +160,7 @@ func (s *Service) AddOption(ctx context.Context, id, by, title string) (string, 
 	}
 	_, err = s.Register.Handle(ctx, id, AddOption{By: s.Content.Member(by), Option: Option{ID: option, Title: ref}})
 	if err != nil {
-		s.forget(ref)
+		s.forgetUnlessRecorded(err, ref)
 	}
 	return option, err
 }
@@ -160,7 +173,7 @@ func (s *Service) SavePosition(ctx context.Context, id, by, option, body string)
 	}
 	_, err = s.Register.Handle(ctx, id, SavePosition{By: s.Content.Member(by), Option: option, Body: ref})
 	if err != nil {
-		s.forget(ref)
+		s.forgetUnlessRecorded(err, ref)
 	}
 	return err
 }
@@ -173,7 +186,7 @@ func (s *Service) RecordOutcome(ctx context.Context, id, by, chosen, rationale s
 	}
 	_, err = s.Register.Handle(ctx, id, RecordOutcome{By: s.Content.Member(by), At: s.Now().UTC(), Chosen: chosen, Rationale: ref})
 	if err != nil {
-		s.forget(ref)
+		s.forgetUnlessRecorded(err, ref)
 	}
 	return err
 }
