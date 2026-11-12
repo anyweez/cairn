@@ -194,12 +194,17 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		trace = append(trace, fmt.Sprintf("%d. %s", step, describe(msg)))
 
 		before := fingerprint(state)
-		first, ok := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
+		// Each call gets its own copy of the message as sent, the way the
+		// ledger gives Decide the value it decoded from the caller's envelope.
+		// One live value shared by both calls would answer "did the first call
+		// change its input?" under D1's name; msg stays as sent for the trace
+		// and the codec round trip, which is what the ledger stores.
+		first, ok := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, clone(msg)) })
 		j(Total, spec.Check(ok, "Decide panicked on %+v: %v", msg, first.panic))
 		decision := first.value
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state for %+v", msg))
 
-		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
+		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, clone(msg)) })
 		j(Total, spec.Check(secondOK, "Decide panicked on its second call with %+v: %v", msg, second.panic))
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state on its second call for %+v", msg))
 		if ok && secondOK {

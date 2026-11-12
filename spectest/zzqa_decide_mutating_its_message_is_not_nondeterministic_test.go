@@ -19,6 +19,7 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/anyweez/cairn"
+	"github.com/anyweez/cairn/codec"
 	"github.com/anyweez/cairn/spectest"
 )
 
@@ -71,5 +72,43 @@ func TestDecideStillCannotDependOnSomethingOutsideItsInputs(t *testing.T) {
 	if err != nil || !failed || !strings.Contains(msg, spectest.Deterministic.ID+" violated") {
 		t.Fatalf("a decider that depends on a call count must fail %s, got err=%v failed=%v:\n%s",
 			spectest.Deterministic.ID, err, failed, msg)
+	}
+}
+
+// The other half of the same copy: D6 round-trips the message the caller sent,
+// which the ledger encodes before Decide sees it. A Decide that writes text its
+// codec refuses into its own copy must not make that stored message unstorable.
+type zzqaNoteMsg struct{ Lines []string }
+
+func (zzqaNoteMsg) isZZQANote() {}
+
+type zzqaNote interface{ isZZQANote() }
+
+func zzqaNoteCodecs() *codec.Set[zzqaNote, int, struct{}, struct{}] {
+	msgs := codec.New[zzqaNote]()
+	codec.Register[zzqaNoteMsg](msgs, "zzqa.note", 1)
+	return &codec.Set[zzqaNote, int, struct{}, struct{}]{Messages: msgs}
+}
+
+func TestDecideCannotMakeTheStoredMessageUnstorable(t *testing.T) {
+	m := spectest.Machine[struct{}, zzqaNote, int, struct{}, struct{}]{
+		Decider: cairn.Decider[struct{}, zzqaNote, int, struct{}, struct{}]{
+			Initial: func() struct{} { return struct{}{} },
+			Decide: func(_ struct{}, msg zzqaNote) cairn.Decision[int, struct{}, struct{}] {
+				// Through the slice the caller's message shares, as a decider
+				// normalising a field in place does.
+				msg.(zzqaNoteMsg).Lines[0] = "bad\x00"
+				return cairn.Accept[int, struct{}, struct{}](0, nil)
+			},
+			Evolve: func(s struct{}, _ struct{}) struct{} { return s },
+		},
+		Messages: func(t *rapid.T, _ struct{}) zzqaNote {
+			return zzqaNoteMsg{Lines: []string{"ok"}}
+		},
+		Codecs: zzqaNoteCodecs(),
+	}
+	msg, failed, err := spectest.Fails(t, m.Check)
+	if err != nil || failed {
+		t.Fatalf("D6 round-tripped text a Decide call wrote, though the ledger stores the caller's message:\n%s", msg)
 	}
 }

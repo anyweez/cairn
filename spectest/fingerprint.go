@@ -26,12 +26,19 @@ type visit struct {
 	len  int
 }
 
-// enter marks v as on the path, or reports that it already is.
-func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
+// visitKey names the object v refers to, for the path maps fingerprint and
+// clone keep.
+func visitKey(v reflect.Value) visit {
 	k := visit{ptr: v.Pointer(), kind: v.Kind()}
 	if v.Kind() == reflect.Slice {
 		k.len = v.Len()
 	}
+	return k
+}
+
+// enter marks v as on the path, or reports that it already is.
+func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
+	k := visitKey(v)
 	if seen[k] {
 		return k, false
 	}
