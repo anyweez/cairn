@@ -1,29 +1,31 @@
-package spectest
+package codec_test
 
 // D6 and D7 ask whether a value survived its round trip. JSON keeps a
 // time.Time's instant but not its monotonic clock reading or the *Location it
 // came from, so the comparison has to be the ledger's — the same instant —
 // rather than Go's value identity, and no looser than that, or a genuine loss
-// goes unreported. These are the comparison's own cases; the rules that use it
-// are held to the same two shapes in spectest_test.
+// goes unreported. These are the comparison's own cases; the checker's rules
+// are held to the same shapes that need a codec or a snapshot.
 
 import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/anyweez/cairn/codec"
 )
 
-type stamped struct{ At time.Time }
+type rtStamped struct{ At time.Time }
 
-// hiddenStamp is a struct JSON cannot see into: an unexported field is not
+// rtHiddenStamp is a struct JSON cannot see into: an unexported field is not
 // encoded, so a snapshot of it drops the field.
-type hiddenStamp struct{ at time.Time }
+type rtHiddenStamp struct{ at time.Time }
 
-// carried holds a time behind an interface, where json reaches the concrete
+// rtCarried holds a time behind an interface, where json reaches the concrete
 // value, as a message's `any` field does.
-type carried struct{ At any }
+type rtCarried struct{ At any }
 
-func jsonRoundTrip[T any](t *testing.T, v T) T {
+func rtJSONRoundTrip[T any](t *testing.T, v T) T {
 	t.Helper()
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -50,44 +52,62 @@ func TestEqualRoundTripped(t *testing.T) {
 	}{
 		{
 			name: "the instant from the clock, without its monotonic reading",
-			a:    stamped{At: now},
-			b:    jsonRoundTrip(t, stamped{At: now}),
+			a:    rtStamped{At: now},
+			b:    rtJSONRoundTrip(t, rtStamped{At: now}),
 			want: true,
 		},
 		{
 			name: "the instant in a named zone, without its *Location",
-			a:    stamped{At: named},
-			b:    jsonRoundTrip(t, stamped{At: named}),
+			a:    rtStamped{At: named},
+			b:    rtJSONRoundTrip(t, rtStamped{At: named}),
 			want: true,
 		},
 		{
 			name: "the instant reached through a pointer",
-			a:    &stamped{At: now},
-			b:    jsonRoundTrip(t, &stamped{At: now}),
+			a:    &rtStamped{At: now},
+			b:    rtJSONRoundTrip(t, &rtStamped{At: now}),
 			want: true,
 		},
 		{
 			name: "the instant reached through an interface",
-			a:    carried{At: now},
-			b:    carried{At: jsonRoundTrip(t, now)},
+			a:    rtCarried{At: now},
+			b:    rtCarried{At: rtJSONRoundTrip(t, now)},
 			want: true,
 		},
 		{
 			name: "the instant inside a map",
-			a:    map[string]stamped{"at": {At: named}},
-			b:    jsonRoundTrip(t, map[string]stamped{"at": {At: named}}),
+			a:    map[string]rtStamped{"at": {At: named}},
+			b:    rtJSONRoundTrip(t, map[string]rtStamped{"at": {At: named}}),
+			want: true,
+		},
+		{
+			name: "the instant as a map key",
+			a:    map[time.Time]int{named: 1},
+			b:    rtJSONRoundTrip(t, map[time.Time]int{named: 1}),
 			want: true,
 		},
 		{
 			name: "an instant JSON moves",
-			a:    stamped{At: moved},
-			b:    jsonRoundTrip(t, stamped{At: moved}),
+			a:    rtStamped{At: moved},
+			b:    rtJSONRoundTrip(t, rtStamped{At: moved}),
+			want: false,
+		},
+		{
+			name: "a map key whose instant JSON moves",
+			a:    map[time.Time]int{moved: 1},
+			b:    rtJSONRoundTrip(t, map[time.Time]int{moved: 1}),
+			want: false,
+		},
+		{
+			name: "a map key at a different instant",
+			a:    map[time.Time]int{named: 1},
+			b:    map[time.Time]int{named.Add(time.Nanosecond): 1},
 			want: false,
 		},
 		{
 			name: "a different instant",
-			a:    stamped{At: now},
-			b:    stamped{At: now.Add(time.Nanosecond)},
+			a:    rtStamped{At: now},
+			b:    rtStamped{At: now.Add(time.Nanosecond)},
 			want: false,
 		},
 		{
@@ -96,7 +116,7 @@ func TestEqualRoundTripped(t *testing.T) {
 				At   time.Time
 				Memo string `json:"-"`
 			}{At: named, Memo: "rent"},
-			b: jsonRoundTrip(t, struct {
+			b: rtJSONRoundTrip(t, struct {
 				At   time.Time
 				Memo string `json:"-"`
 			}{At: named, Memo: "rent"}),
@@ -104,20 +124,20 @@ func TestEqualRoundTripped(t *testing.T) {
 		},
 		{
 			name: "a hidden field a snapshot drops",
-			a:    hiddenStamp{at: named},
-			b:    jsonRoundTrip(t, hiddenStamp{at: named}),
+			a:    rtHiddenStamp{at: named},
+			b:    rtJSONRoundTrip(t, rtHiddenStamp{at: named}),
 			want: false,
 		},
 		{
 			name: "nil against empty",
-			a:    []stamped(nil),
-			b:    []stamped{},
+			a:    []rtStamped(nil),
+			b:    []rtStamped{},
 			want: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := equalRoundTripped(tc.a, tc.b); got != tc.want {
-				t.Fatalf("equalRoundTripped(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			if got := codec.EqualRoundTripped(tc.a, tc.b); got != tc.want {
+				t.Fatalf("EqualRoundTripped(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
 			}
 		})
 	}
