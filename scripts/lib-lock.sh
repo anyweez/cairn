@@ -22,6 +22,8 @@
 # more than a minute, which is the window between mkdir and writing the
 # metadata. A recorded PID that is still alive keeps the lock however long it
 # takes; a first-time `docker pull` inside `docker run` can exceed a minute.
+# A caller whose read straddles a release sees no PID and no directory: it
+# retries and acquires, rather than reporting a stale lock that is not there.
 # An EXIT trap releases the lock when the critical section fails or the script
 # is interrupted.
 
@@ -50,6 +52,17 @@ _lock_takeover_possible() {
     return 1
   fi
   return 0
+}
+
+# A lock that cannot be removed is only reported for a directory that is still
+# there. lock_release does rm -rf, so a caller that straddles a release can
+# decide the lock is stale after the directory has gone; there is nothing to
+# remove by hand then, and the caller should retry mkdir instead. Returns 0
+# when the caller should retry, 1 after reporting.
+_lock_report_unremovable() {
+  [ -d "$1" ] || return 0
+  echo "lock $1: cannot remove the stale lock directory; remove it by hand" >&2
+  return 1
 }
 
 lock_acquire() {
@@ -81,23 +94,34 @@ lock_acquire() {
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "lock $dir: holder $pid is gone, taking it" >&2
         if ! _lock_takeover "$dir"; then
-          echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
-          return 1
+          _lock_report_unremovable "$dir" || return 1
+          seen=
+          continue
         fi
       fi
     else
+      # An empty read is also what a caller sees when lock_release has just
+      # removed the directory, so a directory that is gone was released, not
+      # left behind: retry mkdir rather than take the stale-lock path, and age
+      # any directory created next from when it is first seen empty.
+      if [ ! -d "$dir" ]; then
+        seen=
+        continue
+      fi
       # A holder killed between mkdir and recording itself leaves no PID to
       # check, so age the lock from when this caller first saw it empty.
       [ -n "$seen" ] || seen=$now
       if ! _lock_takeover_possible "$dir"; then
-        echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
-        return 1
+        _lock_report_unremovable "$dir" || return 1
+        seen=
+        continue
       fi
       if [ "$((now - seen))" -gt 60 ]; then
         echo "lock $dir: no holder recorded for more than 60s, taking it" >&2
         if ! _lock_takeover "$dir"; then
-          echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
-          return 1
+          _lock_report_unremovable "$dir" || return 1
+          seen=
+          continue
         fi
       fi
     fi
