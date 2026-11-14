@@ -1,6 +1,9 @@
 package spectest
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // D1 hands each Decide call its own copy of the message as sent, so a write
 // through any shared reference reaches the copy only.
@@ -65,5 +68,89 @@ func TestCloneTerminatesOnCycles(t *testing.T) {
 	}
 	if c.Next != c || c.Any.(*node) != c {
 		t.Fatal("the copy did not keep the original's cycle")
+	}
+}
+
+// encodedHidden keeps its references private and stores them through its own
+// JSON encoding, the way a message that treats its fields as private does.
+type encodedHidden struct {
+	items    map[string]int
+	list     []int
+	p        *int
+	anything any
+}
+
+func (m encodedHidden) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Items    map[string]int `json:"items"`
+		List     []int          `json:"list"`
+		P        *int           `json:"p"`
+		Anything any            `json:"anything"`
+	}{m.items, m.list, m.p, m.anything})
+}
+
+func (m *encodedHidden) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Items    map[string]int `json:"items"`
+		List     []int          `json:"list"`
+		P        *int           `json:"p"`
+		Anything any            `json:"anything"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	m.items = wire.Items
+	m.list = wire.List
+	m.p = wire.P
+	m.anything = wire.Anything
+	return nil
+}
+
+// A field the message's own encoding writes is stored by the ledger, which
+// gives each Decide call its own decoded value, so the copy must not share it.
+func TestCloneCopiesUnexportedFieldsItsJSONEncodingWrites(t *testing.T) {
+	n := 1
+	m := encodedHidden{items: map[string]int{"a": 1}, list: []int{1}, p: &n, anything: map[string]int{"b": 1}}
+	c := clone(m)
+
+	c.items["a"] = 2
+	c.list[0] = 2
+	*c.p = 2
+	c.anything.(map[string]int)["b"] = 2
+
+	if m.items["a"] != 1 {
+		t.Errorf("a write to the copy's unexported map reached the original: %v", m.items)
+	}
+	if m.list[0] != 1 {
+		t.Errorf("a write to the copy's unexported slice element reached the original: %v", m.list)
+	}
+	if n != 1 {
+		t.Errorf("a write through the copy's unexported pointer reached the original: %d", n)
+	}
+	if m.anything.(map[string]int)["b"] != 1 {
+		t.Errorf("a write to the map behind the copy's unexported interface reached the original: %v", m.anything)
+	}
+}
+
+// A field encoding/json does not write is not stored by the ledger, so the
+// value is carried by assignment, as a Go copy of the struct carries it.
+func TestCloneLeavesUnexportedFieldsItsJSONEncodingDoesNotWrite(t *testing.T) {
+	type msg struct {
+		items    map[string]int
+		list     []int
+		p        *int
+		anything any
+	}
+	n := 1
+	m := msg{items: map[string]int{"a": 1}, list: []int{1}, p: &n, anything: map[string]int{"b": 1}}
+	c := clone(m)
+
+	c.items["a"] = 2
+	c.list[0] = 2
+	*c.p = 2
+	c.anything.(map[string]int)["b"] = 2
+
+	if m.items["a"] != 2 || m.list[0] != 2 || n != 2 || m.anything.(map[string]int)["b"] != 2 {
+		t.Fatalf("clone split a field encoding/json cannot write; the value should stay shared by assignment: %+v", m)
 	}
 }

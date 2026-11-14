@@ -22,6 +22,8 @@
 # more than a minute, which is the window between mkdir and writing the
 # metadata. A recorded PID that is still alive keeps the lock however long it
 # takes; a first-time `docker pull` inside `docker run` can exceed a minute.
+# A caller whose read straddles a release sees no PID and no directory: it
+# retries and acquires, rather than reporting a stale lock that is not there.
 # An EXIT trap releases the lock when the critical section fails or the script
 # is interrupted.
 #
@@ -49,8 +51,8 @@ _lock_inode() {
 # failed move leaves the pid and at files where the takeover logic reads them.
 #
 # _lock_takeover DIR PID INODE returns 0 when DIR was still the stale lock and
-# is now gone, 2 when another caller is taking it over and this one should
-# wait, and 1 when the directory cannot be moved aside at all.
+# is now gone, 2 when another caller is taking it over or DIR has gone, and 1
+# when the directory cannot be moved aside at all.
 _lock_takeover() {
   local dir=$1 pid=$2 inode=$3 stale="$1.stale.$$" status=0
   _lock_claim "$dir" "$pid" "$inode" || status=$?
@@ -158,10 +160,24 @@ lock_acquire() {
         reason="holder $pid is gone"
       fi
     else
+      # An empty read is also what a caller sees when lock_release has just
+      # removed the directory, so a directory that is gone was released, not
+      # left behind: retry mkdir rather than take the stale-lock path, and age
+      # any directory created next from when it is first seen empty.
+      if [ ! -d "$dir" ]; then
+        seen=
+        continue
+      fi
       # A holder killed between mkdir and recording itself leaves no PID to
       # check, so age the lock from when this caller first saw it empty.
       [ -n "$seen" ] || seen=$now
       if ! _lock_takeover_possible "$dir"; then
+        # A lock released between the read and here is not there to remove;
+        # report only a directory that is still there, and retry otherwise.
+        if [ ! -d "$dir" ]; then
+          seen=
+          continue
+        fi
         echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
         return 1
       fi
@@ -176,7 +192,12 @@ lock_acquire() {
         echo "lock $dir: $reason, taking it" >&2
       else
         case $? in
-          2) ;; # another caller is taking it over; wait for the lock it leaves
+          2)
+            # Either another caller is taking it over or the lock went away in
+            # between: there is nothing to remove by hand, and the next mkdir
+            # settles which.
+            seen=
+            ;;
           *)
             echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
             return 1
