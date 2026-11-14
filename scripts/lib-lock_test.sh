@@ -3,6 +3,8 @@
 # does not hand it over while the holder is alive. A first-time `docker pull`
 # inside `docker run` can hold the lock for more than a minute, so a caller let
 # in at that point races the same container name the lock exists to protect.
+# It also checks that a caller whose lock was taken over while it worked does
+# not delete the new holder's lock when it releases.
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -10,9 +12,11 @@ tmp=$(mktemp -d)
 name=cairn-lock-test
 lock=$tmp/$name.lock
 holder=
+old_holder=
 
 cleanup() {
   [ -z "$holder" ] || kill "$holder" 2>/dev/null || true
+  [ -z "$old_holder" ] || kill "$old_holder" 2>/dev/null || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -86,3 +90,34 @@ wait "$acquirer" || fail "the caller exited non-zero after taking over a dead ho
 [ -d "$lock" ] && fail "the caller did not release the lock"
 
 echo "ok: a live holder keeps the lock, and a gone or unrecorded one is taken over"
+
+# A lock taken over while its holder is still working belongs to its new
+# holder. The old holder's release must remove the directory it created, not
+# whatever the name holds when it is called.
+taken=$tmp/$name-taken.lock
+new_pid=$$ # this test's own PID, alive for as long as it matters
+cat >"$tmp/taken.sh" <<EOF
+. '$here/lib-lock.sh'
+lock_acquire $name-taken
+: >"$tmp/taken-acquired"
+while [ ! -e "$tmp/taken-released" ]; do sleep 0.05; done
+lock_release
+EOF
+TMPDIR=$tmp bash "$tmp/taken.sh" &
+old_holder=$!
+for _ in $(seq 1 50); do
+  [ -e "$tmp/taken-acquired" ] && break
+  sleep 0.1
+done
+[ -e "$tmp/taken-acquired" ] || { kill "$old_holder" 2>/dev/null; fail "the caller never took the lock"; }
+mv "$taken" "$taken.stale"
+mkdir "$taken"
+printf '%s\n' "$new_pid" >"$taken/pid"
+printf '%s\n' 0 >"$taken/at"
+: >"$tmp/taken-released"
+wait "$old_holder" 2>/dev/null
+old_holder=
+[ "$(cat "$taken/pid" 2>/dev/null)" = "$new_pid" ] ||
+  fail "a caller whose lock was taken over deleted the new holder's lock"
+
+echo "ok: a taken-over caller's release leaves the new holder's lock alone"
