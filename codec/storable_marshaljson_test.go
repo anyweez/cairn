@@ -84,15 +84,20 @@ func TestEncodeAcceptsMarshalledEscapesTheLedgerCanStore(t *testing.T) {
 }
 
 // A replacement-character escape is not a byte jsonb refuses: jsonb stores it
-// happily, as a U+FFFD the caller never sent. json writes a genuine U+FFFD raw
-// as its three UTF-8 bytes and escapes no other rune as \ufffd, so the escape
-// is always some encoder's stand-in for a byte it could not decode, and a
-// marshaler that emits it has already laundered its input.
+// happily, as a U+FFFD the caller never sent. encoding/json never escapes a
+// genuine U+FFFD and escapes no other rune as \ufffd, so in its output the
+// escape is a stand-in for a byte it could not decode. The codec cannot tell
+// that apart from another encoder's escaped genuine U+FFFD, so both are
+// refused; the first case below is the deliberate false positive.
 func TestEncodeRefusesAReplacementCharacterAnEncoderWrote(t *testing.T) {
 	c := codec.New[shape]()
 	codec.Register[verbatimJSONHolder](c, "verbatimJSONHolder", 1)
 
 	for name, sent := range map[string]verbatimJSON{
+		// The deliberate false positive: an encoder that escapes non-ASCII —
+		// Python's default json.dumps, say — writes a genuine U+FFFD as this
+		// escape, and it is refused because the bytes cannot be told apart
+		// from a Go-encoded replaced byte.
 		"a replacement-character escape in a string":      `"a\ufffdb"`,
 		"a replacement-character escape in an object key": `{"a\ufffd":1}`,
 	} {

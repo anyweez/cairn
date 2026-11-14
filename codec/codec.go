@@ -504,14 +504,19 @@ func checkStorableMarshaler(v reflect.Value, path string) error {
 // is rejected as an unsupported Unicode escape (SQLSTATE 22P05). The bytes are
 // the type's to decide, but what jsonb can keep is not.
 //
-// The replacement-character escape is refused for a different reason: it is
-// always remediation, never text. A marshaler built on an inner json.Marshal —
-// `type plain T; return json.Marshal(plain(v))` — has that encoder replace each
-// invalid byte with \ufffd, so the bytes that come back are valid JSON and
-// jsonb accepts them: the entry holds a replacement character where the
-// caller's byte was, text the caller never sent. encoding/json writes a
-// genuine U+FFFD rune raw, as its three UTF-8 bytes, and escapes no other
-// rune as \ufffd, so the escape can only mean an encoder replaced something.
+// The replacement-character escape is refused for a different reason, and it
+// is the one refusal here that can be a false positive. A marshaler built on
+// an inner json.Marshal — `type plain T; return json.Marshal(plain(v))` — has
+// that encoder replace each invalid byte with \ufffd, so the bytes that come
+// back are valid JSON and jsonb accepts them: the entry holds a replacement
+// character where the caller's byte was, text the caller never sent.
+// encoding/json never escapes a genuine U+FFFD rune — it writes it raw, as its
+// three UTF-8 bytes — and escapes no other rune as \ufffd, so in bytes it
+// produced the escape means it replaced something. A marshaler may return
+// bytes another encoder wrote, though: a json.RawMessage from Python's default
+// json.dumps escapes every non-ASCII rune, so a genuine U+FFFD arrives as
+// \ufffd, and jsonb would store it faithfully. The codec cannot tell the two
+// apart, so it refuses both rather than let a replaced byte through.
 func checkMarshalledJSON(data []byte, path string) error {
 	if !utf8.Valid(data) {
 		return &NotStorableError{Path: path}
@@ -534,9 +539,11 @@ func checkMarshalledJSON(data []byte, path string) error {
 		}
 		switch {
 		case u == 0, u == utf8.RuneError, u >= 0xdc00 && u <= 0xdfff:
-			// A NUL; a replacement character standing in for a byte an inner
-			// encoder could not decode; or a low surrogate with no high
-			// surrogate before it.
+			// A NUL; a replacement-character escape; or a low surrogate with
+			// no high surrogate before it. In bytes encoding/json produced
+			// the escape stands in for a byte it could not decode, but another
+			// encoder may have written a genuine U+FFFD that way, and the two
+			// are indistinguishable here; both are refused.
 			return &NotStorableError{Path: path}
 		case u >= 0xd800 && u <= 0xdbff:
 			// A high surrogate is storable only as half of a pair.
