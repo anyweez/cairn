@@ -297,7 +297,10 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   transactions cannot deadlock. Locking a stream doesn't create it: a stream exists once its first
   entry is written, so one locked only to be read leaves nothing behind.
 - **Append-only entries,** enforced by a trigger. A CHECK constraint keeps
-  refusals free of events and effects.
+  refusals free of events and effects. Every entry column is stored as the
+  bytes `json.Marshal` wrote, so a retry, `ReadStream` and `Verify` see the
+  message, result, events, effects and metadata the decider produced rather
+  than a re-serialised version of them.
 - **No gaps for readers of the global log.** `ReadAll` and projections hold
   back entries from transactions that are still in flight until every older
   transaction has finished, so a reader never skips past an entry that
