@@ -37,6 +37,8 @@
 _lock_dir=
 _lock_held=
 _lock_ino=
+_lock_claim_seen=
+_lock_claim_ino=
 
 # The inode names one lock directory even after its name is reused, so it is
 # what a caller compares to tell the lock it inspected from a newer one.
@@ -79,24 +81,56 @@ _lock_takeover() {
 # through the same takeover (wait for it, and the live lock it leaves behind),
 # and 1 when the claim cannot be taken or cleared, so DIR cannot be taken over.
 _lock_claim() {
-  local dir=$1 pid=$2 inode=$3 claim=$1/claim owner
+  local dir=$1 pid=$2 inode=$3 claim=$1/claim owner now claim_ino
   while :; do
     if mkdir "$claim" 2>/dev/null; then
+      _lock_claim_seen=
+      _lock_claim_ino=
       break
     fi
     [ -d "$dir" ] || return 2
     owner=$(cat "$claim/pid" 2>/dev/null || true)
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      return 2
+    if [ -n "$owner" ]; then
+      _lock_claim_seen=
+      _lock_claim_ino=
+      if kill -0 "$owner" 2>/dev/null; then
+        return 2
+      fi
+      # A taker killed while taking the lock over leaves a claim that nothing
+      # would ever clear, so a claim whose taker is gone is removed and retried.
+      if ! rm -rf "$claim" 2>/dev/null; then
+        return 1
+      fi
+      continue
     fi
     # Nothing to clear means the claim cannot be created at all, in a directory
     # the caller cannot write; report that rather than spinning on it.
-    [ -e "$claim" ] || return 1
-    # A taker killed while taking the lock over leaves a claim that nothing
-    # would ever clear, so a claim whose taker is gone is removed and retried.
+    if [ ! -e "$claim" ]; then
+      _lock_claim_seen=
+      _lock_claim_ino=
+      return 1
+    fi
+    # A claim with no PID is also what a live taker looks like between its
+    # mkdir of the claim and writing its PID inside it. Clearing that at once
+    # would let this caller take the claim over and both of them move the lock,
+    # so an empty claim is held and only becomes stale once it has been seen
+    # empty for longer than that window.
+    now=$(date +%s)
+    claim_ino=$(_lock_inode "$claim")
+    if [ "$claim_ino" != "$_lock_claim_ino" ]; then
+      _lock_claim_ino=$claim_ino
+      _lock_claim_seen=$now
+    fi
+    if [ "$((now - _lock_claim_seen))" -le 5 ]; then
+      return 2
+    fi
+    # A taker killed before it recorded itself leaves a claim nothing would
+    # ever clear, so one that has stayed empty past the window is removed.
     if ! rm -rf "$claim" 2>/dev/null; then
       return 1
     fi
+    _lock_claim_seen=
+    _lock_claim_ino=
   done
   printf '%s\n' "$$" >"$claim/pid" 2>/dev/null || true
   if [ "$(_lock_inode "$dir")" = "$inode" ] &&
@@ -130,6 +164,8 @@ _lock_takeover_possible() {
 lock_acquire() {
   local dir=${TMPDIR:-/tmp}/$1.lock
   local pid now seen= missing=0 inode reason stale
+  _lock_claim_seen=
+  _lock_claim_ino=
   while ! mkdir "$dir" 2>/dev/null; do
     if [ ! -d "$dir" ]; then
       # mkdir failed with no lock directory to inspect. Either the directory

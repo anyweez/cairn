@@ -89,7 +89,29 @@ wait_for "$acquirer" 5 || { kill "$acquirer" 2>/dev/null; fail "a dead holder's 
 wait "$acquirer" || fail "the caller exited non-zero after taking over a dead holder's lock"
 [ -d "$lock" ] && fail "the caller did not release the lock"
 
-echo "ok: a live holder keeps the lock, and a gone or unrecorded one is taken over"
+# A claim directory with no PID inside it is what a live taker looks like in
+# the moment between its mkdir of the claim and recording its PID. It must be
+# treated as held rather than cleared at once: a second taker that cleared it
+# would move the lock the first taker is claiming, and both would get in.
+mkdir "$lock"
+printf '%s\n' "$dead" >"$lock/pid"
+printf '%s\n' 0 >"$lock/at"
+mkdir "$lock/claim"
+TMPDIR=$tmp bash -c ". '$here/lib-lock.sh'; lock_acquire $name" >/dev/null 2>&1 &
+acquirer=$!
+sleep 1
+if ! kill -0 "$acquirer" 2>/dev/null; then
+  wait "$acquirer" 2>/dev/null
+  fail "took over a stale lock whose claim recorded no PID, so a live taker could still be claiming it"
+fi
+[ -d "$lock/claim" ] || fail "cleared a claim that recorded no PID, so its taker and this caller could both take the lock"
+[ "$(cat "$lock/pid" 2>/dev/null)" = "$dead" ] || fail "moved a stale lock out from under a claim that recorded no PID"
+kill "$acquirer" 2>/dev/null
+wait "$acquirer" 2>/dev/null
+acquirer=
+rm -rf "$lock"
+
+echo "ok: a live holder keeps the lock, a gone or unrecorded one is taken over, and an unrecorded claim is not"
 
 # A lock taken over while its holder is still working belongs to its new
 # holder. The old holder's release must remove the directory it created, not
