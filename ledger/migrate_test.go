@@ -18,6 +18,14 @@ import (
 // ends. Tests inside the package use it, since ledgertest imports ledger.
 func emptyDatabase(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	return emptyDatabaseWith(t, nil)
+}
+
+// emptyDatabaseWith is emptyDatabase with a hook to change the pool's
+// configuration before it opens, for a test that needs a particular pool size
+// rather than the default one.
+func emptyDatabaseWith(t *testing.T, configure func(*pgxpool.Config)) *pgxpool.Pool {
+	t.Helper()
 	url := os.Getenv("CAIRN_TEST_DATABASE_URL")
 	if url == "" {
 		if os.Getenv("CAIRN_REQUIRE_DATABASE") != "" {
@@ -41,6 +49,9 @@ func emptyDatabase(t *testing.T) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.Database = name
+	if configure != nil {
+		configure(cfg)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +418,10 @@ func TestMigrationLeaseIsRenewedWhileHeld(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	pool := emptyDatabase(t)
+	// A migrating caller holds two connections, for the migration and its lease
+	// heartbeat, while the gate holds one and this test reads through the same
+	// pool. Name the size rather than depend on the machine's CPU count for it.
+	pool := emptyDatabaseWith(t, func(cfg *pgxpool.Config) { cfg.MaxConns = 4 })
 	store := New(pool, RequireActor(false))
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
