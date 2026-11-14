@@ -26,18 +26,125 @@
 # retries and acquires, rather than reporting a stale lock that is not there.
 # An EXIT trap releases the lock when the critical section fails or the script
 # is interrupted.
+#
+# A lock is identified by the directory, not by its name: the name can be
+# reused as soon as a lock is released, so a caller that reads a stale PID and
+# then acts on the name could act on a newer lock that took the name in
+# between. A takeover therefore claims the lock it inspected with an atomic
+# mkdir inside it, and only then moves it, and lock_release removes the
+# directory it created rather than whatever the name holds when it is called.
 
 _lock_dir=
 _lock_held=
+_lock_ino=
+_lock_claim_seen=
+_lock_claim_ino=
+
+# The inode names one lock directory even after its name is reused, so it is
+# what a caller compares to tell the lock it inspected from a newer one.
+_lock_inode() {
+  local listing
+  listing=$(ls -di "$1" 2>/dev/null) || true
+  printf '%s\n' "${listing%% *}"
+}
 
 # A stale lock is moved aside before it is deleted. Renaming is one step, so
 # the lock name is free even if the moved directory cannot be deleted, and a
 # failed move leaves the pid and at files where the takeover logic reads them.
+#
+# _lock_takeover DIR PID INODE returns 0 when DIR was still the stale lock and
+# is now gone, 2 when another caller is taking it over or DIR has gone, and 1
+# when the directory cannot be moved aside at all.
 _lock_takeover() {
-  local stale="$1.stale.$$"
-  mv "$1" "$stale" 2>/dev/null || return 1
+  local dir=$1 pid=$2 inode=$3 stale="$1.stale.$$" status=0
+  _lock_claim "$dir" "$pid" "$inode" || status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  if ! mv "$dir" "$stale" 2>/dev/null; then
+    _lock_unclaim "$dir"
+    # A move that failed with the directory still there cannot succeed later,
+    # unless the lock went away in between, which the next mkdir settles.
+    [ -d "$dir" ] || return 2
+    return 1
+  fi
   rm -rf "$stale" 2>/dev/null || true
   return 0
+}
+
+# Take the right to move DIR aside, but only while it is still the lock the
+# caller inspected: the same directory (inode) recording the same PID.
+#
+# mkdir is atomic, so one caller at a time holds the claim. The claim sits
+# inside the directory it claims, so claiming a lock that was replaced in
+# between is detected by the re-check below and given back untouched.
+#
+# Returns 0 when this caller may move DIR, 2 when another caller is part-way
+# through the same takeover (wait for it, and the live lock it leaves behind),
+# and 1 when the claim cannot be taken or cleared, so DIR cannot be taken over.
+_lock_claim() {
+  local dir=$1 pid=$2 inode=$3 claim=$1/claim owner now claim_ino
+  while :; do
+    if mkdir "$claim" 2>/dev/null; then
+      _lock_claim_seen=
+      _lock_claim_ino=
+      break
+    fi
+    [ -d "$dir" ] || return 2
+    owner=$(cat "$claim/pid" 2>/dev/null || true)
+    if [ -n "$owner" ]; then
+      _lock_claim_seen=
+      _lock_claim_ino=
+      if kill -0 "$owner" 2>/dev/null; then
+        return 2
+      fi
+      # A taker killed while taking the lock over leaves a claim that nothing
+      # would ever clear, so a claim whose taker is gone is removed and retried.
+      if ! rm -rf "$claim" 2>/dev/null; then
+        return 1
+      fi
+      continue
+    fi
+    # Nothing to clear means the claim cannot be created at all, in a directory
+    # the caller cannot write; report that rather than spinning on it.
+    if [ ! -e "$claim" ]; then
+      _lock_claim_seen=
+      _lock_claim_ino=
+      return 1
+    fi
+    # A claim with no PID is also what a live taker looks like between its
+    # mkdir of the claim and writing its PID inside it. Clearing that at once
+    # would let this caller take the claim over and both of them move the lock,
+    # so an empty claim is held and only becomes stale once it has been seen
+    # empty for longer than that window.
+    now=$(date +%s)
+    claim_ino=$(_lock_inode "$claim")
+    if [ "$claim_ino" != "$_lock_claim_ino" ]; then
+      _lock_claim_ino=$claim_ino
+      _lock_claim_seen=$now
+    fi
+    if [ "$((now - _lock_claim_seen))" -le 5 ]; then
+      return 2
+    fi
+    # A taker killed before it recorded itself leaves a claim nothing would
+    # ever clear, so one that has stayed empty past the window is removed.
+    if ! rm -rf "$claim" 2>/dev/null; then
+      return 1
+    fi
+    _lock_claim_seen=
+    _lock_claim_ino=
+  done
+  printf '%s\n' "$$" >"$claim/pid" 2>/dev/null || true
+  if [ "$(_lock_inode "$dir")" = "$inode" ] &&
+     [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$pid" ]; then
+    return 0
+  fi
+  _lock_unclaim "$dir"
+  return 2
+}
+
+# Give back a claim, and only a claim this caller wrote.
+_lock_unclaim() {
+  [ "$(cat "$1/claim/pid" 2>/dev/null || true)" = "$$" ] || return 0
+  rm -rf "$1/claim" 2>/dev/null || true
 }
 
 # An empty lock is aged before takeover, so this checks now whether that
@@ -54,20 +161,11 @@ _lock_takeover_possible() {
   return 0
 }
 
-# A lock that cannot be removed is only reported for a directory that is still
-# there. lock_release does rm -rf, so a caller that straddles a release can
-# decide the lock is stale after the directory has gone; there is nothing to
-# remove by hand then, and the caller should retry mkdir instead. Returns 0
-# when the caller should retry, 1 after reporting.
-_lock_report_unremovable() {
-  [ -d "$1" ] || return 0
-  echo "lock $1: cannot remove the stale lock directory; remove it by hand" >&2
-  return 1
-}
-
 lock_acquire() {
   local dir=${TMPDIR:-/tmp}/$1.lock
-  local pid now seen= missing=0
+  local pid now seen= missing=0 inode reason stale
+  _lock_claim_seen=
+  _lock_claim_ino=
   while ! mkdir "$dir" 2>/dev/null; do
     if [ ! -d "$dir" ]; then
       # mkdir failed with no lock directory to inspect. Either the directory
@@ -86,18 +184,16 @@ lock_acquire() {
     missing=0
     now=$(date +%s)
     pid=$(cat "$dir/pid" 2>/dev/null || true)
+    stale=
+    reason=
     if [ -n "$pid" ]; then
       # A live holder keeps the lock however long it takes. Taking it would
       # let a second caller into the check-then-act and reintroduce the
       # name-conflict race this lock exists to prevent.
       seen=
       if ! kill -0 "$pid" 2>/dev/null; then
-        echo "lock $dir: holder $pid is gone, taking it" >&2
-        if ! _lock_takeover "$dir"; then
-          _lock_report_unremovable "$dir" || return 1
-          seen=
-          continue
-        fi
+        stale=1
+        reason="holder $pid is gone"
       fi
     else
       # An empty read is also what a caller sees when lock_release has just
@@ -112,21 +208,42 @@ lock_acquire() {
       # check, so age the lock from when this caller first saw it empty.
       [ -n "$seen" ] || seen=$now
       if ! _lock_takeover_possible "$dir"; then
-        _lock_report_unremovable "$dir" || return 1
-        seen=
-        continue
-      fi
-      if [ "$((now - seen))" -gt 60 ]; then
-        echo "lock $dir: no holder recorded for more than 60s, taking it" >&2
-        if ! _lock_takeover "$dir"; then
-          _lock_report_unremovable "$dir" || return 1
+        # A lock released between the read and here is not there to remove;
+        # report only a directory that is still there, and retry otherwise.
+        if [ ! -d "$dir" ]; then
           seen=
           continue
         fi
+        echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
+        return 1
+      fi
+      if [ "$((now - seen))" -gt 60 ]; then
+        stale=1
+        reason="no holder recorded for more than 60s"
+      fi
+    fi
+    if [ -n "$stale" ]; then
+      inode=$(_lock_inode "$dir")
+      if _lock_takeover "$dir" "$pid" "$inode"; then
+        echo "lock $dir: $reason, taking it" >&2
+      else
+        case $? in
+          2)
+            # Either another caller is taking it over or the lock went away in
+            # between: there is nothing to remove by hand, and the next mkdir
+            # settles which.
+            seen=
+            ;;
+          *)
+            echo "lock $dir: cannot remove the stale lock directory; remove it by hand" >&2
+            return 1
+            ;;
+        esac
       fi
     fi
     sleep 0.1
   done
+  _lock_ino=$(_lock_inode "$dir")
   printf '%s\n' "$$" >"$dir/pid"
   date +%s >"$dir/at"
   _lock_dir=$dir
@@ -136,8 +253,14 @@ lock_acquire() {
 
 lock_release() {
   if [ -n "${_lock_held:-}" ]; then
-    rm -rf "$_lock_dir"
+    # Remove the lock this caller created, not whatever the name holds now: a
+    # lock taken over while this caller worked belongs to its new holder.
+    if [ "$(_lock_inode "$_lock_dir")" = "${_lock_ino:-}" ] &&
+       [ "$(cat "$_lock_dir/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -rf "$_lock_dir"
+    fi
     _lock_held=
     _lock_dir=
+    _lock_ino=
   fi
 }
