@@ -3,8 +3,6 @@ package ledger
 import (
 	"context"
 	"fmt"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // EntryView keeps a read model of a stream's history in step with its
@@ -79,29 +77,19 @@ var rebuildWindow = 1000
 // transaction of its own, and no stream is locked, so RebuildEntries can run
 // while the aggregate is taking messages: an entry recorded meanwhile is
 // written live and again by the replay, which changes nothing, since Write is
-// safe to run again. A failed rebuild leaves the windows before the failure
-// written; running it again redoes them.
+// safe to run again. A stream first written while it runs is replayed by a
+// later pass, so it is in the rebuilt entry view too. A failed rebuild leaves
+// the windows before the failure written; running it again redoes them.
 func (a *Aggregate[S, M, R, Ev, Ef]) RebuildEntries(ctx context.Context, v EntryView[S, Ev]) (int, error) {
 	if err := a.Validate(); err != nil {
 		return 0, err
 	}
-	rows, err := a.Store.pool.Query(ctx, `
-SELECT DISTINCT stream FROM cairn.entries
-WHERE kind = $1 AND events <> '[]'::jsonb ORDER BY stream`, a.Kind)
-	if err != nil {
-		return 0, err
-	}
-	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return 0, err
-	}
-	for i, name := range names {
-		stream := parseStream(name, a.Kind)
+	return a.eachEventfulStream(ctx, func(name string, stream Stream) error {
 		if err := a.replayEntries(ctx, stream, v); err != nil {
-			return i, fmt.Errorf("cairn: rebuilding entry view %s at %s: %w", v.Name, name, err)
+			return fmt.Errorf("cairn: rebuilding entry view %s at %s: %w", v.Name, name, err)
 		}
-	}
-	return len(names), nil
+		return nil
+	})
 }
 
 // replayEntries replays one stream's entries through v, a window at a time.
