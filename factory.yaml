@@ -67,7 +67,9 @@ gate:
     Needs Docker for a throwaway
     postgres:17-alpine unless CAIRN_TEST_DATABASE_URL points at a server. CI's
     PR-only checks (commit messages, stored types against the base branch) are
-    not in it. Under a minute with a warm module cache
+    not in it. About two to four minutes: the tests always run (-count=1), and
+    the ledger package alone takes one to two minutes against the fixture
+    Postgres
 
 # The ledger's Postgres. test-postgres.sh reuses a running container, so `up`
 # is safe to call again, and check.sh reuses the same one rather than starting
