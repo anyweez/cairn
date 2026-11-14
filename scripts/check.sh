@@ -24,7 +24,10 @@ export CAIRN_TEST_DATABASE_URL
 # Fail, rather than skip, a ledger test that needs a database or a server
 # that can prepare transactions.
 export CAIRN_REQUIRE_DATABASE=1
-go test -race ./...
+# -count=1 disables Go's test cache: the cache key covers the binary and the
+# environment, not the database the ledger tests talk to, so a cached pass says
+# nothing about the server behind CAIRN_TEST_DATABASE_URL today.
+go test -race -count=1 ./...
 
 # The fixture scripts' lock library is shell, so no Go test reaches its
 # failure paths: without these, a regression shows up as a hung fixture.
@@ -32,7 +35,7 @@ bash scripts/lib-lock_test.sh
 bash scripts/zzqa_lock_acquire_ends_when_its_directory_is_unusable_test.sh
 
 go -C cmd/cairn-manifest vet ./...
-go -C cmd/cairn-manifest test ./...
+go -C cmd/cairn-manifest test -count=1 ./...
 
 go -C cmd/cairn-manifest run . -dir ../..
 # status, not diff: it also catches a manifest that was never committed.
