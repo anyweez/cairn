@@ -55,4 +55,8 @@ if [ -z "${ready:-}" ]; then
   exit 1
 fi
 
+# The URL has to name the port the container publishes, not the one it was
+# asked for: CAIRN_TEST_PGBOUNCER_PORT=0 asks Docker to choose the host port,
+# and a URL built from the request would name port 0 instead.
+port=$(container_host_port "$name" 5432)
 echo "postgres://cairn:cairn@127.0.0.1:${port}/postgres?sslmode=disable&default_query_exec_mode=cache_describe"
