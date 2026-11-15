@@ -70,6 +70,10 @@ func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 	total := 0
 	for {
 		n := 0
+		// more records whether the read found an entry past this batch, which is
+		// how the loop knows there is more to apply without opening a second
+		// transaction to find out.
+		more := false
 		// READ COMMITTED is required, not the default: under REPEATABLE READ the
 		// transaction's snapshot would be taken here, before readAll measures the
 		// log fence, and a transaction committing in between would be invisible
@@ -94,9 +98,22 @@ func (p *Projection) CatchUp(ctx context.Context) (int, error) {
 				}
 			}
 
-			entries, err := readAll(ctx, tx, after, batch, p.Kinds)
+			// Read one entry past the batch. A read of exactly batch entries is
+			// otherwise indistinguishable from a full batch with more behind it,
+			// and only a further transaction could tell: the one that costs four
+			// round trips to discover the log is empty. Applying just the batch
+			// keeps the checkpoint on its last entry, so the next iteration
+			// reads the one past it again. With Kinds, an entry in a branch's
+			// first limit entries has at most limit-1 entries ahead of it in the
+			// log, so the union's first limit is the log's first limit; one more
+			// than the batch is still the log's next entry.
+			entries, err := readAll(ctx, tx, after, batch+1, p.Kinds)
 			if err != nil || len(entries) == 0 {
 				return err
+			}
+			more = len(entries) > batch
+			if more {
+				entries = entries[:batch]
 			}
 
 			// Claim the checkpoint, first in the batch. Another runner of the same
@@ -141,11 +158,11 @@ WHERE cairn.checkpoints.txid = $4::text::xid8 AND cairn.checkpoints.position = $
 		if err != nil {
 			return total, err
 		}
-		// A short batch means there are no more entries visible as of the read
-		// that produced it. Return without reading again: the next call picks up
-		// anything that commits meanwhile, and the terminating transaction would
-		// otherwise cost four round trips on its own.
-		if n < batch {
+		// No entry past this batch means there are no more visible as of the read
+		// that found this one. Return without reading again: the next call picks
+		// up anything that commits meanwhile, and the terminating transaction
+		// would otherwise cost four round trips on its own.
+		if !more {
 			return total + n, nil
 		}
 		total += n
