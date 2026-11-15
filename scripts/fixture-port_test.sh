@@ -35,7 +35,7 @@ assert_refuses() {
   [ "$status" -ne 0 ] || fail "$what: accepted it and printed '$out'"
   [ -z "$out" ] || fail "$what: refused but printed '$out' on stdout"
   case $err in
-    *1-65535* | *'is not a port number'*) : ;;
+    *0-65535* | *'is not a port number'*) : ;;
     *) fail "$what: the error does not say what is wrong: '$err'" ;;
   esac
 }
@@ -124,7 +124,16 @@ assert_eq cairn-test-pgbouncer-56073 "$(fixture_name cairn-test-pgbouncer 55873 
 assert_eq 9000 "$(fixture_port_beside 8474 55872 56100 9000 '' 56101)" \
   "explicit CAIRN_TOXIPROXY_API_PORT"
 
-# A port that leaves 1-65535 is refused with the reason, not handed to Docker,
+# An explicit 0 is a host port too: Docker reads it as "publish on a port of
+# your choosing", and the script reads the port it chose back from the
+# container. A derived port is never 0, so this only widens what a caller may
+# ask for.
+assert_eq 0 "$(fixture_port 55873 55871 55871 0)" \
+  "explicit CAIRN_TEST_PGBOUNCER_PORT=0"
+assert_eq 0 "$(fixture_port_beside 8474 55872 55872 0 '' 55873)" \
+  "explicit CAIRN_TOXIPROXY_API_PORT=0"
+
+# A port that leaves 0-65535 is refused with the reason, not handed to Docker,
 # which only says "invalid port range" once a container is being created.
 assert_refuses "PgBouncer port for CAIRN_TEST_PORT=65534" \
   fixture_port 55873 55871 65534
