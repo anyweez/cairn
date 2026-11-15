@@ -51,6 +51,54 @@ func TestCloneKeepsSharing(t *testing.T) {
 	}
 }
 
+// Different objects can share an address: every empty slice points at the
+// runtime's zerobase, a struct and its first field share one, and two named map
+// types converted from one another share one backing map. The copy's identity
+// key must include the type, or it hands a copy of one to the other's field and
+// reflect.Set panics.
+func TestCloneDistinguishesObjectsThatShareAnAddress(t *testing.T) {
+	t.Run("empty slices", func(t *testing.T) {
+		type msg struct {
+			Names  []string
+			Counts []int
+		}
+		c := clone(msg{Names: []string{}, Counts: []int{}})
+		if c.Names == nil || c.Counts == nil {
+			t.Fatalf("an empty slice was copied as nil: %+v", c)
+		}
+	})
+
+	t.Run("pointer and first field", func(t *testing.T) {
+		type head struct{ N int }
+		type body struct {
+			head
+			M int
+		}
+		type msg struct {
+			Whole *body
+			Head  *head
+		}
+		b := &body{}
+		c := clone(msg{Whole: b, Head: &b.head})
+		if c.Whole == nil || c.Head == nil || c.Whole == b || c.Head == &b.head {
+			t.Fatalf("the copy did not keep two pointers apart: %+v", c)
+		}
+	})
+
+	t.Run("named map types", func(t *testing.T) {
+		type m1 map[string]int
+		type m2 map[string]int
+		a := m1{"x": 1}
+		c := clone(struct {
+			A m1
+			B m2
+		}{A: a, B: m2(a)})
+		if c.A["x"] != 1 || c.B["x"] != 1 {
+			t.Fatalf("a converted map was copied wrong: %+v", c)
+		}
+	})
+}
+
 // A value that contains itself must terminate, and the copy must keep the
 // cycle rather than unfolding it.
 func TestCloneTerminatesOnCycles(t *testing.T) {
