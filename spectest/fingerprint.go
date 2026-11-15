@@ -19,17 +19,22 @@ func fingerprint(v any) string {
 
 // visit identifies a pointer, map or slice on the current path, so a value
 // that contains itself renders as <cycle> instead of recursing forever. A
-// slice is only the same value at the same length.
+// slice is only the same value at the same length. The type is part of the
+// identity too: different objects can share an address — every zero-length
+// slice points at zerobase, a struct and its first field share one, and two
+// named map types can share one backing map — and treating them as the same
+// object would make clone install one type's copy in another type's field.
 type visit struct {
 	ptr  uintptr
 	kind reflect.Kind
 	len  int
+	typ  reflect.Type
 }
 
 // visitKey names the object v refers to, for the path maps fingerprint and
 // clone keep.
 func visitKey(v reflect.Value) visit {
-	k := visit{ptr: v.Pointer(), kind: v.Kind()}
+	k := visit{ptr: v.Pointer(), kind: v.Kind(), typ: v.Type()}
 	if v.Kind() == reflect.Slice {
 		k.len = v.Len()
 	}
