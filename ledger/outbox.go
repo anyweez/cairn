@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -319,11 +320,25 @@ func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error 
 func (d Delivery[Ef]) caused() Meta {
 	correlation := d.Meta.CorrelationID
 	if correlation == "" {
-		correlation = fmt.Sprintf("%s#%d", d.Stream, d.Seq)
+		correlation = derivedCorrelation(d.Stream, d.Seq)
 	}
 	actor := d.Meta.Actor
 	if actor == "" {
 		actor = "outbox"
 	}
 	return Meta{Actor: actor, Via: "outbox", CorrelationID: correlation, CausationID: d.Key()}
+}
+
+// derivedCorrelation starts a flow at the entry that produced an effect: its
+// stream and seq. The value is written to an indexed column, and a stream name
+// may fill that column's bound on its own, so a value too long to store is
+// hashed rather than truncated. Truncating would give two long streams with a
+// shared prefix the same flow, and could cut a multi-byte rune in half.
+func derivedCorrelation(st Stream, seq int64) string {
+	correlation := fmt.Sprintf("%s#%d", st, seq)
+	if len(correlation) <= maxIndexedTextBytes {
+		return correlation
+	}
+	sum := sha256.Sum256([]byte(correlation))
+	return fmt.Sprintf("%x#%d", sum[:16], seq)
 }
