@@ -20,7 +20,9 @@ measurements and how to reproduce them.
 | `CatchUp`, per batch of up to `BatchSize` entries | 5 |
 
 `TestEachPathKeepsToItsRoundTrips` holds the uncached paths to these numbers,
-and `cache_test.go` the cached ones.
+and `cache_test.go` the cached ones. A catch-up reads one entry past its batch,
+so a batch that is exactly full costs 5 like any other and no transaction is
+spent discovering the log is empty. One that finds nothing costs 4.
 
 Without the cache, `Handle` makes two round trips:
 
