@@ -64,6 +64,58 @@ func (closeFailsSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResu
 	return &closeFailsResults{remaining: b.Len()}
 }
 
+// A batch whose COMMIT response never arrives is neither a commit the client
+// saw nor a failure the database reported: the transaction may have committed.
+// The caller must be told the outcome is unknown, so a caller holding data the
+// entry would name keeps it rather than deleting the only copy.
+func TestABatchWhoseCommitResponseIsLostSaysTheOutcomeIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(execResult, `INSERT INTO recorded VALUES (1)`)
+	b.end()
+
+	err := b.send(context.Background(), commitLostSender{})
+	if err == nil {
+		t.Fatal("send returned nil, want the lost connection's error")
+	}
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v; the COMMIT's result was never read, so it cannot say the message was recorded", err)
+	}
+	if !errors.Is(err, ErrUnknownOutcome) {
+		t.Fatalf("send returned %v, want an error wrapping ErrUnknownOutcome", err)
+	}
+}
+
+// commitLostSender answers every statement up to the COMMIT, and fails that
+// one with the connection gone: the tag carrying its outcome never arrives.
+type commitLostSender struct{}
+
+func (commitLostSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	return &commitLostResults{remaining: b.Len()}
+}
+
+type commitLostResults struct {
+	remaining int
+}
+
+func (r *commitLostResults) Exec() (pgconn.CommandTag, error) {
+	r.remaining--
+	if r.remaining == 0 {
+		return pgconn.CommandTag{}, errors.New("unexpected EOF")
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (r *commitLostResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (r *commitLostResults) QueryRow() pgx.Row { return nil }
+
+func (r *commitLostResults) Close() error { return nil }
+
 type closeFailsResults struct {
 	remaining int
 }
