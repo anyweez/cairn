@@ -102,11 +102,25 @@ fixture_port_beside() {
 # container_publishes NAME CONTAINER_PORT HOST_PORT succeeds only when NAME is
 # running and publishes CONTAINER_PORT on 127.0.0.1:HOST_PORT. A container
 # found by name alone may have been created with a different port, and then
-# the URL a script prints points somewhere nothing is listening.
+# the URL a script prints points somewhere nothing is listening. HOST_PORT 0 is
+# Docker's "publish on a port you choose": the container reports a host port
+# the request cannot name, so any 127.0.0.1 host port is the one asked for.
+# Comparing the mapping with "127.0.0.1:0" would never match, and every call
+# would remove and recreate the container instead of reusing it.
 container_publishes() {
-  local name=$1 container_port=$2 host_port=$3 mapping
+  local name=$1 container_port=$2 host_port=$3 mapping port
   [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
   mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) || return 1
+  if [ "$host_port" = 0 ]; then
+    case $mapping in
+      127.0.0.1:*) port=${mapping##*:} ;;
+      *) return 1 ;;
+    esac
+    case $port in
+      '' | 0 | *[!0-9]*) return 1 ;;
+    esac
+    return 0
+  fi
   [ "$mapping" = "127.0.0.1:${host_port}" ]
 }
 
