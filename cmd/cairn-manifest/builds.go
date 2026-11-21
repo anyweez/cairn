@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"go/ast"
 	"go/build"
 	"go/build/constraint"
 	"go/parser"
@@ -465,58 +465,116 @@ func orBuilds(a, b string) string {
 // buildHeader returns the //go:build line in path's header as go/build reads
 // it, or, when it has none, the legacy // +build lines it ANDs there, in order.
 //
-// The header is the comments before the package clause that a blank line
-// separates from it: the group directly above the clause is the package doc,
-// which go/build does not read a constraint from. Parsing the file is what keeps
-// a directive-shaped line inside a raw string, a block comment or the body from
-// being taken as the header, and it handles the BOM.
+// This is go/build's own scan of the file: a //go:build line counts anywhere in
+// the leading run of comments, including directly above the package clause,
+// while the legacy form ends at the last blank line before the first line of
+// code, and a block comment ends it outright. Reading the file's bytes rather
+// than its syntax tree is what keeps a directive-shaped line inside a raw
+// string or the body from being taken as the header, and it handles the BOM.
 func buildHeader(path string) (goBuild string, plusBuilds []string) {
-	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly|parser.ParseComments)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", nil
 	}
-	for _, g := range f.Comments {
-		if g.Pos() >= f.Package {
-			break
+	header, line := fileHeader(bytes.TrimPrefix(content, utf8BOM))
+	if len(line) > 0 {
+		goBuild = string(line)
+	}
+	for _, l := range strings.Split(string(header), "\n") {
+		l = strings.TrimSpace(l)
+		if _, err := constraint.Parse(l); err == nil && constraint.IsPlusBuild(l) {
+			plusBuilds = append(plusBuilds, l)
 		}
-		if g == f.Doc {
-			continue
-		}
-		line, legacy := headerDirectives(g)
-		if goBuild == "" {
-			goBuild = line
-		}
-		plusBuilds = append(plusBuilds, legacy...)
 	}
 	return goBuild, plusBuilds
 }
 
-// headerDirectives returns the build directives in one comment group of a file
-// header: its //go:build line if it has one, and its legacy // +build lines.
-// go/build ignores a legacy line that follows a block comment in the header,
-// and a blank line -- which ends the group -- clears that, so the flag is per
-// group rather than per file.
-func headerDirectives(g *ast.CommentGroup) (goBuild string, plusBuilds []string) {
-	block := false
-	for _, c := range g.List {
-		if strings.HasPrefix(c.Text, "/*") {
-			block = true
+// utf8BOM is the byte order mark the go command drops before reading a file's
+// header, so a directive after it is still a directive.
+var utf8BOM = []byte("\xef\xbb\xbf")
+
+// fileHeader returns the part of content the legacy // +build lines are read
+// from, and the //go:build line anywhere in the leading comment run, as
+// go/build's parseFileHeader does. content must not begin with a BOM.
+func fileHeader(content []byte) (header, goBuild []byte) {
+	return legacyHeader(content), goBuildHeader(content)
+}
+
+// legacyHeader returns content's leading run of blank lines and // comments,
+// which is where go/build reads the legacy // +build form. The run ends at the
+// first line that is neither, so a blank line after it -- or a directive inside
+// a block comment or a raw string -- is not part of the header.
+func legacyHeader(content []byte) []byte {
+	end := 0
+	for p := content; len(p) > 0; {
+		var line []byte
+		line, p = firstLine(p)
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			end = len(content) - len(p)
 			continue
 		}
-		if block {
-			continue
-		}
-		if constraint.IsGoBuild(c.Text) {
-			if goBuild == "" {
-				goBuild = c.Text
-			}
-			continue
-		}
-		if constraint.IsPlusBuild(c.Text) {
-			plusBuilds = append(plusBuilds, c.Text)
+		if !bytes.HasPrefix(line, []byte("//")) {
+			break
 		}
 	}
-	return goBuild, plusBuilds
+	return content[:end]
+}
+
+// goBuildHeader returns the first //go:build line in content's leading comment
+// run, or nil. Unlike the legacy form it counts wherever a blank line falls,
+// including directly above the package clause; go/build accepts one before the
+// first line of code and ignores one inside a block comment or a string.
+func goBuildHeader(content []byte) []byte {
+	inSlashStar := false
+	for p := content; len(p) > 0; {
+		var line []byte
+		line, p = firstLine(p)
+		line = bytes.TrimSpace(line)
+		if !inSlashStar && constraint.IsGoBuild(string(line)) {
+			return line
+		}
+		var code bool
+		inSlashStar, code = scanComment(line, inSlashStar)
+		if code {
+			return nil
+		}
+	}
+	return nil
+}
+
+// scanComment advances the /* */ state through one line of a file, and reports
+// whether the line holds text that is not a comment.
+func scanComment(line []byte, inSlashStar bool) (next, code bool) {
+	for len(line) > 0 {
+		if inSlashStar {
+			i := bytes.Index(line, []byte("*/"))
+			if i < 0 {
+				return true, false
+			}
+			inSlashStar = false
+			line = bytes.TrimSpace(line[i+len("*/"):])
+			continue
+		}
+		switch {
+		case bytes.HasPrefix(line, []byte("//")):
+			return false, false
+		case bytes.HasPrefix(line, []byte("/*")):
+			inSlashStar = true
+			line = bytes.TrimSpace(line[len("/*"):])
+		default:
+			return false, true
+		}
+	}
+	return inSlashStar, false
+}
+
+// firstLine splits p at its first newline.
+func firstLine(p []byte) (line, rest []byte) {
+	if i := bytes.IndexByte(p, '\n'); i >= 0 {
+		return p[:i], p[i+1:]
+	}
+	return p, nil
 }
 
 // plusBuildExpr ANDs the legacy // +build lines in a file header, one per
