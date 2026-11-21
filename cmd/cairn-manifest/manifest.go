@@ -493,7 +493,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			return
 		}
 		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
-		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
+		subject := "codec.Register[" + typeString(v) + "]"
 		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
 			return
 		}
@@ -512,10 +512,10 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			// resolve both here or a registration through an alias is recorded
 			// under a name the running program does not have, and Sum and Type
 			// disagree about which one it is.
-			Sum:     types.TypeString(types.Unalias(sum), nil),
+			Sum:     typeString(sum),
 			Name:    constant.StringVal(name),
 			Version: int(n),
-			Type:    types.TypeString(types.Unalias(v), nil),
+			Type:    typeString(v),
 			Build:   build,
 			Fields:  fields(v),
 		}
@@ -565,7 +565,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 		}
 		n, _ := constant.Int64Val(from)
 		x.upcasts = append(x.upcasts, upcast{
-			sum:   types.TypeString(types.Unalias(sum), nil),
+			sum:   typeString(sum),
 			name:  constant.StringVal(name),
 			from:  int(n),
 			pos:   x.position(p.Fset, call.Pos()),
@@ -693,6 +693,60 @@ func typeParamIn(t types.Type, seen map[types.Type]bool) string {
 		}
 	}
 	return ""
+}
+
+// typeString renders t as the runtime names it, with every alias resolved.
+// reflect has no aliases, so codec.Registration names the aliased type wherever
+// one appears. types.Unalias resolves only t itself, leaving an alias inside an
+// instantiated generic's type-argument list for types.TypeString to print: the
+// runtime's Event[Key, string] would be recorded as Event[AliasKey, string],
+// and codec.CheckRegistrations would read one correct codec as both missing
+// from the manifest and extra in the codecs.
+func typeString(t types.Type) string {
+	return types.TypeString(unaliased(t), nil)
+}
+
+// unaliased returns t with its aliases resolved, including those inside a type
+// argument or a composite, because reflect has no aliases and the runtime names
+// the aliased type at every depth.
+func unaliased(t types.Type) types.Type {
+	if u := types.Unalias(t); u != nil {
+		t = u
+	}
+	switch u := t.(type) {
+	case *types.Named:
+		return unaliasedNamed(u)
+	case *types.Pointer:
+		return types.NewPointer(unaliased(u.Elem()))
+	case *types.Slice:
+		return types.NewSlice(unaliased(u.Elem()))
+	case *types.Array:
+		return types.NewArray(unaliased(u.Elem()), u.Len())
+	case *types.Map:
+		return types.NewMap(unaliased(u.Key()), unaliased(u.Elem()))
+	case *types.Chan:
+		return types.NewChan(u.Dir(), unaliased(u.Elem()))
+	}
+	return t
+}
+
+// unaliasedNamed rebuilds an instantiated generic around its unaliased type
+// arguments; the runtime type of an instance has them resolved, and
+// types.TypeString would otherwise print the alias they were written with.
+func unaliasedNamed(n *types.Named) types.Type {
+	args := n.TypeArgs()
+	if args.Len() == 0 {
+		return n
+	}
+	resolved := make([]types.Type, args.Len())
+	for i := range resolved {
+		resolved[i] = unaliased(args.At(i))
+	}
+	inst, err := types.Instantiate(nil, n.Origin(), resolved, false)
+	if err != nil {
+		return n
+	}
+	return inst
 }
 
 // typeChildren lists the types t contains that could hold a type parameter.
