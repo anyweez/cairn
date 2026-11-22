@@ -695,20 +695,24 @@ func typeParamIn(t types.Type, seen map[types.Type]bool) string {
 	return ""
 }
 
-// typeString renders t as the runtime names it, with every alias resolved.
-// reflect has no aliases, so codec.Registration names the aliased type wherever
-// one appears. types.Unalias resolves only t itself, leaving an alias inside an
-// instantiated generic's type-argument list for types.TypeString to print: the
-// runtime's Event[Key, string] would be recorded as Event[AliasKey, string],
-// and codec.CheckRegistrations would read one correct codec as both missing
-// from the manifest and extra in the codecs.
+// typeString renders t as the runtime names it, with every alias resolved and
+// the parameter names reflect cannot see dropped. reflect has no aliases, so
+// codec.Registration names the aliased type wherever one appears. It also has
+// no parameter names — an unnamed interface method or a function type is
+// exposed with their types only — so an expression written
+// `interface{Accept(x int) string}` is named `interface{Accept(int) string}`
+// by the runtime. A codec sum the two halves spell differently is read by
+// codec.CheckRegistrations as both missing from the manifest and extra in the
+// codecs, so the manifest records the reflection's spelling.
 func typeString(t types.Type) string {
 	return types.TypeString(unaliased(t), nil)
 }
 
-// unaliased returns t with its aliases resolved, including those inside a type
-// argument or a composite, because reflect has no aliases and the runtime names
-// the aliased type at every depth.
+// unaliased returns t as reflect exposes it, including inside a type argument
+// or a composite: aliases resolved and the parameter and result names of a
+// function or interface method dropped. Names are kept wherever there is
+// nothing to drop, so the universe's empty interface stays the `any` go/types
+// prints rather than becoming a rebuilt `interface{}`.
 func unaliased(t types.Type) types.Type {
 	if u := types.Unalias(t); u != nil {
 		t = u
@@ -726,11 +730,17 @@ func unaliased(t types.Type) types.Type {
 		return types.NewMap(unaliased(u.Key()), unaliased(u.Elem()))
 	case *types.Chan:
 		return types.NewChan(u.Dir(), unaliased(u.Elem()))
+	case *types.Signature:
+		return withoutParamNames(u)
+	case *types.Interface:
+		return unaliasedInterface(u)
+	case *types.Struct:
+		return unaliasedStruct(u)
 	}
 	return t
 }
 
-// unaliasedNamed rebuilds an instantiated generic around its unaliased type
+// unaliasedNamed rebuilds an instantiated generic around its runtime type
 // arguments; the runtime type of an instance has them resolved, and
 // types.TypeString would otherwise print the alias they were written with.
 func unaliasedNamed(n *types.Named) types.Type {
@@ -747,6 +757,68 @@ func unaliasedNamed(n *types.Named) types.Type {
 		return n
 	}
 	return inst
+}
+
+// unaliasedInterface rebuilds an interface with its methods' parameter names
+// dropped. The empty interface is returned unchanged: rebuilding it would turn
+// the universe's `any` back into an `interface{}`.
+func unaliasedInterface(t *types.Interface) types.Type {
+	if t.NumMethods() == 0 && t.NumEmbeddeds() == 0 {
+		return t
+	}
+	methods := make([]*types.Func, t.NumExplicitMethods())
+	for i := range methods {
+		m := t.ExplicitMethod(i)
+		methods[i] = types.NewFunc(m.Pos(), m.Pkg(), m.Name(), withoutParamNames(m.Type().(*types.Signature)))
+	}
+	embeds := make([]types.Type, t.NumEmbeddeds())
+	for i := range embeds {
+		embeds[i] = unaliased(t.EmbeddedType(i))
+	}
+	iface := types.NewInterfaceType(methods, embeds)
+	iface.Complete()
+	return iface
+}
+
+// unaliasedStruct rebuilds a struct whose field types hold something reflect
+// spells differently, such as a function type with named parameters. The
+// field names and tags are kept: reflect exposes both.
+func unaliasedStruct(t *types.Struct) types.Type {
+	fields := make([]*types.Var, t.NumFields())
+	tags := make([]string, t.NumFields())
+	for i := range fields {
+		f := t.Field(i)
+		fields[i] = types.NewField(f.Pos(), f.Pkg(), f.Name(), unaliased(f.Type()), f.Embedded())
+		tags[i] = t.Tag(i)
+	}
+	return types.NewStruct(fields, tags)
+}
+
+// withoutParamNames returns sig with its parameter and result names dropped.
+// The variadic flag is kept, so the last parameter still prints with `...`.
+func withoutParamNames(sig *types.Signature) *types.Signature {
+	params := make([]*types.Var, sig.Params().Len())
+	for i := range params {
+		p := sig.Params().At(i)
+		params[i] = types.NewParam(p.Pos(), p.Pkg(), "", unaliased(p.Type()))
+	}
+	results := make([]*types.Var, sig.Results().Len())
+	for i := range results {
+		r := sig.Results().At(i)
+		results[i] = types.NewParam(r.Pos(), r.Pkg(), "", unaliased(r.Type()))
+	}
+	return types.NewSignatureType(sig.Recv(), typeParamSlice(sig.RecvTypeParams()), typeParamSlice(sig.TypeParams()), types.NewTuple(params...), types.NewTuple(results...), sig.Variadic())
+}
+
+func typeParamSlice(list *types.TypeParamList) []*types.TypeParam {
+	if list == nil {
+		return nil
+	}
+	out := make([]*types.TypeParam, list.Len())
+	for i := range out {
+		out[i] = list.At(i)
+	}
+	return out
 }
 
 // typeChildren lists the types t contains that could hold a type parameter.
