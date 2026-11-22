@@ -343,10 +343,11 @@ func deliver[M, R any](r *request[M, R], res result[R]) {
 
 // retryable reports whether a transaction failed in a way that recorded
 // nothing, so its messages can be decided again: the database refused a
-// statement, which aborts every statement after it including the commit, or
-// a view failed before anything was sent. Any other failure, such as a
-// connection lost while committing, leaves it unknown whether the commit
-// happened, and is returned to the callers instead.
+// statement, which aborts every statement after it including the commit, pgx
+// could not build one, which fails the batch before it is sent, or a view
+// failed before anything was sent. Any other failure, such as a connection
+// lost while committing, leaves it unknown whether the commit happened, and
+// is returned to the callers instead.
 func retryable(err error) bool {
 	// A recorded message is never retried: the transaction committed, and a
 	// second attempt would record it again.
@@ -354,10 +355,11 @@ func retryable(err error) bool {
 		return false
 	}
 	var (
-		pgErr *pgconn.PgError
-		view  *viewFailure
+		pgErr   *pgconn.PgError
+		view    *viewFailure
+		notSent *notSentError
 	)
-	return errors.As(err, &pgErr) || errors.As(err, &view)
+	return errors.As(err, &pgErr) || errors.As(err, &view) || errors.As(err, &notSent)
 }
 
 // groupContext is a context for recording reqs together, which ends once every
