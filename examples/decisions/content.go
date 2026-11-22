@@ -58,9 +58,10 @@ func (c *Content) Text(ref Ref) string {
 	return c.text[ref]
 }
 
-// IndexedText returns the text the reference index holds for a decision: its
-// question, and the rationale once an outcome is recorded. It is how a
-// delivery of IndexReferences becomes the text the index stores.
+// IndexedText returns the text the reference index answers with for a
+// decision: its question, and the rationale once an outcome is recorded. The
+// index keeps the refs IndexReferences delivered and resolves them through
+// here when it is read, so a deleted row contributes nothing.
 func (c *Content) IndexedText(title, rationale Ref) string {
 	text := c.Text(title)
 	if rationale == "" {

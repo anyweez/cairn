@@ -29,7 +29,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	index := NewReferenceIndex()
+	index := NewReferenceIndex(svc.Content)
 	deliveries, applied := 0, 0
 	d := &ledger.Dispatcher[Effect]{
 		Store:   svc.Register.Store,
@@ -46,10 +46,9 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 			}
 			// The retried create effect arrives after the edit's. The index
 			// drops it because its entry is older, not because of the order it
-			// is handed. The effect names the rows the text lives in; reading
-			// them is the application's job, since the ledger holds no words.
-			ir := dl.Effect.(IndexReferences)
-			index.Apply(dl.Seq, ir.Decision, svc.Content.IndexedText(ir.Title, ir.Rationale))
+			// is handed. It keeps the refs the effect names and reads the text
+			// from the register's table when asked.
+			index.Apply(dl.Seq, dl.Effect.(IndexReferences))
 			applied++
 			return nil
 		},

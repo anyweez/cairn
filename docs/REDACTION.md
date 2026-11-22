@@ -28,6 +28,12 @@ table keyed by the subject, and on request delete those rows. The decision
 history in the ledger keeps referring to the subject by its pseudonymous id
 and stays verifiable, because it never held the data that was erased.
 
+A read model that keeps its own copy of the words needs the deletion too:
+deleting the row alone does not reach it. Keep the reference in the read model
+and resolve it against the table when the model is read, as the reference index
+in `examples/decisions` does, or propagate the deletion to the model
+deliberately.
+
 When an application must be able to link a person to their stream, that link
 is a per-subject key the application holds outside the ledger. Erasing the
 person means destroying the key; the ledger keeps only the pseudonym it
