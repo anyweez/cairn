@@ -171,12 +171,25 @@ func encode(m *Manifest) ([]byte, error) {
 // entries already stored under old.
 func Incompatible(old, m *Manifest) []string {
 	now := map[string]Codec{}
+	byName := map[string][]Codec{}
 	for _, c := range m.Codecs {
 		now[c.key()] = c
+		byName[c.Name] = append(byName[c.Name], c)
 	}
 	var problems []string
 	for _, was := range old.Codecs {
 		c, ok := now[was.key()]
+		if !ok {
+			// A stored entry is keyed by its codec name, so a sum this
+			// manifest spells differently still describes the same stored
+			// type. A base manifest written before the runtime's rendering
+			// of a type expression was corrected names the sum the old way,
+			// and comparing the two spellings as keys would report every
+			// entry it stored as removed.
+			if same := byName[was.Name]; len(same) == 1 {
+				c, ok = same[0], true
+			}
+		}
 		switch {
 		case !ok:
 			problems = append(problems, fmt.Sprintf("%s (%s) was removed; entries already stored with it can't be decoded", was.Name, was.Sum))

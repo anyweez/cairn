@@ -607,3 +607,15 @@ func TestIncompatible(t *testing.T) {
 		})
 	}
 }
+
+// A sum the runtime names differently after a rendering fix describes the same
+// stored type: entries are keyed by the codec name, which did not change. A
+// base manifest written before the fix must not read as a removal.
+func TestIncompatibleAcceptsARecorrectedSum(t *testing.T) {
+	fields := []string{"a: string"}
+	old := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(x int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	now := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	if problems := Incompatible(old, now); len(problems) > 0 {
+		t.Fatalf("Incompatible reports %q for a corrected sum spelling; the stored type is unchanged", problems)
+	}
+}
