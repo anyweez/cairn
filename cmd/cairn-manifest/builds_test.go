@@ -262,6 +262,12 @@ func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
 		{"foo.go", "/*\n//go:build linux\n*/\n\npackage x\n", ""},
 		// go/build ignores a legacy line that follows a block comment.
 		{"foo.go", "/* c */\n// +build linux\n\npackage x\n", ""},
+		// A blank line does not bring a legacy line after a block comment back.
+		{"foo.go", "/* c */\n\n// +build linux\n\npackage x\n", ""},
+		// A legacy line in the package documentation group is not a header.
+		{"foo.go", "// +build linux\npackage x\n", ""},
+		// A //go:build line is, even with no blank line before the clause.
+		{"foo.go", "//go:build linux\npackage x\n", "linux"},
 		{"foo.go", "\ufeff//go:build linux\n\npackage x\n", "linux"},
 	} {
 		path := filepath.Join(t.TempDir(), tc.name)
