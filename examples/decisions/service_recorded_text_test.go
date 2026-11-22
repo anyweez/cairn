@@ -137,11 +137,31 @@ func TestARefusedCreateLeavesNoTextBehind(t *testing.T) {
 	if !errors.As(err, new(*cairn.Refusal)) {
 		t.Fatalf("Create returned %v, want a refusal", err)
 	}
-
-	svc.Content.mu.Lock()
-	rows := len(svc.Content.text)
-	svc.Content.mu.Unlock()
-	if rows != 0 {
+	if rows := storedRows(svc); rows != 0 {
 		t.Fatalf("a refused Create left %d rows of text behind, want none", rows)
 	}
+}
+
+// A guard refuses a request before anything is sent, so nothing names the text
+// it stored and it must be removed: keeping text for an outcome the ledger
+// cannot rule out must not turn into keeping it for every failure.
+func TestACreateAGuardRefusesLeavesNoTextBehind(t *testing.T) {
+	svc := NewService(ledgertest.NewStore(t, ledger.RequireActor(false)))
+	// The message names its sender as its actor, so metadata naming somebody
+	// else is refused before the message reaches the ledger.
+	ctx := ledger.ContextWithMeta(context.Background(), ledger.Meta{Actor: "ben"})
+	_, err := svc.Create(ctx, "ana", "Ship the beta?", "yes", "not yet")
+	if !errors.Is(err, ledger.ErrActorMismatch) {
+		t.Fatalf("Create returned %v, want ErrActorMismatch", err)
+	}
+	if rows := storedRows(svc); rows != 0 {
+		t.Fatalf("a Create a guard refused left %d rows of text behind, want none", rows)
+	}
+}
+
+// storedRows is how many rows the register's own table holds.
+func storedRows(svc *Service) int {
+	svc.Content.mu.Lock()
+	defer svc.Content.mu.Unlock()
+	return len(svc.Content.text)
 }

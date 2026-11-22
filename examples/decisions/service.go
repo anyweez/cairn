@@ -114,13 +114,17 @@ func (s *Service) forget(refs ...Ref) {
 	}
 }
 
-// forgetUnlessRecorded keeps text for a message the ledger recorded. An error
-// wrapping ledger.ErrRecorded says the transaction committed but its result
-// could not be read, so the entry exists and names these refs; deleting the
-// rows would leave the entry pointing at text nothing can restore. Every other
-// error means nothing was recorded, so the cleanup runs as before.
+// forgetUnlessRecorded keeps the text a message stored unless the error proves
+// nothing was recorded. Two errors leave that open: one wrapping
+// ledger.ErrRecorded says the transaction committed but its result could not be
+// read, and one wrapping ledger.ErrUnknownOutcome says the connection went away
+// before the COMMIT's response arrived, so the message may be in the ledger.
+// Either way the entry may name these refs, and nothing else holds the words, so
+// deleting them would leave a decision nothing can answer with. Every other
+// error — a refusal, a guard, a validation failure, a transaction the database
+// rolled back — means no entry names them, so the cleanup runs.
 func (s *Service) forgetUnlessRecorded(err error, refs ...Ref) {
-	if errors.Is(err, ledger.ErrRecorded) {
+	if errors.Is(err, ledger.ErrRecorded) || errors.Is(err, ledger.ErrUnknownOutcome) {
 		return
 	}
 	s.forget(refs...)
