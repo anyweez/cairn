@@ -180,9 +180,12 @@ func TestCloneCopiesUnexportedFieldsItsJSONEncodingWrites(t *testing.T) {
 	}
 }
 
-// A field encoding/json does not write is not stored by the ledger, so the
-// value is carried by assignment, as a Go copy of the struct carries it.
-func TestCloneLeavesUnexportedFieldsItsJSONEncodingDoesNotWrite(t *testing.T) {
+// A field encoding/json does not write is dropped by the codec, which D6
+// reports. The copy must still not share it: a write through it would reach the
+// message D6 round-trips, and a decider that zeroed it could make the loss look
+// like a value the codec kept, or make Decide's second call see the first one's
+// write.
+func TestCloneCopiesUnexportedFieldsItsJSONEncodingDoesNotWrite(t *testing.T) {
 	type msg struct {
 		items    map[string]int
 		list     []int
@@ -198,7 +201,37 @@ func TestCloneLeavesUnexportedFieldsItsJSONEncodingDoesNotWrite(t *testing.T) {
 	*c.p = 2
 	c.anything.(map[string]int)["b"] = 2
 
-	if m.items["a"] != 2 || m.list[0] != 2 || n != 2 || m.anything.(map[string]int)["b"] != 2 {
-		t.Fatalf("clone split a field encoding/json cannot write; the value should stay shared by assignment: %+v", m)
+	if m.items["a"] != 1 {
+		t.Errorf("a write to the copy's unexported map reached the original: %v", m.items)
+	}
+	if m.list[0] != 1 {
+		t.Errorf("a write to the copy's unexported slice element reached the original: %v", m.list)
+	}
+	if n != 1 {
+		t.Errorf("a write through the copy's unexported pointer reached the original: %d", n)
+	}
+	if m.anything.(map[string]int)["b"] != 1 {
+		t.Errorf("a write to the map behind the copy's unexported interface reached the original: %v", m.anything)
+	}
+}
+
+// An embedded unexported struct is part of the message as sent: encoding/json
+// promotes its exported fields, so the codec stores them and the ledger gives
+// each Decide call an independently decoded map. The copy must reach it too,
+// though the field itself has an unexported name.
+func TestCloneCopiesAnEmbeddedUnexportedStruct(t *testing.T) {
+	type seen struct {
+		Seen map[string]int `json:"seen"`
+	}
+	type msg struct {
+		seen
+		Note string `json:"note"`
+	}
+	m := msg{seen: seen{Seen: map[string]int{"calls": 1}}, Note: "rent"}
+	c := clone(m)
+
+	c.Seen["calls"] = 2
+	if m.Seen["calls"] != 1 {
+		t.Fatalf("a write to the copy's embedded unexported map reached the original: %v", m.Seen)
 	}
 }
