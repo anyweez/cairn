@@ -75,4 +75,8 @@ if [ "$cleared" -gt 0 ]; then
   echo "cleared $cleared prepared transaction(s) left by interrupted runs" >&2
 fi
 
+# The URL has to name the port the container publishes, not the one it was
+# asked for: `-p 127.0.0.1:0:5432` lets Docker choose the host port, and a URL
+# built from the request would name port 0 instead.
+port=$(container_host_port "$name" 5432)
 echo "postgres://cairn:cairn@127.0.0.1:${port}/postgres?sslmode=disable"

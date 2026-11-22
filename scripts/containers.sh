@@ -17,13 +17,16 @@ fixture_name() {
 # fixture_host_port PORT succeeds when PORT is a host port a container can
 # publish. A companion's host port is computed from the fixture port, so a
 # fixture port near the end of the range pushes its companions past 65535;
-# Docker only refuses that when the container is created.
+# Docker only refuses that when the container is created. 0 is a host port in
+# the same sense: Docker reads it as "publish on a port of your choosing", and
+# the fixture reads the chosen port back from the container
+# (container_host_port).
 fixture_host_port() {
   local port=$1
   case $port in
     '' | *[!0-9]*) return 1 ;;
   esac
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+  [ "$port" -ge 0 ] && [ "$port" -le 65535 ]
 }
 
 # fixture_port DEFAULT_PORT DEFAULT_KEY KEY [OVERRIDE] prints the host port a
@@ -52,7 +55,7 @@ fixture_port() {
     port=$(( default_port + key - default_key ))
   fi
   if ! fixture_host_port "$port"; then
-    echo "cairn: ${what} is host port ${port}, outside 1-65535" >&2
+    echo "cairn: ${what} is host port ${port}, outside 0-65535" >&2
     return 1
   fi
   printf '%s' "$port"
@@ -90,7 +93,7 @@ fixture_port_beside() {
     fi
   fi
   if ! fixture_host_port "$port"; then
-    echo "cairn: ${what} is host port ${port}, outside 1-65535" >&2
+    echo "cairn: ${what} is host port ${port}, outside 0-65535" >&2
     return 1
   fi
   printf '%s' "$port"
@@ -99,12 +102,48 @@ fixture_port_beside() {
 # container_publishes NAME CONTAINER_PORT HOST_PORT succeeds only when NAME is
 # running and publishes CONTAINER_PORT on 127.0.0.1:HOST_PORT. A container
 # found by name alone may have been created with a different port, and then
-# the URL a script prints points somewhere nothing is listening.
+# the URL a script prints points somewhere nothing is listening. HOST_PORT 0 is
+# Docker's "publish on a port you choose": the container reports a host port
+# the request cannot name, so any 127.0.0.1 host port is the one asked for.
+# Comparing the mapping with "127.0.0.1:0" would never match, and every call
+# would remove and recreate the container instead of reusing it.
 container_publishes() {
-  local name=$1 container_port=$2 host_port=$3 mapping
+  local name=$1 container_port=$2 host_port=$3 mapping port
   [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
   mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) || return 1
+  if [ "$host_port" = 0 ]; then
+    case $mapping in
+      127.0.0.1:*) port=${mapping##*:} ;;
+      *) return 1 ;;
+    esac
+    case $port in
+      '' | 0 | *[!0-9]*) return 1 ;;
+    esac
+    return 0
+  fi
   [ "$mapping" = "127.0.0.1:${host_port}" ]
+}
+
+# container_host_port NAME CONTAINER_PORT prints the host port on 127.0.0.1
+# that NAME publishes CONTAINER_PORT on, as Docker reports it, or prints nothing
+# and fails when NAME publishes that container port on no host port. A fixture
+# started with host port 0 is published on a port Docker chose, and only the
+# container knows which: printing the requested 0 would name a port nothing
+# listens on. Asking the container instead makes the port a script prints the
+# one it publishes, whether the request fixed it or not.
+container_host_port() {
+  local name=$1 container_port=$2 mapping port
+  mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) ||
+    mapping=
+  port=${mapping##*:}
+  case $port in
+    '' | *[!0-9]*)
+      echo "cairn: ${name} publishes container port ${container_port}" \
+        "on no host port" >&2
+      return 1
+      ;;
+  esac
+  printf '%s' "$port"
 }
 
 # container_setting NAME SETTING prints the value the Postgres running in NAME
