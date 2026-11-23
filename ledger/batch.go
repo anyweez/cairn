@@ -95,6 +95,16 @@ func (e *batchError) Error() string { return fmt.Sprintf("statement %d: %v", e.i
 
 func (e *batchError) Unwrap() error { return e.err }
 
+// notSentError is a batch that failed before it was sent: pgx could not build
+// one of its statements, so no statement ran and nothing was recorded. It wraps
+// the error that says why, and tells a caller deciding whether to try again
+// that nothing in the batch can have taken effect.
+type notSentError struct{ err error }
+
+func (e *notSentError) Error() string { return e.err.Error() }
+
+func (e *notSentError) Unwrap() error { return e.err }
+
 // batchSender is a transaction or a connection.
 type batchSender interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
@@ -118,10 +128,13 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			// happen.
 			closeErr := results.Close()
 			j, unbuilt := b.blame(s, i, err)
-			// An unbuilt statement is one the client could not encode, so the
-			// batch was never sent and nothing can have committed — whatever
-			// state the connection happens to be in.
-			if !unbuilt && b.commits && b.hasCommit {
+			if unbuilt {
+				// An unbuilt statement is one the client could not encode, so the
+				// batch was never sent and nothing can have committed — whatever
+				// state the connection happens to be in.
+				return b.failed(j, &notSentError{err})
+			}
+			if b.commits && b.hasCommit {
 				switch {
 				case committed(s, err, closeErr):
 					return &recordedError{err: b.failed(j, err)}
