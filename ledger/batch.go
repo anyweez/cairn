@@ -205,13 +205,17 @@ func (e *unknownOutcomeError) Is(target error) bool { return target == ErrUnknow
 
 // neverCommitted reports whether one of errs means no transaction committed:
 // the database refused a statement, which aborts every statement after it, the
-// COMMIT included, or the client could not build one, so the batch was never
-// sent.
+// COMMIT included, the client could not build one, or the client never sent the
+// batch at all. pgconn's SafeToRetry names the last kind — the errors it returns
+// before writing to the server, a context already done when the batch reached
+// the connection among them. A cancellation that arrives after the statements
+// went out is not one of these: the transaction may be in the ledger, and pgconn
+// does not mark that error safe to retry.
 func neverCommitted(errs ...error) bool {
 	for _, err := range errs {
 		var pgErr *pgconn.PgError
 		var prep pgx.ErrPreprocessingBatch
-		if errors.As(err, &pgErr) || errors.As(err, &prep) {
+		if errors.As(err, &pgErr) || errors.As(err, &prep) || pgconn.SafeToRetry(err) {
 			return true
 		}
 	}

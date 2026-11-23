@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -176,3 +177,56 @@ func TestABatchThatDidNotCommitDoesNotSayItDid(t *testing.T) {
 		t.Fatalf("send returned %v, but the transaction had not committed", err)
 	}
 }
+
+// A batch whose context ends after its statements were sent may still have
+// committed: all of them, the COMMIT among them, are on their way before any
+// result is read. Reporting a plain failure would lose the message if the
+// transaction committed, because a caller retries a failure, so the only safe
+// answer is that the outcome is unknown — and a cancellation is not, by
+// itself, proof that nothing was sent.
+func TestAContextThatEndsAfterSendingLeavesTheOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
+	b.end()
+
+	err := b.send(context.Background(), contextEndsSender{})
+	if err == nil {
+		t.Fatal("send returned nil, want the context's error")
+	}
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v; the COMMIT's result was never read, so it cannot say the message was recorded", err)
+	}
+	if !errors.Is(err, ErrUnknownOutcome) {
+		t.Fatalf("send returned %v, want an error wrapping ErrUnknownOutcome: the context ended after the statements were sent", err)
+	}
+}
+
+// contextEndsSender answers every statement up to the COMMIT, and fails that
+// one with the context ending: the transaction may have committed, and there is
+// no connection left to inspect.
+type contextEndsSender struct{}
+
+func (contextEndsSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	return &contextEndsResults{remaining: b.Len()}
+}
+
+type contextEndsResults struct{ remaining int }
+
+func (r *contextEndsResults) Exec() (pgconn.CommandTag, error) {
+	r.remaining--
+	if r.remaining == 0 {
+		return pgconn.CommandTag{}, context.Canceled
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (r *contextEndsResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (r *contextEndsResults) QueryRow() pgx.Row { return nil }
+
+func (r *contextEndsResults) Close() error { return nil }
