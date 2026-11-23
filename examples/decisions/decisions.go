@@ -173,7 +173,8 @@ type SetStatus struct {
 // decision is made — and replayed — from facts in the ledger. With is the
 // replacement decision's ID, which is the stream it is recorded on, so the
 // self-supersede guard and DR3 compare it against this decision's ID like for
-// like.
+// like. WithStatus is the replacement's status as the shell read it: Uncreated
+// means the stream holds no decision, which decide refuses as not found.
 type Supersede struct {
 	By               Member `json:"by"`
 	With             string `json:"with"`
@@ -377,8 +378,11 @@ func decide(s State, m Msg) decision {
 		if s.Status != Uncreated {
 			return refuse(Exists, "decision %s already exists", s.ID)
 		}
+		if m.ID == "" {
+			return refuse(Invalid, "a decision needs an ID")
+		}
 		title := Ref(strings.TrimSpace(string(m.Title)))
-		if title == "" || m.ID == "" {
+		if title == "" {
 			return refuse(Invalid, "a decision needs a question")
 		}
 		if m.At.IsZero() {
@@ -387,8 +391,11 @@ func decide(s State, m Msg) decision {
 		options := []Option{}
 		seen := map[string]bool{}
 		for _, o := range m.Options {
+			if o.ID == "" {
+				return refuse(Invalid, "an option needs an ID")
+			}
 			title := Ref(strings.TrimSpace(string(o.Title)))
-			if title == "" || o.ID == "" {
+			if title == "" {
 				return refuse(Invalid, "an option needs a title")
 			}
 			if seen[o.ID] {
@@ -423,8 +430,11 @@ func decide(s State, m Msg) decision {
 		if s.Status != Open {
 			return refuse(Frozen, "this decision is %s, so its options can no longer change", s.Status)
 		}
+		if m.Option.ID == "" {
+			return refuse(Invalid, "an option needs an ID")
+		}
 		title := Ref(strings.TrimSpace(string(m.Option.Title)))
-		if title == "" || m.Option.ID == "" {
+		if title == "" {
 			return refuse(Invalid, "an option needs a title")
 		}
 		if s.option(m.Option.ID) {
@@ -486,9 +496,17 @@ func decide(s State, m Msg) decision {
 		return decision{Result: Result{Status: to}, Events: []Event{StatusChanged{From: s.Status, To: to}}}
 
 	case Supersede:
+		// WithStatus is what the shell read of the replacement under lock. A
+		// stream with no Create on it reads as the zero state, so Uncreated
+		// means there is no such decision — not a lifecycle conflict — and is
+		// answered the way every other message on a missing stream is.
 		switch {
-		case m.With == s.ID || m.With == "":
+		case m.With == "":
+			return refuse(Invalid, "a supersede needs the replacement decision's ID")
+		case m.With == s.ID:
 			return refuse(Invalid, "a decision cannot supersede itself")
+		case m.WithStatus == Uncreated:
+			return refuse(NotFound, "no such decision")
 		case m.WithStatus != Decided:
 			return refuse(NotAllowed, "only a decided decision can supersede another one")
 		case m.WithSupersededBy == s.ID:
@@ -501,6 +519,12 @@ func decide(s State, m Msg) decision {
 		return decision{Result: Result{Status: to}, Events: []Event{SupersededBy{By: m.With}}}
 
 	case Acknowledge:
+		// A superseded decision was recorded and has since been replaced, so
+		// it is not one to go looking for: only a status that never carried an
+		// outcome is described as not recorded yet.
+		if s.Status == Superseded {
+			return refuse(NotDecided, "this decision was recorded and then superseded by %s, so its outcome can no longer be answered", s.SupersededBy)
+		}
 		if s.Status != Decided {
 			return refuse(NotDecided, "this decision has not been recorded yet")
 		}
