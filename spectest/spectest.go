@@ -308,7 +308,10 @@ func (m Machine[S, M, R, Ev, Ef]) checkSnapshot(j func(spec.Rule, spec.Verdict),
 		if err == nil {
 			err = json.Unmarshal(data, &back)
 		}
-		return spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err)
+		if err == nil && m.Equal(state, back) {
+			return spec.Pass
+		}
+		return spec.Fail("state %s came back as %s (%v)", describeRoundTrip(state), describeRoundTrip(back), err)
 	}))
 }
 
@@ -369,7 +372,10 @@ func roundTripMaybeRefused[T any](c *codec.Codec[T], v T, refused bool) spec.Ver
 	if err != nil {
 		return spec.Fail("%v", err)
 	}
-	return spec.Check(equalRoundTripped(v, back), "%+v came back as %+v", v, back)
+	if equalRoundTripped(v, back) {
+		return spec.Pass
+	}
+	return spec.Fail("%s came back as %s", describeRoundTrip(v), describeRoundTrip(back))
 }
 
 // describe renders a value with its type's short name, so a trace reads
