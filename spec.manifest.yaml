@@ -79,11 +79,14 @@ rules:
 codecs:
   - sum: github.com/anyweez/cairn/examples/decisions.Effect
     name: decision.index_references
-    version: 1
+    version: 2
     type: github.com/anyweez/cairn/examples/decisions.IndexReferences
+    upcasts:
+      - 1
     fields:
       - 'decision: string'
-      - 'text: string'
+      - 'title: string'
+      - 'rationale?: string'
   - sum: github.com/anyweez/cairn/examples/decisions.Event
     name: decision.acknowledged
     version: 1

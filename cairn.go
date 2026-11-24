@@ -79,10 +79,11 @@ func StorableText(s string) bool {
 func (r *Refusal) Error() string { return r.Code + ": " + r.Message }
 
 // Is matches another refusal with the same code, so errors.Is works against a
-// sentinel built with only a code.
+// sentinel built with only a code. A nil refusal or a nil sentinel matches
+// nothing, rather than panicking the caller's error check.
 func (r *Refusal) Is(target error) bool {
 	t, ok := target.(*Refusal)
-	return ok && t.Code == r.Code
+	return ok && r != nil && t != nil && t.Code == r.Code
 }
 
 // Fold applies events to a state in order.

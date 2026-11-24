@@ -18,10 +18,11 @@ type omittedKey struct {
 	A int `json:"a,omitempty"`
 }
 
-// fields() marks an omitempty (or omitzero) field by appending "?" to its
-// name, which is also a legal character in a JSON key. The manifest therefore
-// renders these two wire formats identically, so the -base check cannot see a
-// change from one to the other and passes a wire-format break.
+// fields() marks a field with omitted values using "?" after its name
+// ("?zero" for omitzero, "?empty,zero" for both), and "?" is also a legal
+// character in a JSON key. The manifest therefore renders a field named "a?"
+// and a field named "a" tagged omitempty identically, so the -base check
+// cannot see a change from one to the other and passes a wire-format break.
 func TestAFieldNamedWithATrailingQuestionMarkIsNotTheOmitemptyMarker(t *testing.T) {
 	if got, _ := json.Marshal(questionKey{}); string(got) != `{"a?":0}` {
 		t.Fatalf("questionKey marshaled to %s, want {\"a?\":0}", got)
@@ -83,5 +84,25 @@ func TestAQuestionMarkInANestedKeyIsNotTheOmitemptyMarker(t *testing.T) {
 	o := declared.get(t, "nestedOmittedKey")
 	if slices.Equal(fields(q), fields(o)) {
 		t.Fatalf("the manifest renders the nested json:%q and json:%q the same: %v", "next?", "next,omitempty", fields(q))
+	}
+}
+
+// bothOptions carries both omission rules: encoding/json then omits a value
+// when either one says so, which is a third wire format and must render
+// differently from either option on its own.
+type bothOptions struct {
+	A int `json:"a,omitempty,omitzero"`
+}
+
+func TestBothOmissionOptionsHaveTheirOwnMarker(t *testing.T) {
+	if got, _ := json.Marshal(bothOptions{}); string(got) != `{}` {
+		t.Fatalf("bothOptions marshaled to %s, want {}", got)
+	}
+	declared := loadDeclaredTypes(t)
+	empty := fields(declared.get(t, "omittedKey"))
+	zero := fields(declared.get(t, "questionZeroKey"))
+	both := fields(declared.get(t, "bothOptions"))
+	if slices.Equal(empty, both) || slices.Equal(zero, both) {
+		t.Fatalf("fields() renders both options as %v, the same as one option alone: empty %v, zero %v", both, empty, zero)
 	}
 }

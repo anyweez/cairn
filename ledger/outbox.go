@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -61,17 +62,27 @@ type Dispatcher[Ef any] struct {
 }
 
 // Validate reports the first thing wrong with how the dispatcher is set up: no
-// store, no Kind, no Effects codec, or no Handle. DrainOnce runs it before
-// claiming anything, so a wiring mistake is an error rather than a nil-pointer
-// panic, or a nil handler recorded as a failed attempt and retried for ever;
+// store, a Kind that is empty, contains a slash or cannot be stored, no Effects
+// codec, or no Handle. DrainOnce runs it before claiming anything, so a wiring
+// mistake is an error rather than a nil-pointer panic, a nil handler recorded as
+// a failed attempt and retried for ever, or a Kind that claims nothing at all;
 // call it at startup to fail before then.
 func (d *Dispatcher[Ef]) Validate() error {
 	fail := func(what string) error { return fmt.Errorf("cairn: dispatcher %s: %s", quoteText(d.Kind), what) }
+	// DrainOnce filters by Kind alone, so it has to satisfy the ledger's rule for
+	// a kind used on its own: no slash (a stream name joins Kind and ID with one,
+	// so a slash could name another kind's effects) and text Postgres can store
+	// (an unstorable one comes back from the claim as a raw SQLSTATE).
+	kind := validKind(d.Kind)
 	switch {
 	case d.Store == nil:
 		return fail("Store is nil")
 	case d.Kind == "":
 		return fail("Kind must be non-empty")
+	case kind != nil:
+		// validKind's message is already cairn-prefixed; fail adds the
+		// dispatcher's name and its own prefix.
+		return fail(strings.TrimPrefix(kind.Error(), "cairn: "))
 	case d.Effects == nil:
 		return fail("Effects is nil")
 	case d.Handle == nil:
@@ -309,11 +320,25 @@ func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error 
 func (d Delivery[Ef]) caused() Meta {
 	correlation := d.Meta.CorrelationID
 	if correlation == "" {
-		correlation = fmt.Sprintf("%s#%d", d.Stream, d.Seq)
+		correlation = derivedCorrelation(d.Stream, d.Seq)
 	}
 	actor := d.Meta.Actor
 	if actor == "" {
 		actor = "outbox"
 	}
 	return Meta{Actor: actor, Via: "outbox", CorrelationID: correlation, CausationID: d.Key()}
+}
+
+// derivedCorrelation starts a flow at the entry that produced an effect: its
+// stream and seq. The value is written to an indexed column, and a stream name
+// may fill that column's bound on its own, so a value too long to store is
+// hashed rather than truncated. Truncating would give two long streams with a
+// shared prefix the same flow, and could cut a multi-byte rune in half.
+func derivedCorrelation(st Stream, seq int64) string {
+	correlation := fmt.Sprintf("%s#%d", st, seq)
+	if len(correlation) <= maxIndexedTextBytes {
+		return correlation
+	}
+	sum := sha256.Sum256([]byte(correlation))
+	return fmt.Sprintf("%x#%d", sum[:16], seq)
 }

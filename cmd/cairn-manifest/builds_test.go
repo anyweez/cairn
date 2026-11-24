@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"go/build"
 	"os"
 	"path/filepath"
 	"slices"
@@ -215,6 +216,123 @@ func TestABuildConstrainedDeclarationIsInTheManifestOnEveryPlatform(t *testing.T
 	}
 }
 
+// TestTheManifestRecordsTheBuildsThatRegisterAStoredType holds the manifest to
+// the other half of the build search: reading every declaration is not enough
+// when a stored type moves off a platform, because the module-wide list is then
+// unchanged and -base would see no removal. Each codec records the builds its
+// registration is written for, taken from the file so every host agrees.
+func TestTheManifestRecordsTheBuildsThatRegisterAStoredType(t *testing.T) {
+	dir := constrainedModule(t)
+	want := map[string]string{
+		"constrained.common":      "",       // an unconstrained file is in every build
+		"constrained.linux":       "linux",  // //go:build linux
+		"constrained.other":       "!linux", // //go:build !linux
+		"constrained.darwin_only": "darwin",
+	}
+	for _, goos := range []string{"linux", "darwin"} {
+		t.Setenv("GOOS", goos)
+		m, err := Extract(dir, "./...")
+		if err != nil {
+			t.Fatalf("extracting for %s: %v", goos, err)
+		}
+		for _, c := range m.Codecs {
+			if w, ok := want[c.Name]; ok && c.Build != w {
+				t.Errorf("%s extracted on %s records build %q, want %q", c.Name, goos, c.Build, w)
+			}
+		}
+	}
+}
+
+// A file name ties a file to a build only after a non-empty prefix: the go
+// command reads foo_linux.go as Linux-only, and linux.go as a file for every
+// build. A build line narrows the name further.
+func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
+	for _, tc := range []struct{ name, src, want string }{
+		{"foo_linux.go", "package x\n", "linux"},
+		{"foo_linux_amd64.go", "package x\n", "linux && amd64"},
+		{"foo_linux_test.go", "package x\n", "linux"},
+		{"linux.go", "package x\n", ""},
+		{"foo.go", "//go:build linux || darwin\n\npackage x\n", "linux || darwin"},
+		{"foo_linux.go", "//go:build linux\n\npackage x\n", "linux"},
+		// The go command ANDs every legacy // +build line in the header.
+		{"foo.go", "// +build linux\n// +build amd64\n\npackage x\n", "linux && amd64"},
+		// A constraint-looking line after the package clause is not one.
+		{"foo.go", "package x\n\nconst s = `\n//go:build linux\n`\n", ""},
+		// Nor is one inside a block comment, and a BOM is not source.
+		{"foo.go", "/*\n//go:build linux\n*/\n\npackage x\n", ""},
+		// go/build ignores a legacy line that follows a block comment.
+		{"foo.go", "/* c */\n// +build linux\n\npackage x\n", ""},
+		// A blank line does not bring a legacy line after a block comment back.
+		{"foo.go", "/* c */\n\n// +build linux\n\npackage x\n", ""},
+		// A legacy line in the package documentation group is not a header.
+		{"foo.go", "// +build linux\npackage x\n", ""},
+		// A //go:build line is, even with no blank line before the clause.
+		{"foo.go", "//go:build linux\npackage x\n", "linux"},
+		{"foo.go", "\ufeff//go:build linux\n\npackage x\n", "linux"},
+	} {
+		path := filepath.Join(t.TempDir(), tc.name)
+		if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := fileBuild(path); got != tc.want {
+			t.Errorf("%s: build %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// extraTags feeds the build search: a custom tag that only a later legacy
+// // +build line names must still be offered, or the file is never read.
+func TestExtraTagsReadsEveryLegacyBuildLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "foo.go")
+	src := "// +build linux\n// +build cairnqa\n\npackage x\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := extraTags(path); !slices.Equal(got, []string{"cairnqa"}) {
+		t.Errorf("extra tags %v, want [cairnqa]", got)
+	}
+}
+
+// The tags a build satisfies are the go command's rule, not this tool's: the
+// target's GOOS and GOARCH, the OS they imply, and "unix" for a unix-like
+// GOOS. buildTags carries a copy of go/build's unix table because the module
+// cannot import it, so this compares that copy with go/build itself rather
+// than with a second reading of the same docs.
+func TestBuildTagsMatchTheGoCommand(t *testing.T) {
+	goosTags, goarchTags := knownPlatformTags()
+	probes := []string{"unix"}
+	for tag := range goosTags {
+		probes = append(probes, tag)
+	}
+	for tag := range goarchTags {
+		probes = append(probes, tag)
+	}
+	slices.Sort(probes)
+
+	// The tag is not the last _segment of the name, so the file name states no
+	// constraint of its own and only the build line decides.
+	dir := t.TempDir()
+	for _, tag := range probes {
+		src := "//go:build " + tag + "\n\npackage probe\n"
+		if err := os.WriteFile(filepath.Join(dir, tag+"_probe.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pair := range platformPairs() {
+		ctxt := build.Context{GOOS: pair[0], GOARCH: pair[1], Compiler: "gc"}
+		tags := buildTags(pair[0], pair[1])
+		for _, tag := range probes {
+			match, err := ctxt.MatchFile(dir, tag+"_probe.go")
+			if err != nil {
+				t.Fatalf("%s/%s: %v", pair[0], pair[1], err)
+			}
+			if match != tags[tag] {
+				t.Errorf("%s/%s: go/build says %q is %t, buildTags says %t", pair[0], pair[1], tag, match, tags[tag])
+			}
+		}
+	}
+}
+
 // TestAFileNoBuildIncludesIsRefused holds the other half of the contract: a
 // constrained file the tool cannot read is an error naming the file and the
 // constraint, and no manifest is written from it.
@@ -327,6 +445,133 @@ type Detail struct {
 		if c.Name == "constrained.tagged" && !slices.Equal(c.Fields, []string{"path: {text: string}"}) {
 			t.Errorf("the tagged type's shape: %v", c.Fields)
 		}
+	}
+}
+
+// A file that declares a package its directory's other files do not is in no
+// build of that directory: the generator behind //go:build ignore, the tools
+// file in a package of its own. The go command keeps it out of every build of
+// the package beside it and go build ./... accepts the module, so the load that
+// enables its tag can only ever fail. The file is read with the other package
+// hidden: the module gets its manifest, and a rule declared in the file is in it
+// rather than dropped with a load that could never work.
+func TestAFileBesideAnotherPackageIsRead(t *testing.T) {
+	for _, tc := range []struct{ name, constraint string }{
+		{"a generator behind the ignore tag", "//go:build ignore\n\npackage main\n"},
+		{"a tools file in its own package", "//go:build tools\n\npackage tools\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeModule(t, `module example.com/beside
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+				"lib.go": `package beside
+
+import "github.com/anyweez/cairn/spec"
+
+var GoodRule = spec.Rule{ID: "G1", Kind: spec.Can, Status: spec.Proposed, Statement: "Read from the package."}
+`,
+				"lib_test.go": `package beside_test
+
+import (
+	"testing"
+
+	"example.com/beside"
+)
+
+func TestNothing(t *testing.T) { _ = beside.GoodRule }
+`,
+				"never.go": tc.constraint + `
+import "github.com/anyweez/cairn/spec"
+
+var NeverBuiltRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, Statement: "Declared in a file no build includes."}
+`,
+			})
+
+			m, err := Extract(dir, "./...")
+			if err != nil {
+				t.Fatalf("a module with %s cannot produce a manifest: %v", tc.name, err)
+			}
+			if got := ruleIDs(m); !slices.Equal(got, []string{"G1", "N1"}) {
+				t.Errorf("rules: %v, want the package's rule and the one declared beside it", got)
+			}
+		})
+	}
+}
+
+// The search tries the builds that read most of the file's package first. A
+// file whose own line names only a tag can use a declaration a sibling declares
+// for one platform, so it type-checks only in the build that reads that
+// sibling. Here a_use.go is in every build that enables the tag, but only the
+// freebsd ones also read bsd.go. Sorting the candidates must put those first,
+// or the budget is spent on platforms where the declaration is missing.
+func TestContextsTryTheBuildThatReadsMostOfThePackage(t *testing.T) {
+	dir := writeModule(t, `module example.com/order
+
+go 1.26.0
+`, map[string]string{
+		"events.go": "package events\n",
+		"a_use.go":  "//go:build cairnqa\n\npackage events\n\nconst _ = BSDOnly\n",
+		"bsd.go":    "//go:build cairnqa && freebsd\n\npackage events\n\nconst BSDOnly = 1\n",
+	})
+
+	contexts := contexts(filepath.Join(dir, "a_use.go"))
+	if len(contexts) == 0 {
+		t.Fatal("no build selects a file tagged cairnqa")
+	}
+	if got := contexts[0].goos; got != "freebsd" {
+		t.Fatalf("the first build tried is %s; want freebsd, the only one that reads bsd.go as well", got)
+	}
+}
+
+// A search that stopped at maxBuildsPerFile has not shown the file to be in no
+// build, so its error must not say so. It names the file and its constraint,
+// says the search stopped, and carries the loader's messages for the builds it
+// did try -- the file may still be readable, and the next reader must be able to
+// tell that from a broken file's error.
+func TestASearchThatStoppedEarlySaysSo(t *testing.T) {
+	err := searchFailure("a_use.go", "//go:build cairnqa", 8, true, []string{"loading packages:\n  ./a_use.go:14:6: undefined: BSDOnly"})
+	for _, want := range []string{"a_use.go", "//go:build cairnqa", "the search stopped after trying 8 builds", "builds that select it were left untried", "undefined: BSDOnly"} {
+		if !strings.Contains(err, want) {
+			t.Errorf("the error does not say %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err, "no build this tool can load includes the file") {
+		t.Errorf("an incomplete search claims the file is in no build:\n%s", err)
+	}
+}
+
+// A codec is a duplicate only when one build selects both its files. The
+// recorded constraints are go build constraints, so two files can be exclusive
+// without naming opposite tags: linux and windows never meet, while linux and
+// amd64 do on every linux/amd64 build.
+func TestBuildsOverlap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"every build and a platform", "", "linux", true},
+		{"two platforms", "linux", "windows", false},
+		{"a platform and a narrower build", "linux", "linux && amd64", true},
+		{"an OS and an architecture", "linux", "amd64", true},
+		{"an OS the other implies", "linux", "android", true},
+		{"a build and its negation", "linux", "!linux", false},
+		{"two disjoint narrow builds", "linux && amd64", "windows || darwin", false},
+		{"a free tag and a narrower build", "tools", "tools && linux", true},
+		{"one free tag on two platforms", "tools && linux", "tools && windows", false},
+		{"the unix tag and windows", "unix", "windows", false},
+		{"the unix tag and a unix OS", "unix", "darwin", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildsOverlap(tc.a, tc.b); got != tc.want {
+				t.Errorf("buildsOverlap(%q, %q) = %t, want %t", tc.a, tc.b, got, tc.want)
+			}
+		})
 	}
 }
 

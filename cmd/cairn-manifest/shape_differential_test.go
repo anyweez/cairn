@@ -290,13 +290,22 @@ func unexportedField(rt reflect.Type, key string) bool {
 	return false
 }
 
-// splitEntry splits a rendered entry into its JSON key and its shape. A
-// trailing "?" is the omitempty marker, which a literal "?" escapes by
-// doubling, so the marker is stripped before the doubling is undone.
+// splitEntry splits a rendered entry into its JSON key and its shape. The
+// omission marker starts at the first "?" that is not doubled, and a literal
+// "?" in the name escapes by doubling, so the marker is dropped before the
+// doubling is undone.
 func splitEntry(entry string) (name, shape string) {
 	name, shape, _ = strings.Cut(entry, ": ")
-	if strings.HasSuffix(name, "?") && !strings.HasSuffix(name, "??") {
-		name = name[:len(name)-1]
+	for i := 0; i < len(name); i++ {
+		if name[i] != '?' {
+			continue
+		}
+		if i+1 < len(name) && name[i+1] == '?' {
+			i++ // a doubled "?" is a literal one
+			continue
+		}
+		name = name[:i]
+		break
 	}
 	return strings.ReplaceAll(name, "??", "?"), shape
 }

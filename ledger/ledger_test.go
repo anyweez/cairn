@@ -216,29 +216,40 @@ func TestTheGlobalLogKeepsEachStreamInOrder(t *testing.T) {
 
 // Transaction IDs order the log as numbers, including across a change in their
 // number of digits.
+//
+// The two rows' transaction IDs are chosen rather than reached by burning
+// transactions: the cluster's counter decides how far the next power of ten
+// is, it survives a reused server, and getting there can take millions of
+// transactions. Both chosen IDs are at or below one the cluster has already
+// assigned, so a later read's fence is above them and a reader sees them.
 func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 	agg := newCounter(t)
 	pool := agg.Store.Pool()
-	if _, err := agg.Handle(ctx, "first", add{1, 10}); err != nil {
-		t.Fatal(err)
-	}
+
 	var current uint64
 	if err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()::text::bigint`).Scan(&current); err != nil {
 		t.Fatal(err)
 	}
-	next := uint64(10)
-	for next <= current {
-		next *= 10
+	boundary := uint64(1)
+	for boundary <= current/10 {
+		boundary *= 10
 	}
-	if next-current > 2_000_000 {
-		t.Skipf("transaction ID %d is too far from %d to cross cheaply", current, next)
+	if boundary < 10 {
+		t.Fatalf("transaction ID %d has no smaller number of digits to cross from", current)
 	}
-	// Each iteration commits, so each one uses up a transaction ID.
-	if _, err := pool.Exec(ctx, fmt.Sprintf(
-		`DO $$ BEGIN FOR i IN 1..%d LOOP PERFORM pg_current_xact_id(); COMMIT; END LOOP; END $$`, next-current)); err != nil {
+	// boundary-1 has one fewer digit than boundary: 999 and 1000, say. A
+	// reader that ordered the log as text would put boundary first.
+	before, after := agg.Stream("before"), agg.Stream("after")
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.streams (stream, kind, seq) VALUES ($1, $2, 1), ($3, $2, 1)`,
+		before.String(), "counter", after.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := agg.Handle(ctx, "second", add{1, 10}); err != nil {
+	if _, err := pool.Exec(ctx, `
+INSERT INTO cairn.entries (txid, stream, kind, seq, message)
+VALUES ($1::text::xid8, $2, 'counter', 1, '{}'::jsonb),
+       ($3::text::xid8, $4, 'counter', 1, '{}'::jsonb)`,
+		fmt.Sprint(boundary-1), before.String(), fmt.Sprint(boundary), after.String()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -254,8 +265,10 @@ func TestTheGlobalLogOrdersTransactionIDsAsNumbers(t *testing.T) {
 		}
 		entries, cursor = append(entries, more...), next
 	}
-	if len(entries) != 2 || entries[0].Stream != agg.Stream("first") || entries[1].Stream != agg.Stream("second") {
-		t.Fatalf("got %d entries, first %v", len(entries), entries)
+	if len(entries) != 2 || entries[0].Stream != before || entries[0].TxID != boundary-1 ||
+		entries[1].Stream != after || entries[1].TxID != boundary {
+		t.Fatalf("got %d entries, first %v; %d and %d must come back in numeric order",
+			len(entries), entries, boundary-1, boundary)
 	}
 }
 

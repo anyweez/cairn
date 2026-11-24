@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/build"
 	"go/build/constraint"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,10 +18,11 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// maxBuildsPerFile bounds the builds tried for one file before it is reported
-// as unreadable. A file's constraint selects the build it belongs to, so the
-// first match usually reads it; the bound is here so a tree whose builds all
-// fail to load cannot turn one file into a load per platform.
+// maxBuildsPerFile bounds the loads spent on one file. A file's constraint
+// selects the build it belongs to, so the first match usually reads it; the
+// bound is here so a tree whose builds all fail to load cannot turn one file
+// into a load per platform. Reaching it leaves builds untried, so the search
+// reports that it stopped rather than claiming no build reads the file.
 const maxBuildsPerFile = 8
 
 // buildContext is one build of the module: a GOOS/GOARCH pair and the extra
@@ -51,6 +56,9 @@ func (c buildContext) selects(path string) bool {
 // inherited build selects, so the extractor reads the rest itself: each file is
 // read in a build that includes it, found by matching its name and build line
 // against every platform the toolchain knows and the extra tags its line names.
+// The builds that read most of the file's package are tried first, since a file
+// that uses a constrained sibling's declaration type-checks only where that
+// sibling is read too.
 func (x *extractor) readBuilds(dir string, patterns []string) {
 	for _, path := range x.unread(dir, patterns) {
 		if x.seen[path] {
@@ -105,21 +113,39 @@ func (x *extractor) readInBuild(dir, path string) {
 	if rel != "." {
 		pattern = "./" + filepath.ToSlash(rel)
 	}
+	// A file that declares a package its directory's other files do not shares
+	// no build with them: the go command builds a directory's files as one
+	// package, and keeps such a file out of every build -- the generator behind
+	// //go:build ignore, the tools file in its own package. Hiding the other
+	// package's files is what lets that file be read instead of refused.
+	hide := otherPackage(path)
+	overlay, cleanup, err := hideOverlay(hide)
+	if err != nil {
+		x.errs = append(x.errs, fmt.Sprintf("%s: %v", x.rel(path), err))
+		return
+	}
+	defer cleanup()
 	tried := 0
 	var loadErrs []string
 	for _, ctx := range contexts(path) {
 		if tried == maxBuildsPerFile {
-			break
+			x.errs = append(x.errs, searchFailure(x.rel(path), buildConstraint(path), tried, true, loadErrs))
+			return
 		}
 		// A sibling needing the same build has already read this package, or
 		// already failed to; either way that load's errors are this file's.
 		key := ctx.key() + " " + pkgDir
+		if len(hide) > 0 {
+			// Another package's files are hidden from this load, so it stands
+			// apart from the one the directory's own files share.
+			key += " hiding for " + path
+		}
 		if errs, done := x.loaded[key]; done {
 			loadErrs = append(loadErrs, errs...)
 			continue
 		}
 		tried++
-		errs := x.loadBuild(dir, ctx, pattern)
+		errs := x.loadBuild(dir, ctx, pattern, overlay)
 		x.loaded[key] = errs
 		loadErrs = append(loadErrs, errs...)
 		if x.seen[path] {
@@ -127,21 +153,44 @@ func (x *extractor) readInBuild(dir, path string) {
 		}
 	}
 	if len(loadErrs) > 0 {
-		// A build does include the file; it just does not type-check. The
-		// loader's own message names the file and the symbol it could not
-		// resolve, which is the answer, where extracting from the partial type
-		// information it reports anyway would record a guess.
-		x.errs = append(x.errs, loadErrs...)
+		x.errs = append(x.errs, searchFailure(x.rel(path), buildConstraint(path), tried, false, loadErrs))
 		return
 	}
 	x.errs = append(x.errs, fmt.Sprintf("%s: %s: no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest", x.rel(path), buildConstraint(path)))
 }
 
+// searchFailure explains a file the build search could not read. A build that
+// selects the file does include it; the loader's own messages say why it did
+// not type-check there, and carry the file and the symbol it could not resolve
+// where extracting from the partial types the loader reports anyway would
+// record a guess. stopped says the search gave up at maxBuildsPerFile with
+// builds that select the file untried, which has not shown the file to be
+// unreadable, so the error says that rather than naming one build's error as
+// the answer.
+func searchFailure(name, constraint string, tried int, stopped bool, loadErrs []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s: ", name, constraint)
+	switch {
+	case stopped:
+		fmt.Fprintf(&b, "the search stopped after trying %d builds without one that type-checks the file, and builds that select it were left untried", tried)
+	case len(loadErrs) > 0:
+		b.WriteString("no build this tool can load type-checks the file")
+	default:
+		b.WriteString("no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest")
+	}
+	if len(loadErrs) > 0 {
+		b.WriteString(":\n  ")
+		b.WriteString(strings.Join(loadErrs, "\n  "))
+	}
+	return b.String()
+}
+
 // loadBuild reads pattern in the build ctx describes and adds what it declares
 // to x. It returns the errors the load reported, which the caller reports
 // against the file that made it try: a build the tool cannot read leaves that
-// file unread, and reporting the loader's message says why.
-func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []string {
+// file unread, and reporting the loader's message says why. overlay, when set,
+// is a go list flag that removes the files the directory cannot build with.
+func (x *extractor) loadBuild(dir string, ctx buildContext, pattern, overlay string) []string {
 	cfg := &packages.Config{
 		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Dir:   dir,
@@ -151,6 +200,9 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []st
 	if len(ctx.tags) > 0 {
 		cfg.BuildFlags = []string{"-tags=" + strings.Join(ctx.tags, ",")}
 	}
+	if overlay != "" {
+		cfg.BuildFlags = append(cfg.BuildFlags, overlay)
+	}
 	pkgs, err := loadPackages(cfg, pattern)
 	if err != nil {
 		return []string{err.Error()}
@@ -159,8 +211,100 @@ func (x *extractor) loadBuild(dir string, ctx buildContext, pattern string) []st
 	return nil
 }
 
-// contexts lists the builds that include path, the inherited build first, so a
-// file the inherited build left out is read in the build it belongs to.
+// otherPackage returns the files in path's directory that declare a package
+// path's does not, when there are any. A directory's non-test files are one
+// package to the go command, so a file whose package clause differs from a
+// sibling's is in no build that includes the sibling: it is the generator kept
+// out of every build by //go:build ignore, or the tools file tagged for go mod
+// tidy in a package of its own. go build ./... and go vet ./... accept the
+// directory, so the module is valid; the file's declarations are still source,
+// so the tool reads it with the ones it cannot be built with hidden rather than
+// refusing the module or dropping what it declares.
+//
+// A test file being read is exempt: package foo_test beside package foo is how
+// the go command spells an external test package, and the two are read in one
+// load. Test files of the other package are hidden like its others, because go
+// list reports a package clash against them too.
+func otherPackage(path string) (hide []string) {
+	pkg, err := packageClause(path)
+	if err != nil || pkg == "" || strings.HasSuffix(filepath.Base(path), "_test.go") {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		sibling := filepath.Join(dir, e.Name())
+		if e.IsDir() || !isGoFile(e.Name()) || sibling == path {
+			continue
+		}
+		if other, err := packageClause(sibling); err == nil && other != pkg {
+			hide = append(hide, sibling)
+		}
+	}
+	return hide
+}
+
+// isGoFile reports whether name is a Go file the go command reads, rather than
+// one it ignores for its name.
+func isGoFile(name string) bool {
+	return strings.HasSuffix(name, ".go") && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, ".")
+}
+
+// packageClause returns the package name a Go file declares.
+func packageClause(path string) (string, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly)
+	if err != nil {
+		return "", err
+	}
+	return f.Name.Name, nil
+}
+
+// hideOverlay writes a go list overlay that removes hide from its directory's
+// build, and returns the flag that applies it and a func removing the file. An
+// empty backing file is how the go command spells a file that does not exist.
+func hideOverlay(hide []string) (flag string, cleanup func(), err error) {
+	if len(hide) == 0 {
+		return "", func() {}, nil
+	}
+	replace := make(map[string]string, len(hide))
+	for _, path := range hide {
+		replace[path] = ""
+	}
+	data, err := json.Marshal(struct {
+		Replace map[string]string
+	}{replace})
+	if err != nil {
+		return "", func() {}, err
+	}
+	f, err := os.CreateTemp("", "cairn-manifest-overlay-*.json")
+	if err != nil {
+		return "", func() {}, err
+	}
+	name := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", func() {}, fmt.Errorf("writing the overlay: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", func() {}, fmt.Errorf("writing the overlay: %w", err)
+	}
+	return "-overlay=" + name, func() { os.Remove(name) }, nil
+}
+
+// contexts lists the builds that include path, ordered by how much of the
+// file's package they read, and the inherited build first among equals.
+//
+// A constrained file often uses a declaration a sibling declares under another
+// build -- a freebsd-only constant, a linux-only type -- so it type-checks only
+// where that sibling is read too, though its own line names no platform. The
+// build that reads the most of the package is the one it belongs to, so it is
+// tried first rather than spending the search's budget on platforms that happen
+// to select the file alone.
 func contexts(path string) []buildContext {
 	tags := extraTags(path)
 	var out []buildContext
@@ -172,7 +316,33 @@ func contexts(path string) []buildContext {
 			}
 		}
 	}
+	mostOfPackageFirst(out, filepath.Dir(path))
 	return out
+}
+
+// mostOfPackageFirst orders builds by how many of dir's Go files they select,
+// stably, so the inherited build keeps its place among builds that read as much
+// of the package as it does.
+func mostOfPackageFirst(builds []buildContext, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && isGoFile(e.Name()) {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	read := make(map[string]int, len(builds))
+	for _, c := range builds {
+		for _, file := range files {
+			if c.selects(file) {
+				read[c.key()]++
+			}
+		}
+	}
+	slices.SortStableFunc(builds, func(a, b buildContext) int { return read[b.key()] - read[a.key()] })
 }
 
 // tagSets lists every subset of tags, none first, so the search can enable the
@@ -246,47 +416,243 @@ func isPlatformTag(tag string) bool {
 }
 
 // buildConstraint names the constraint that keeps path out of this run's build:
-// its //go:build line when it has one, and its name otherwise, which is where
-// the go command reads the rest of them.
+// its //go:build line when it has one, the equivalent line for the legacy
+// // +build lines it writes instead, and its name when it states neither.
 func buildConstraint(path string) string {
-	if line := buildLine(path); line != "" {
-		return line
+	goBuild, plusBuilds := buildHeader(path)
+	if goBuild != "" {
+		return goBuild
+	}
+	if expr := plusBuildExpr(plusBuilds); expr != nil {
+		return "//go:build " + expr.String()
 	}
 	return fmt.Sprintf("file name %q", filepath.Base(path))
 }
 
-// buildExpr parses path's build constraint, or returns nil when it has none.
+// buildExpr parses path's build constraint as the go command reads it, or
+// returns nil when it has none.
 func buildExpr(path string) constraint.Expr {
-	line := buildLine(path)
-	if line == "" {
-		return nil
+	goBuild, plusBuilds := buildHeader(path)
+	if goBuild != "" {
+		expr, err := constraint.Parse(goBuild)
+		if err != nil {
+			return nil
+		}
+		return expr
 	}
-	expr, err := constraint.Parse(line)
-	if err != nil {
-		return nil
-	}
-	return expr
+	return plusBuildExpr(plusBuilds)
 }
 
-// buildLine returns path's //go:build line, or the legacy // +build line
-// before it, as it is written. Every comment line is scanned rather than the
-// header alone: a line that parses as a build constraint is one, and the search
-// it feeds verifies the file itself before anything is read from it.
-func buildLine(path string) string {
-	src, err := os.ReadFile(path)
-	if err != nil {
+// fileBuild returns the constraint selecting the builds that include path, as
+// the manifest records it, or "" when every build includes the file.
+//
+// The constraint is the file's own -- the suffix of its name and its build
+// line -- rather than the context this run read it in, so the same tree records
+// the same membership on every host. A registration that moves from one
+// platform's file to another's is then a change -base can see, where the
+// whole-module list of registrations alone would be identical.
+func fileBuild(path string) string {
+	name, line := fileNameExpr(path), buildExpr(path)
+	switch {
+	case name == nil:
+		if line == nil {
+			return ""
+		}
+		return line.String()
+	case line == nil:
+		return name.String()
+	case name.String() == line.String():
+		// foo_linux.go with //go:build linux names the same build twice.
+		return name.String()
+	default:
+		return (&constraint.AndExpr{X: name, Y: line}).String()
+	}
+}
+
+// fileNameExpr returns the constraint a file name states, or nil when it states
+// none. The go command ties a file to a build by a _GOOS, _GOARCH or
+// _GOOS_GOARCH suffix after a non-empty prefix; linux.go alone is not
+// constrained, and foo_linux_test.go is.
+func fileNameExpr(path string) constraint.Expr {
+	name, _, _ := strings.Cut(filepath.Base(path), ".")
+	i := strings.Index(name, "_")
+	if i < 0 {
+		return nil
+	}
+	parts := strings.Split(name[i:], "_")
+	if n := len(parts); n > 0 && parts[n-1] == "test" {
+		parts = parts[:n-1]
+	}
+	goosTags, goarchTags := knownPlatformTags()
+	n := len(parts)
+	if n >= 2 && goosTags[parts[n-2]] && goarchTags[parts[n-1]] {
+		return &constraint.AndExpr{
+			X: &constraint.TagExpr{Tag: parts[n-2]},
+			Y: &constraint.TagExpr{Tag: parts[n-1]},
+		}
+	}
+	if n >= 1 && (goosTags[parts[n-1]] || goarchTags[parts[n-1]]) {
+		return &constraint.TagExpr{Tag: parts[n-1]}
+	}
+	return nil
+}
+
+// parseBuild parses a constraint the manifest records. The manifest writes the
+// expression without the //go:build prefix the go command requires.
+func parseBuild(s string) (constraint.Expr, error) {
+	return constraint.Parse("//go:build " + s)
+}
+
+// orBuilds combines two build constraints for one registration or upcaster
+// version: it is registered in the builds either one selects. An empty
+// constraint selects every build, so it absorbs the other.
+func orBuilds(a, b string) string {
+	if a == "" || b == "" {
 		return ""
 	}
-	for _, line := range strings.Split(string(src), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "//") {
-			continue
-		}
-		if _, err := constraint.Parse(line); err == nil {
-			return line
+	if a == b {
+		return a
+	}
+	ax, errA := parseBuild(a)
+	bx, errB := parseBuild(b)
+	if errA != nil || errB != nil {
+		// Both come from fileBuild, which only returns constraints it parsed.
+		return a
+	}
+	return (&constraint.OrExpr{X: ax, Y: bx}).String()
+}
+
+// buildHeader returns the //go:build line in path's header as go/build reads
+// it, or, when it has none, the legacy // +build lines it ANDs there, in order.
+//
+// This is go/build's own scan of the file: a //go:build line counts anywhere in
+// the leading run of comments, including directly above the package clause,
+// while the legacy form ends at the last blank line before the first line of
+// code, and a block comment ends it outright. Reading the file's bytes rather
+// than its syntax tree is what keeps a directive-shaped line inside a raw
+// string or the body from being taken as the header, and it handles the BOM.
+func buildHeader(path string) (goBuild string, plusBuilds []string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil
+	}
+	header, line := fileHeader(bytes.TrimPrefix(content, utf8BOM))
+	if len(line) > 0 {
+		goBuild = string(line)
+	}
+	for _, l := range strings.Split(string(header), "\n") {
+		l = strings.TrimSpace(l)
+		if _, err := constraint.Parse(l); err == nil && constraint.IsPlusBuild(l) {
+			plusBuilds = append(plusBuilds, l)
 		}
 	}
-	return ""
+	return goBuild, plusBuilds
+}
+
+// utf8BOM is the byte order mark the go command drops before reading a file's
+// header, so a directive after it is still a directive.
+var utf8BOM = []byte("\xef\xbb\xbf")
+
+// fileHeader returns the part of content the legacy // +build lines are read
+// from, and the //go:build line anywhere in the leading comment run, as
+// go/build's parseFileHeader does. content must not begin with a BOM.
+func fileHeader(content []byte) (header, goBuild []byte) {
+	return legacyHeader(content), goBuildHeader(content)
+}
+
+// legacyHeader returns content's leading run of blank lines and // comments,
+// which is where go/build reads the legacy // +build form. The run ends at the
+// first line that is neither, so a blank line after it -- or a directive inside
+// a block comment or a raw string -- is not part of the header.
+func legacyHeader(content []byte) []byte {
+	end := 0
+	for p := content; len(p) > 0; {
+		var line []byte
+		line, p = firstLine(p)
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			end = len(content) - len(p)
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("//")) {
+			break
+		}
+	}
+	return content[:end]
+}
+
+// goBuildHeader returns the first //go:build line in content's leading comment
+// run, or nil. Unlike the legacy form it counts wherever a blank line falls,
+// including directly above the package clause; go/build accepts one before the
+// first line of code and ignores one inside a block comment or a string.
+func goBuildHeader(content []byte) []byte {
+	inSlashStar := false
+	for p := content; len(p) > 0; {
+		var line []byte
+		line, p = firstLine(p)
+		line = bytes.TrimSpace(line)
+		if !inSlashStar && constraint.IsGoBuild(string(line)) {
+			return line
+		}
+		var code bool
+		inSlashStar, code = scanComment(line, inSlashStar)
+		if code {
+			return nil
+		}
+	}
+	return nil
+}
+
+// scanComment advances the /* */ state through one line of a file, and reports
+// whether the line holds text that is not a comment.
+func scanComment(line []byte, inSlashStar bool) (next, code bool) {
+	for len(line) > 0 {
+		if inSlashStar {
+			i := bytes.Index(line, []byte("*/"))
+			if i < 0 {
+				return true, false
+			}
+			inSlashStar = false
+			line = bytes.TrimSpace(line[i+len("*/"):])
+			continue
+		}
+		switch {
+		case bytes.HasPrefix(line, []byte("//")):
+			return false, false
+		case bytes.HasPrefix(line, []byte("/*")):
+			inSlashStar = true
+			line = bytes.TrimSpace(line[len("/*"):])
+		default:
+			return false, true
+		}
+	}
+	return inSlashStar, false
+}
+
+// firstLine splits p at its first newline.
+func firstLine(p []byte) (line, rest []byte) {
+	if i := bytes.IndexByte(p, '\n'); i >= 0 {
+		return p[:i], p[i+1:]
+	}
+	return p, nil
+}
+
+// plusBuildExpr ANDs the legacy // +build lines in a file header, one per
+// conjunct, as the go command does. It returns nil when the header has none.
+func plusBuildExpr(lines []string) constraint.Expr {
+	var expr constraint.Expr
+	for _, line := range lines {
+		x, err := constraint.Parse(line)
+		if err != nil {
+			continue
+		}
+		if expr == nil {
+			expr = x
+		} else {
+			expr = &constraint.AndExpr{X: expr, Y: x}
+		}
+	}
+	return expr
 }
 
 // moduleGoFiles lists every Go file in the module rooted at dir, skipping the
@@ -319,7 +685,7 @@ func moduleGoFiles(dir string) ([]string, error) {
 				}
 				continue
 			}
-			if !strings.HasSuffix(name, ".go") || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			if !isGoFile(name) {
 				continue
 			}
 			out = append(out, filepath.Join(path, name))
@@ -336,6 +702,63 @@ var (
 	pairsOnce sync.Once
 	pairsAll  [][2]string
 )
+
+var (
+	platformTagsOnce sync.Once
+	knownOS          map[string]bool
+	knownArch        map[string]bool
+)
+
+// knownPlatformTags lists the GOOS and GOARCH names the toolchain knows, which
+// are the suffixes a file name can use to select a build.
+func knownPlatformTags() (map[string]bool, map[string]bool) {
+	platformTagsOnce.Do(func() {
+		knownOS, knownArch = map[string]bool{}, map[string]bool{}
+		for _, pair := range platformPairs() {
+			knownOS[pair[0]] = true
+			knownArch[pair[1]] = true
+		}
+	})
+	return knownOS, knownArch
+}
+
+// unixOS lists the GOOS values the go command satisfies the "unix" build tag
+// for. go/build keeps the same table in its internal syslist package, which a
+// module cannot import, so TestBuildTagsMatchTheGoCommand compares this copy
+// with go/build itself.
+var unixOS = map[string]bool{
+	"aix":       true,
+	"android":   true,
+	"darwin":    true,
+	"dragonfly": true,
+	"freebsd":   true,
+	"hurd":      true,
+	"illumos":   true,
+	"ios":       true,
+	"linux":     true,
+	"netbsd":    true,
+	"openbsd":   true,
+	"solaris":   true,
+}
+
+// buildTags lists the tags the go command satisfies for one GOOS/GOARCH pair:
+// the two names, the OS the GOOS implies, and "unix" for a unix-like GOOS.
+// Every other tag a constraint names is free: a build may or may not have it.
+func buildTags(goos, goarch string) map[string]bool {
+	tags := map[string]bool{goos: true, goarch: true}
+	switch goos {
+	case "android":
+		tags["linux"] = true
+	case "ios":
+		tags["darwin"] = true
+	case "illumos":
+		tags["solaris"] = true
+	}
+	if unixOS[goos] {
+		tags["unix"] = true
+	}
+	return tags
+}
 
 // platformPairs lists the GOOS/GOARCH pairs the toolchain can target, the
 // inherited build first. It asks `go tool dist list` rather than carrying its

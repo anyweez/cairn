@@ -1,11 +1,12 @@
 package codec_test
 
 // D6 and D7 ask whether a value survived its round trip. JSON keeps a
-// time.Time's instant but not its monotonic clock reading or the *Location it
-// came from, so the comparison has to be the ledger's — the same instant —
-// rather than Go's value identity, and no looser than that, or a genuine loss
-// goes unreported. These are the comparison's own cases; the checker's rules
-// are held to the same shapes that need a codec or a snapshot.
+// time.Time's instant and zone offset but not its monotonic clock reading or
+// the *Location it came from, so the comparison has to be the ledger's — the
+// same instant and offset — rather than Go's value identity, and no looser
+// than that, or a genuine loss goes unreported. These are the comparison's own
+// cases; the checker's rules are held to the same shapes that need a codec or
+// a snapshot.
 
 import (
 	"encoding/json"
@@ -44,6 +45,10 @@ func TestEqualRoundTripped(t *testing.T) {
 	// A zone offset with seconds in it, which time.Time.MarshalJSON writes only
 	// to the minute: the snapshot keeps every offset it can and moves this one.
 	moved := time.Date(2026, time.March, 4, 5, 6, 7, 0, time.FixedZone("LMT", -(5*60*60+53*60+7)))
+	// The same instant written in two zones: RFC 3339 stores a different offset,
+	// so the bytes differ even though time.Time.Equal calls the pair equal.
+	cet := time.Date(2026, time.March, 4, 23, 0, 0, 0, time.FixedZone("CET", 3600))
+	eet := cet.In(time.FixedZone("EET", 2*3600))
 
 	for _, tc := range []struct {
 		name string
@@ -61,6 +66,18 @@ func TestEqualRoundTripped(t *testing.T) {
 			a:    rtStamped{At: named},
 			b:    rtJSONRoundTrip(t, rtStamped{At: named}),
 			want: true,
+		},
+		{
+			name: "a named zone against the unnamed zone JSON decodes it to",
+			a:    rtStamped{At: named},
+			b:    rtStamped{At: time.Date(2026, time.March, 4, 5, 6, 7, 0, time.FixedZone("", 5*60*60+30*60))},
+			want: true,
+		},
+		{
+			name: "the same instant at a different zone offset",
+			a:    rtStamped{At: cet},
+			b:    rtStamped{At: eet},
+			want: false,
 		},
 		{
 			name: "the instant reached through a pointer",
@@ -85,6 +102,12 @@ func TestEqualRoundTripped(t *testing.T) {
 			a:    map[time.Time]int{named: 1},
 			b:    rtJSONRoundTrip(t, map[time.Time]int{named: 1}),
 			want: true,
+		},
+		{
+			name: "a map key at the same instant but a different offset",
+			a:    map[time.Time]int{cet: 1},
+			b:    map[time.Time]int{eet: 1},
+			want: false,
 		},
 		{
 			name: "an instant JSON moves",

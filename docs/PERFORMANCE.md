@@ -20,7 +20,9 @@ measurements and how to reproduce them.
 | `CatchUp`, per batch of up to `BatchSize` entries | 5 |
 
 `TestEachPathKeepsToItsRoundTrips` holds the uncached paths to these numbers,
-and `cache_test.go` the cached ones.
+and `cache_test.go` the cached ones. A catch-up reads one entry past its batch,
+so a batch that is exactly full costs 5 like any other and no transaction is
+spent discovering the log is empty. One that finds nothing costs 4.
 
 Without the cache, `Handle` makes two round trips:
 
@@ -78,7 +80,8 @@ transaction at a time:
   shared transaction is narrowed down by halving the group: a half the
   database accepts is recorded whole, and only a failing half is halved
   again, so one bad message costs a few transactions rather than one per
-  message in the group. Only failures the database reported are retried.
+  message in the group. Only failures that recorded nothing are retried: one
+  the database reported, or a batch pgx could not build, which is never sent.
   When it is unknown whether a commit happened, the callers get the error;
   when a batch's transaction is known to have committed, the error wraps
   `ErrRecorded`.

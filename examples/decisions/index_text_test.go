@@ -6,15 +6,18 @@ import (
 )
 
 // The reference index is told the decision's text by an IndexReferences
-// effect: its title, and once an outcome is recorded, its rationale. Every
-// message that changes that text must tell the index the new text, or the
-// index goes on answering with text the decision no longer has.
+// effect. The effect names the rows in the application's table that hold the
+// text — the question, and the rationale once one is recorded — and the shell
+// resolves them (Content.IndexedText) when it delivers the effect.
 //
-// Two messages do not. Reopening a settled decision clears the outcome, so
-// the rationale leaves the text, but the reopen emits no effect at all, and
-// the index keeps the cleared rationale. Editing a settled decision sends
-// only the new title, dropping the rationale the state still carries. In both
-// cases the text handed to the index is not the decision's text.
+// Every message that changes that text must tell the index the new rows, or
+// the index goes on answering with text the decision no longer names.
+//
+// Two messages did not. Reopening a settled decision clears the outcome, so
+// the rationale leaves the text, but the reopen emitted no effect at all, and
+// the index kept the cleared rationale. Editing a settled decision sent only
+// the new question, dropping the rationale the state still carries. In both
+// cases the text handed to the index was not the decision's text.
 func TestIndexTextFollowsTheDecision(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0).UTC()
 
@@ -33,13 +36,13 @@ func TestIndexTextFollowsTheDecision(t *testing.T) {
 		}
 		return s
 	}
-	text := func(d decision) (string, bool) {
+	indexed := func(d decision) (IndexReferences, bool) {
 		for _, e := range d.Effects {
 			if ir, ok := e.(IndexReferences); ok {
-				return ir.Text, true
+				return ir, true
 			}
 		}
-		return "", false
+		return IndexReferences{}, false
 	}
 
 	t.Run("reopen clears the rationale from the index", func(t *testing.T) {
@@ -48,13 +51,13 @@ func TestIndexTextFollowsTheDecision(t *testing.T) {
 		if d.Refused() {
 			t.Fatal(d.Refusal)
 		}
-		got, ok := text(d)
+		got, ok := indexed(d)
 		if !ok {
-			t.Fatalf("reopen emitted no IndexReferences; the index keeps %q",
-				s.Title+"\n"+s.Outcome.Rationale)
+			t.Fatalf("reopen emitted no IndexReferences; the index keeps %q and %q",
+				s.Title, s.Outcome.Rationale)
 		}
-		if want := after.Title; got != want {
-			t.Fatalf("reopen re-indexed %q, want %q", got, want)
+		if got.Title != after.Title || got.Rationale != "" {
+			t.Fatalf("reopen re-indexed %+v, want %q and no rationale", got, after.Title)
 		}
 	})
 
@@ -64,12 +67,12 @@ func TestIndexTextFollowsTheDecision(t *testing.T) {
 		if d.Refused() {
 			t.Fatal(d.Refusal)
 		}
-		got, ok := text(d)
+		got, ok := indexed(d)
 		if !ok {
 			t.Fatal("edit emitted no IndexReferences")
 		}
-		if want := after.Title + "\n" + after.Outcome.Rationale; got != want {
-			t.Fatalf("edit re-indexed %q, want %q", got, want)
+		if want := (IndexReferences{Decision: after.ID, Title: after.Title, Rationale: after.Outcome.Rationale}); got != want {
+			t.Fatalf("edit re-indexed %+v, want %+v", got, want)
 		}
 	})
 }

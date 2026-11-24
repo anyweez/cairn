@@ -14,13 +14,144 @@ fixture_name() {
   fi
 }
 
+# fixture_host_port PORT succeeds when PORT is a host port a container can
+# publish. A companion's host port is computed from the fixture port, so a
+# fixture port near the end of the range pushes its companions past 65535;
+# Docker only refuses that when the container is created. 0 is a host port in
+# the same sense: Docker reads it as "publish on a port of your choosing", and
+# the fixture reads the chosen port back from the container
+# (container_host_port).
+fixture_host_port() {
+  local port=$1
+  case $port in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 0 ] && [ "$port" -le 65535 ]
+}
+
+# fixture_port DEFAULT_PORT DEFAULT_KEY KEY [OVERRIDE] prints the host port a
+# companion fixture publishes. A companion's container name is keyed by the
+# fixture port it belongs to (fixture_name), so its host port has to be keyed
+# the same way: left at the default, a session on another CAIRN_TEST_PORT leaves
+# a differently named container holding the port the next default session asks
+# for, and Docker refuses to start it. The port keeps its distance from the key
+# (55873 is two above the Postgres default 55871), so the default session gets
+# the documented port and any other key gets a host port of its own. An
+# explicit override still wins. A port outside 1-65535 is refused with a
+# message rather than passed to Docker.
+fixture_port() {
+  local default_port=$1 default_key=$2 key=$3 override=${4:-} port what
+  what="the companion of fixture port ${key}"
+  if [ -n "$override" ]; then
+    port=$override
+    what="the companion port asked for"
+  else
+    case $key in
+      '' | *[!0-9]*)
+        echo "cairn: fixture port '${key}' is not a port number" >&2
+        return 1
+        ;;
+    esac
+    port=$(( default_port + key - default_key ))
+  fi
+  if ! fixture_host_port "$port"; then
+    echo "cairn: ${what} is host port ${port}, outside 0-65535" >&2
+    return 1
+  fi
+  printf '%s' "$port"
+}
+
+# fixture_port_beside DEFAULT_PORT DEFAULT_KEY KEY [OVERRIDE] [AVOID] prints
+# the host port a companion publishes beside another companion in the same
+# container, rather than at a fixed distance from the fixture port. The
+# toxiproxy's control API is one: it and the proxy are fixed when its container
+# is created, so moving the proxy port has to move the API port with it, and
+# the documented pair (55872 and 8474) is not the distance apart the others
+# are. KEY at DEFAULT_KEY keeps DEFAULT_PORT; any other KEY takes the port next
+# to it, stepping over AVOID, which is the port the other fixture in front of
+# the same Postgres publishes: one session may run both, and a host port can
+# only be published once. An override still wins, and a port outside 1-65535 is
+# refused rather than passed to Docker.
+fixture_port_beside() {
+  local default_port=$1 default_key=$2 key=$3 override=${4:-} avoid=${5:-} port what
+  what="the port beside ${key}"
+  if [ -n "$override" ]; then
+    port=$override
+    what="the companion port asked for"
+  elif [ "$key" = "$default_key" ]; then
+    port=$default_port
+  else
+    case $key in
+      '' | *[!0-9]*)
+        echo "cairn: companion host port '${key}' is not a port number" >&2
+        return 1
+        ;;
+    esac
+    port=$(( key + 1 ))
+    if [ -n "$avoid" ] && [ "$port" = "$avoid" ]; then
+      port=$(( port + 1 ))
+    fi
+  fi
+  if ! fixture_host_port "$port"; then
+    echo "cairn: ${what} is host port ${port}, outside 0-65535" >&2
+    return 1
+  fi
+  printf '%s' "$port"
+}
+
 # container_publishes NAME CONTAINER_PORT HOST_PORT succeeds only when NAME is
 # running and publishes CONTAINER_PORT on 127.0.0.1:HOST_PORT. A container
 # found by name alone may have been created with a different port, and then
-# the URL a script prints points somewhere nothing is listening.
+# the URL a script prints points somewhere nothing is listening. HOST_PORT 0 is
+# Docker's "publish on a port you choose": the container reports a host port
+# the request cannot name, so any 127.0.0.1 host port is the one asked for.
+# Comparing the mapping with "127.0.0.1:0" would never match, and every call
+# would remove and recreate the container instead of reusing it.
 container_publishes() {
-  local name=$1 container_port=$2 host_port=$3 mapping
+  local name=$1 container_port=$2 host_port=$3 mapping port
   [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
   mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) || return 1
+  if [ "$host_port" = 0 ]; then
+    case $mapping in
+      127.0.0.1:*) port=${mapping##*:} ;;
+      *) return 1 ;;
+    esac
+    case $port in
+      '' | 0 | *[!0-9]*) return 1 ;;
+    esac
+    return 0
+  fi
   [ "$mapping" = "127.0.0.1:${host_port}" ]
+}
+
+# container_host_port NAME CONTAINER_PORT prints the host port on 127.0.0.1
+# that NAME publishes CONTAINER_PORT on, as Docker reports it, or prints nothing
+# and fails when NAME publishes that container port on no host port. A fixture
+# started with host port 0 is published on a port Docker chose, and only the
+# container knows which: printing the requested 0 would name a port nothing
+# listens on. Asking the container instead makes the port a script prints the
+# one it publishes, whether the request fixed it or not.
+container_host_port() {
+  local name=$1 container_port=$2 mapping port
+  mapping=$(docker port "$name" "$container_port" 2>/dev/null | head -1) ||
+    mapping=
+  port=${mapping##*:}
+  case $port in
+    '' | *[!0-9]*)
+      echo "cairn: ${name} publishes container port ${container_port}" \
+        "on no host port" >&2
+      return 1
+      ;;
+  esac
+  printf '%s' "$port"
+}
+
+# container_setting NAME SETTING prints the value the Postgres running in NAME
+# reports for SETTING, or nothing when it cannot be read. A -c flag passed to
+# docker run is fixed when the container is created, so a container the fixture
+# started before that flag existed keeps the old value: asking the server is
+# the only way a reuse check sees it.
+container_setting() {
+  local name=$1 setting=$2
+  docker exec "$name" psql -U cairn -d postgres -Atc "SHOW ${setting}" 2>/dev/null || true
 }

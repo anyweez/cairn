@@ -603,8 +603,8 @@ func (a *Aggregate[S, M, R, Ev, Ef]) finishLoad(ctx context.Context, q querier, 
 	entries := p.entries
 	switch {
 	case p.snapshot != nil && p.snapSeq <= seq:
-		var state S
-		if err := json.Unmarshal(p.snapshot, &state); err != nil {
+		state, err := decodeSnapshotState[S](p.snapshot)
+		if err != nil {
 			return Loaded[S]{}, fmt.Errorf("cairn: decoding snapshot of %s: %w", p.stream, err)
 		}
 		at.State, at.snapshotSeq, at.snapshotBytes = state, p.snapSeq, len(p.snapshot)
@@ -762,10 +762,20 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 		}
 		return nil, at, nil, nil, encodeErr
 	}
-	if entry.Events, err = a.Codecs.Events.EncodeAll(decision.Events); err != nil {
+	// Decode the envelopes back before anything is appended, as for the message
+	// and the result above. EncodeAll proves a value is storable, which is what
+	// jsonb keeps, not that the registered type's UnmarshalJSON can read the
+	// bytes its MarshalJSON wrote. An entry that cannot be decoded is permanent:
+	// entries are append-only, so every later Load, Handle and Verify of the
+	// stream would fail. The decoded events are the ones folded and handed to
+	// entry views, so the state a live write caches is the state a later Load
+	// folds from the same entry, rather than the two disagreeing about a value
+	// the codec changed.
+	var storedEvents []Ev
+	if entry.Events, storedEvents, err = encodeReadable(a.Codecs.Events, decision.Events); err != nil {
 		return nil, at, nil, nil, err
 	}
-	if entry.Effects, err = a.Codecs.Effects.EncodeAll(decision.Effects); err != nil {
+	if entry.Effects, _, err = encodeReadable(a.Codecs.Effects, decision.Effects); err != nil {
 		return nil, at, nil, nil, err
 	}
 	if decision.Refused() {
@@ -804,7 +814,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 		return nil, at, nil, nil, err
 	}
 	next = at
-	next.State = a.Decider.Fold(at.State, decision.Events)
+	next.State = a.Decider.Fold(at.State, storedEvents)
 	next.Seq = entry.Seq
 
 	return func() Handled[R] {
@@ -817,7 +827,24 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueEntry(b *Batch, l *locks, at Loaded[S]
 			result = decision.Result
 		}
 		return Handled[R]{Entry: *entry, Result: result, Refusal: entry.Refusal}
-	}, next, entry, decision.Events, nil
+	}, next, entry, storedEvents, nil
+}
+
+// encodeReadable encodes vs and decodes the envelopes back, returning both. A
+// value that encodes but does not decode would be recorded and never read
+// again, since entries are append-only; Encode alone does not catch it, because
+// CheckStorable checks what jsonb keeps rather than what the type's
+// UnmarshalJSON can read.
+func encodeReadable[T any](c *codec.Codec[T], vs []T) ([]codec.Envelope, []T, error) {
+	envs, err := c.EncodeAll(vs)
+	if err != nil {
+		return nil, nil, err
+	}
+	back, err := c.DecodeAll(envs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return envs, back, nil
 }
 
 // storableRefusal returns r as the ledger will read it back. json.Marshal
@@ -836,6 +863,16 @@ func storableRefusal(r *cairn.Refusal) (*cairn.Refusal, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// decodeSnapshotState decodes a snapshot's bytes into the stream's state type.
+// finishLoad reads every stored snapshot through it, and queueSnapshot decodes
+// the bytes it is about to store through it, so a state the ledger could not
+// read back is refused before it is written rather than bricking the stream.
+func decodeSnapshotState[S any](data []byte) (S, error) {
+	var state S
+	err := json.Unmarshal(data, &state)
+	return state, err
 }
 
 // pendingDuplicate is the entry an idempotency key names, if any, as read by
@@ -921,6 +958,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) queueSnapshot(b *Batch, at *Loaded[S]) erro
 	data, err := json.Marshal(at.State)
 	if err != nil {
 		return fmt.Errorf("cairn: encoding snapshot of %s: %w", at.Stream, err)
+	}
+	// finishLoad reads these bytes back through decodeSnapshotState, and the
+	// row is only replaced when another snapshot is due - which needs a
+	// successful load - so a state whose UnmarshalJSON rejects what its
+	// MarshalJSON wrote would leave the stream unloadable for good.
+	// CheckStorable and json.Marshal only prove a state is storable, not that
+	// its own type can read it back, so decode it here before it is queued.
+	if _, err := decodeSnapshotState[S](data); err != nil {
+		return fmt.Errorf("cairn: the snapshot state of %s cannot be read back: %w", at.Stream, err)
 	}
 	b.own(sqlStep("saving snapshot of "+at.Stream.String()), `
 INSERT INTO cairn.state_snapshots (stream, seq, version, state) VALUES ($1, $2, $3, $4)

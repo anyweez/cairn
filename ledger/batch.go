@@ -95,6 +95,16 @@ func (e *batchError) Error() string { return fmt.Sprintf("statement %d: %v", e.i
 
 func (e *batchError) Unwrap() error { return e.err }
 
+// notSentError is a batch that failed before it was sent: pgx could not build
+// one of its statements, so no statement ran and nothing was recorded. It wraps
+// the error that says why, and tells a caller deciding whether to try again
+// that nothing in the batch can have taken effect.
+type notSentError struct{ err error }
+
+func (e *notSentError) Error() string { return e.err.Error() }
+
+func (e *notSentError) Unwrap() error { return e.err }
+
 // batchSender is a transaction or a connection.
 type batchSender interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
@@ -118,11 +128,22 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			// happen.
 			closeErr := results.Close()
 			j, unbuilt := b.blame(s, i, err)
-			// An unbuilt statement is one the client could not encode, so the
-			// batch was never sent and nothing can have committed — whatever
-			// state the connection happens to be in.
-			if !unbuilt && b.commits && b.hasCommit && committed(s, err, closeErr) {
-				return &recordedError{err: b.failed(j, err)}
+			if unbuilt {
+				// An unbuilt statement is one the client could not encode, so the
+				// batch was never sent and nothing can have committed — whatever
+				// state the connection happens to be in.
+				return b.failed(j, &notSentError{err})
+			}
+			if b.commits && b.hasCommit {
+				switch {
+				case committed(s, err, closeErr):
+					return &recordedError{err: b.failed(j, err)}
+				case !neverCommitted(err, closeErr):
+					// The COMMIT's result never arrived and the connection is not
+					// there to be inspected, so whether the transaction committed
+					// is unknown: the message may be in the ledger.
+					return &unknownOutcomeError{err: b.failed(j, err)}
+				}
 			}
 			return b.failed(j, err)
 		}
@@ -160,20 +181,52 @@ func (e *recordedError) Unwrap() error { return e.err }
 
 func (e *recordedError) Is(target error) bool { return target == ErrRecorded }
 
-// committed reports whether s's connection is between transactions after a
-// batch's results have been read: 'I' is idle, which is what a committed
-// transaction leaves behind, 'T' or 'E' that it is still open or aborted, and
-// a closed connection leaves it unknown. A database error aborts the
-// transaction, so it is never a commit. s's own result-reading may report a
-// client-side error the database knows nothing about, which is exactly the
-// case this is here to see past.
-func committed(s batchSender, errs ...error) bool {
+// ErrUnknownOutcome reports that a batch failed after its COMMIT was sent, and
+// neither the COMMIT's result nor its connection could be read to tell whether
+// the transaction committed: the message may be in the ledger. It is wrapped
+// by the error naming what failed to read.
+//
+// A caller that stores data the entry would name must keep it, exactly as for
+// ErrRecorded; this error only stops short of promising that the message is
+// there. It must not replay the message unless it carries an idempotency key.
+var ErrUnknownOutcome = errors.New("cairn: whether the message was recorded is unknown")
+
+// unknownOutcomeError is an error from a batch whose COMMIT result could not be
+// read, sent over a connection that cannot be inspected to tell whether it
+// committed. It carries the error that says what could not be read, and
+// matches ErrUnknownOutcome.
+type unknownOutcomeError struct{ err error }
+
+func (e *unknownOutcomeError) Error() string { return fmt.Sprintf("%v: %v", ErrUnknownOutcome, e.err) }
+
+func (e *unknownOutcomeError) Unwrap() error { return e.err }
+
+func (e *unknownOutcomeError) Is(target error) bool { return target == ErrUnknownOutcome }
+
+// neverCommitted reports whether one of errs means no transaction committed:
+// the database refused a statement, which aborts every statement after it, the
+// COMMIT included, or the client could not build one, so the batch was never
+// sent.
+func neverCommitted(errs ...error) bool {
 	for _, err := range errs {
 		var pgErr *pgconn.PgError
 		var prep pgx.ErrPreprocessingBatch
 		if errors.As(err, &pgErr) || errors.As(err, &prep) {
-			return false
+			return true
 		}
+	}
+	return false
+}
+
+// committed reports whether s's connection is between transactions after a
+// batch's results have been read: 'I' is idle, which is what a committed
+// transaction leaves behind, 'T' or 'E' that it is still open or aborted, and
+// a closed connection leaves it unknown. s's own result-reading may report a
+// client-side error the database knows nothing about, which is exactly the
+// case this is here to see past.
+func committed(s batchSender, errs ...error) bool {
+	if neverCommitted(errs...) {
+		return false
 	}
 	pg := senderPgConn(s)
 	return pg != nil && !pg.IsClosed() && pg.TxStatus() == 'I'

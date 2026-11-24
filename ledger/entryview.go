@@ -15,8 +15,9 @@ import (
 //
 // Write is called once for each recorded entry that has events, in order,
 // with the stream's state before and after it and the entry's events. They
-// are the events Decide returned, or when rebuilding, the stored ones decoded;
-// the two are equal for any event type that survives its codec (D6).
+// are the entry's stored events decoded, both on a live write and when
+// rebuilding, so the two are the same value even for an event type that does
+// not survive its codec (D6).
 // Refusals, duplicates and entries without events don't reach it. Key its
 // rows by the entry (after.Stream.ID and entry.Seq, plus an index for an
 // entry that writes several) and insert with ON CONFLICT, so that running it

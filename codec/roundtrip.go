@@ -9,13 +9,15 @@ import (
 // replay kept it as are the same value.
 //
 // It is reflect.DeepEqual except for a time.Time, which is compared by its
-// instant, because that is the notion of "read back unchanged" this package
-// and the ledger hold themselves to. json.Marshal writes an instant and a zone
-// offset but neither the monotonic clock reading nor the *Location it came
-// from, so a time the ledger records, snapshots and replays exactly fails
-// DeepEqual. CheckStorable accepts exactly the times whose instant survives,
-// and the ledger runs it before writing a snapshot; this is that rule, applied
-// to a pair rather than to one value.
+// instant and its zone offset, because that is the notion of "read back
+// unchanged" this package and the ledger hold themselves to. json.Marshal
+// writes an instant and a zone offset but neither the monotonic clock reading
+// nor the *Location it came from, so a time the ledger records, snapshots and
+// replays exactly fails DeepEqual. The offset is part of the text RFC 3339
+// writes, so a time whose instant is kept but whose offset changes is a
+// different stored value, not a surviving one. CheckStorable is the ledger's
+// rule for what may be written; this is that rule applied to a pair, held to
+// the offsets the stored text carries.
 //
 // Everything else is DeepEqual's answer, so a field a codec or a snapshot
 // drops — a `json:"-"` tag, an unexported field — is still reported, and so is
@@ -60,14 +62,20 @@ func equalRoundTripValue(a, b reflect.Value, seen map[visit]bool) bool {
 	return a.Equal(b)
 }
 
-// sameInstant compares two times by the instant JSON keeps. A time inside an
-// unexported field cannot be read through reflect, so it is compared with Go's
-// == instead: JSON never encodes that field, so nothing about it may change.
+// sameInstant reports whether two times are the same value JSON keeps. JSON
+// writes the instant and the zone offset, so both must be equal; the *Location
+// name and the monotonic reading are dropped, so they may differ. A time inside
+// an unexported field cannot be read through reflect, so it is compared with
+// Go's == instead: JSON never encodes that field, so nothing about it may
+// change.
 func sameInstant(a, b reflect.Value) bool {
 	if !a.CanInterface() {
 		return a.Equal(b)
 	}
-	return a.Interface().(time.Time).Equal(b.Interface().(time.Time))
+	x, y := a.Interface().(time.Time), b.Interface().(time.Time)
+	_, xOffset := x.Zone()
+	_, yOffset := y.Zone()
+	return x.Equal(y) && xOffset == yOffset
 }
 
 // equalThrough compares the pair a pointer or an interface refers to.
@@ -139,10 +147,10 @@ func equalMap(a, b reflect.Value, seen map[visit]bool) bool {
 	return true
 }
 
-// equalTimeKeyedMap matches each key by its instant. Go's == on a time.Time
-// compares its *Location, and a decoded key has a new one even when JSON kept
-// the instant, so b.MapIndex would never find the counterpart of a key that
-// survived the round trip.
+// equalTimeKeyedMap matches each key by its instant and zone offset. Go's == on
+// a time.Time compares its *Location, and a decoded key has a new one even when
+// JSON kept the instant, so b.MapIndex would never find the counterpart of a
+// key that survived the round trip.
 func equalTimeKeyedMap(a, b reflect.Value, seen map[visit]bool) bool {
 	keys := b.MapKeys()
 	matched := make([]bool, len(keys))

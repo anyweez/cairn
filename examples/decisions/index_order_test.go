@@ -29,7 +29,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	index := NewReferenceIndex()
+	index := NewReferenceIndex(svc.Content)
 	deliveries, applied := 0, 0
 	d := &ledger.Dispatcher[Effect]{
 		Store:   svc.Register.Store,
@@ -46,7 +46,8 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 			}
 			// The retried create effect arrives after the edit's. The index
 			// drops it because its entry is older, not because of the order it
-			// is handed.
+			// is handed. It keeps the refs the effect names and reads the text
+			// from the register's table when asked.
 			index.Apply(dl.Seq, dl.Effect.(IndexReferences))
 			applied++
 			return nil
@@ -70,7 +71,7 @@ func TestIndexTextDoesNotGoBackwardsOnARetriedEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := indexText(state)
+	want := svc.Content.Text(state.Title)
 	if got := index.Text(id); got != want {
 		t.Fatalf("the index holds %q, but the decision's text is %q", got, want)
 	}

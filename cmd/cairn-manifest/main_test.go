@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -42,7 +43,7 @@ func TestExtractReadsEverything(t *testing.T) {
 		"status: string",                         // a named string is a string
 		"-: string",                              // json:"-," names the field "-"
 		"Untagged: int",                          //
-		"extra?: map[string]string",              // omitzero
+		"extra?zero: map[string]string",          // omitzero
 		"count: string(int)",                     // ,string writes the number inside a string
 		"labels: []string",                       // ,string applies only to scalars
 		"inline: {a: int}",                       // not addressable: the pointer marshaler is unused
@@ -189,6 +190,139 @@ func TestExtractRefusesToGuess(t *testing.T) {
 	if n := strings.Count(err.Error(), "\n") + 1; n != 11 {
 		t.Errorf("got %d errors, want 11:\n%v", n, err)
 	}
+}
+
+// A registration repeated in files one build includes together is a duplicate
+// even when the second file is also constrained: every linux/amd64 build sees
+// both calls.
+func TestExtractRefusesCodecRegisteredInBuildsOneBuildSelects(t *testing.T) {
+	dir := codecBuildModule(t, codecBuildEvents+codecBuildCreated, map[string]string{
+		"linux.go": registerOnlyInBuild("linux", "Created", 1),
+		"amd64.go": registerOnlyInBuild("linux && amd64", "Created", 1),
+	})
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("a codec registered in two files one build includes together must be refused")
+	}
+	for _, want := range []string{"builds.created", "is also registered at", "linux.go", "amd64.go"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in:\n%v", want, err)
+		}
+	}
+}
+
+// Two calls no build includes together are one registration only when they say
+// the same thing. A different version, type or field shape is refused naming
+// both files and the disagreement, rather than folded into one entry.
+func TestExtractRefusesCodecRegistrationsThatDisagree(t *testing.T) {
+	path := "Path string `json:\"path\"`"
+	for _, tc := range []struct {
+		name           string
+		linux, windows string
+		want           []string
+	}{
+		{
+			"version",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Created", path, 2),
+			[]string{"version 1", "version 2"},
+		},
+		{
+			"type",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Published", path, 1),
+			[]string{"example.com/builds.Created", "example.com/builds.Published", "type "},
+		},
+		{
+			"field shape",
+			registerInBuild("linux", "Created", path, 1),
+			registerInBuild("windows", "Created", "Name string `json:\"name\"`", 1),
+			[]string{"fields [", "path: string", "name: string"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := codecBuildModule(t, codecBuildEvents, map[string]string{"linux.go": tc.linux, "windows.go": tc.windows})
+			_, err := Extract(dir, "./...")
+			if err == nil {
+				t.Fatal("codec registrations that disagree under one name must be refused")
+			}
+			for _, want := range append([]string{"builds.created", "linux.go", "windows.go", "disagree"}, tc.want...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("missing %q in:\n%v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// codecBuildModule writes a module whose shared file is events, with the given
+// platform files registering into it.
+func codecBuildModule(t *testing.T, events string, files map[string]string) string {
+	t.Helper()
+	files["events.go"] = events
+	return writeModule(t, `module example.com/builds
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, files)
+}
+
+const codecBuildEvents = `package builds
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+func Codecs() *codec.Codec[Event] { return codecs }
+
+var codecs = codec.New[Event]()
+`
+
+const codecBuildCreated = `
+type Created struct {
+	Path string ` + "`json:\"path\"`" + `
+}
+
+func (Created) isEvent() {}
+`
+
+// registerOnlyInBuild writes a file selecting build that registers an existing
+// type under one name.
+func registerOnlyInBuild(build, typ string, version int) string {
+	return fmt.Sprintf(`//go:build %s
+
+package builds
+
+import "github.com/anyweez/cairn/codec"
+
+func init() {
+	codec.Register[%s, Event](Codecs(), "builds.created", %d)
+}
+`, build, typ, version)
+}
+
+// registerInBuild writes a file selecting build that registers typ under one
+// name.
+func registerInBuild(build, typ, fields string, version int) string {
+	return fmt.Sprintf(`//go:build %s
+
+package builds
+
+import "github.com/anyweez/cairn/codec"
+
+type %s struct {
+	%s
+}
+
+func (%s) isEvent() {}
+
+func init() {
+	codec.Register[%s, Event](Codecs(), "builds.created", %d)
+}
+`, build, typ, fields, typ, typ, version)
 }
 
 // A registration reached through a generic helper writes the helper's type
@@ -379,6 +513,44 @@ func TestRunChecksTheBaseAcrossPlatforms(t *testing.T) {
 	}
 }
 
+// A stored type, or an upcaster, can move between builds without changing its
+// name, version or shape. The whole-module manifest is identical either way, so
+// the build membership the extractor records is the only place -base can see
+// that a platform lost the code path that reads its entries.
+func TestIncompatibleBuildMembership(t *testing.T) {
+	codec := func(build string, upcasts []int, upcastBuilds []UpcastBuild) Codec {
+		return Codec{Sum: "x.Event", Name: "x.happened", Version: 2, Build: build, Upcasts: upcasts, UpcastBuilds: upcastBuilds}
+	}
+	for _, tc := range []struct {
+		name     string
+		old, now Codec
+		want     string
+	}{
+		{"registration unchanged in a constrained build", codec("linux", nil, nil), codec("linux", nil, nil), ""},
+		{"registration moved to another platform", codec("linux", nil, nil), codec("!linux", nil, nil), "moved out of a build that stored it"},
+		{"registration narrowed to one architecture", codec("linux", nil, nil), codec("linux && amd64", nil, nil), "moved out of a build that stored it"},
+		{"registration widened to every build", codec("linux", nil, nil), codec("", nil, nil), ""},
+		{"registration widened to everything but windows", codec("linux", nil, nil), codec("!windows", nil, nil), ""},
+		{"registration narrowed off an OS it implies", codec("linux", nil, nil), codec("linux && !android", nil, nil), "moved out of a build that stored it"},
+		{"registration widened to unix", codec("linux", nil, nil), codec("unix", nil, nil), ""},
+		{"registration narrowed behind a free tag", codec("tools", nil, nil), codec("tools && linux", nil, nil), "moved out of a build that stored it"},
+		{"registration widened off a free tag", codec("tools && linux", nil, nil), codec("tools", nil, nil), ""},
+		{"registration narrowed off darwin's implied OS", codec("darwin", nil, nil), codec("darwin && !ios", nil, nil), "moved out of a build that stored it"},
+		{"registration narrowed from every build", codec("", nil, nil), codec("windows", nil, nil), "moved out of a build that stored it"},
+		{"upcaster unchanged in a constrained build", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), ""},
+		{"upcaster moved to another platform", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "linux"}}), codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "windows"}}), "upcaster from version 1 is registered only in"},
+		{"one of two upcasters moved", codec("", []int{1, 2}, nil), codec("", []int{1, 2}, []UpcastBuild{{Version: 2, Build: "windows"}}), "upcaster from version 2"},
+		{"upcaster widened to every build", codec("", []int{1}, []UpcastBuild{{Version: 1, Build: "windows"}}), codec("", []int{1}, nil), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Join(Incompatible(&Manifest{Codecs: []Codec{tc.old}}, &Manifest{Codecs: []Codec{tc.now}}), "\n")
+			if tc.want == "" && got != "" || !strings.Contains(got, tc.want) {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIncompatible(t *testing.T) {
 	codec := func(version int, fields []string, upcasts ...int) Codec {
 		return Codec{Sum: "x.Event", Name: "x.happened", Version: version, Fields: fields, Upcasts: upcasts}
@@ -419,6 +591,11 @@ func TestIncompatible(t *testing.T) {
 		{"nested field added", one("o: {a: string}"), one("o: {a: string, b: int}"), "changed shape without a version bump"},
 		{"nested field removed", one("o: {a: string, b: int}"), one("o: {a: string}"), "changed shape without a version bump"},
 		{"nested omitempty added", one("o: {a: string}"), one("o: {a?: string}"), "changed shape without a version bump"},
+		{"nested omitzero added", one("o: {a: string}"), one("o: {a?zero: string}"), "changed shape without a version bump"},
+		// omitempty and omitzero omit different values, so a switch between
+		// them is a wire change the -base check must report.
+		{"nested omitempty switched to omitzero", one("o: {a?: string}"), one("o: {a?zero: string}"), "changed shape without a version bump"},
+		{"nested omitzero added to omitempty", one("o: {a?: string}"), one("o: {a?empty,zero: string}"), "changed shape without a version bump"},
 		{"nested string option added", one("o: {a: int}"), one("o: {a: string(int)}"), "changed shape without a version bump"},
 		{"nested reorder hides a rename", one("o: {a: string, b: int}"), one("o: {b: int, c: string}"), "changed shape without a version bump"},
 	} {
@@ -428,5 +605,35 @@ func TestIncompatible(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A sum the runtime names differently after a rendering fix describes the same
+// stored type: entries are keyed by the codec name, which did not change. A
+// base manifest written before the fix must not read as a removal.
+func TestIncompatibleAcceptsARecorrectedSum(t *testing.T) {
+	fields := []string{"a: string"}
+	old := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(x int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	now := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	if problems := Incompatible(old, now); len(problems) > 0 {
+		t.Fatalf("Incompatible reports %q for a corrected sum spelling; the stored type is unchanged", problems)
+	}
+}
+
+// A codec name is unique only within a sum, so two sums can both have stored an
+// entry under one name. When the base holds both and the manifest keeps one,
+// the fallback for a respelled sum must not pair the dropped entry with the
+// survivor that the base already lists: that is a removal, not a renaming.
+func TestIncompatibleReportsARemovalBesideARespelledSum(t *testing.T) {
+	fields := []string{"a: string"}
+	old := &Manifest{Codecs: []Codec{
+		{Sum: "x.First", Name: "x.happened", Version: 1, Fields: fields},
+		{Sum: "x.Second", Name: "x.happened", Version: 1, Fields: fields},
+	}}
+	now := &Manifest{Codecs: []Codec{
+		{Sum: "x.First", Name: "x.happened", Version: 1, Fields: fields},
+	}}
+	if got, want := strings.Join(Incompatible(old, now), "\n"), "x.happened (x.Second) was removed"; !strings.Contains(got, want) {
+		t.Fatalf("Incompatible reports %q, want %q: the entry the manifest dropped is a removal", got, want)
 	}
 }

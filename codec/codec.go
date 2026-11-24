@@ -56,11 +56,15 @@ func New[T any]() *Codec[T] {
 
 // Register adds V to c under name, at version (1 for a type that has never
 // changed shape). V must implement T. Register panics on a duplicate name or
-// type: registration happens once, at startup, and a mistake there is a bug.
+// type, and on a name the ledger cannot store: registration happens once, at
+// startup, and a mistake there is a bug.
 func Register[V, T any](c *Codec[T], name string, version int) {
 	var zero V
 	if _, ok := any(zero).(T); !ok {
 		panic(fmt.Sprintf("codec: %T does not implement %s", zero, reflect.TypeFor[T]()))
+	}
+	if !cairn.StorableText(name) {
+		panic(fmt.Sprintf("codec: %q is not valid UTF-8 or contains a NUL, so the ledger cannot store it", name))
 	}
 	if version < 1 {
 		panic(fmt.Sprintf("codec: %s: version must be at least 1", name))
@@ -134,17 +138,24 @@ func (e *NotStorableError) Error() string {
 // through its JSON encoding, because json.Marshal reports a year it cannot
 // write only at encode time and rounds a zone offset with seconds in it to
 // the minute without reporting anything, storing an instant that was never
-// sent.
+// sent. A time used as a map key is checked through its MarshalText round
+// trip instead, because that is how json writes and reads an object key.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalText
 // is checked through the text it returns, because json writes it through its
 // own string encoder rather than verbatim. A type with its own MarshalJSON
 // decides its own encoding, so the Go value behind it is not inspected; the
-// bytes it returns are, because json.Marshal copies them into the entry and
-// jsonb's alphabet is narrower than JSON's. A MarshalText or MarshalJSON on
+// bytes it returns are, because json.Marshal copies them into the entry, where
+// jsonb's alphabet is narrower than JSON's, and because a marshaler built on an
+// inner json.Marshal reports a byte it could not decode as a replacement
+// character rather than failing. A MarshalText or MarshalJSON on
 // the pointer to the value counts too wherever json reaches the value
 // addressably, which is a slice or array element, or a field of a struct
-// behind a pointer.
+// behind a pointer. A value that carries a time — a time.Time, a type defined
+// over one, a struct embedding one — is held to the instant-survival round
+// trip whenever its encoding is time's own RFC 3339, whichever of the two
+// marshallers writes it; a type that encodes its time some other way has an
+// encoding of its own, and only its text is checked.
 func CheckStorable(v any) error {
 	return checkStorable(reflect.ValueOf(v), "value", map[visit]bool{})
 }
@@ -203,7 +214,7 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 			return checkStorableMarshaler(addr, path)
 		}
 		if _, ok := addr.Interface().(encoding.TextMarshaler); ok {
-			_, err := renderStorableText(addr, path)
+			_, err := renderStorableTextValue(addr, path)
 			return err
 		}
 	}
@@ -217,7 +228,7 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 			if jsonNil(v) {
 				return nil
 			}
-			_, err := renderStorableText(v, path)
+			_, err := renderStorableTextValue(v, path)
 			return err
 		}
 	}
@@ -485,6 +496,9 @@ func validJSONTag(s string) bool {
 // replaces bytes that are not valid UTF-8 with U+FFFD, exactly as it does for
 // a string value, so the key text needs the same check. A string-kind key is
 // checked as its string, because json ignores a MarshalText on such a type.
+// A key that renders a time through time's own RFC 3339 text needs more than
+// its text checked: the offset in that text is whole minutes, so a key with
+// seconds in its offset decodes as a different instant.
 func checkMapKey(k reflect.Value, path string) (string, error) {
 	if k.Kind() == reflect.String {
 		if !cairn.StorableText(k.String()) {
@@ -500,7 +514,7 @@ func checkMapKey(k reflect.Value, path string) (string, error) {
 			if jsonNil(k) {
 				return "", nil
 			}
-			return renderStorableText(k, path)
+			return renderStorableTextValue(k, path)
 		}
 	}
 	// An integer key becomes its decimal form, which is always storable. The
@@ -518,61 +532,159 @@ const offsetSecondsLayout = "2006-01-02T15:04:05.999999999-07:00:00"
 // checkStorableMarshaler calls v's MarshalJSON and checks the bytes jsonb will
 // be handed. A nil pointer is storable because json writes null and never
 // calls the method, and a marshaller that fails is left to Encode's own
-// json.Marshal, which reports that failure once. A time.Time is the exception:
-// its marshaller both fails on a value json cannot write and silently moves
-// one whose zone offset it rounds, so it is checked by the round trip.
+// json.Marshal, which reports that failure once. A value carrying a time is
+// the exception: time's own marshaller both fails on a value json cannot write
+// — a year outside [0,9999], a timezone hour outside [0,23] — and silently
+// moves one whose zone offset it rounds, so a time it writes is held to the
+// round trip.
 func checkStorableMarshaler(v reflect.Value, path string) error {
 	if jsonNil(v) {
 		return nil
 	}
-	if t, ok := asTime(v); ok {
-		return checkStorableTime(t, path)
-	}
+	t, isTime := carriedTime(v)
 	data, err := v.Interface().(json.Marshaler).MarshalJSON()
 	if err != nil {
+		if !isTime {
+			return nil
+		}
+		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot write (%v)", err)}
+	}
+	if err := checkMarshalledJSON(data, path); err != nil {
+		return err
+	}
+	if !isTime {
 		return nil
 	}
-	return checkMarshalledJSON(data, path)
+	return checkMarshalledTime(data, t, path)
 }
 
-// asTime returns the time.Time v holds, for a value, a pointer to one, or
-// either of those behind an interface — the walk reaches a time held in an
-// `any`, as in Meta.Extra, as the interface value itself.
-func asTime(v reflect.Value) (time.Time, bool) {
+// checkMarshalledTime reports whether a value carrying t is written as the
+// instant it holds. Only a JSON string holding RFC 3339 is time's own
+// encoding: a type that writes its time another way — a date, null, an object
+// around it — has an encoding of its own, and only the bytes are checked.
+func checkMarshalledTime(data []byte, t time.Time, path string) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return nil
+	}
+	var back time.Time
+	if err := back.UnmarshalText([]byte(text)); err != nil {
+		return nil
+	}
+	return checkTimeSurvived(t, back, path)
+}
+
+// checkTimeSurvived reports a time that time's encoding writes as a different
+// instant. Both of time's encodings carry a zone offset only to the minute, so
+// an offset with seconds in it decodes as a value that is not Equal to the one
+// sent, with no error along the way. A type that writes its time at a coarser
+// RFC 3339 precision loses the fraction of a second instead, and the refusal
+// says which part moved so the caller is not sent after the wrong cause.
+func checkTimeSurvived(t, back time.Time, path string) error {
+	if back.Equal(t) {
+		return nil
+	}
+	if t.Truncate(time.Second).Equal(back) {
+		return &NotStorableError{Path: path, Why: fmt.Sprintf(
+			"it is %s, whose encoding drops the fraction of a second, so it would be stored as %s",
+			t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
+	}
+	return &NotStorableError{Path: path, Why: fmt.Sprintf(
+		"it is %s, whose zone offset time's encoding writes only to the minute, so it would be stored as %s",
+		t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
+}
+
+// carriedTime returns the instant a value carries: the value itself when it is
+// a time.Time, a pointer to one, a named type whose underlying type is
+// time.Time, or a struct with one of those embedded in an exported field,
+// which is how a named type delegates its encoding to time. A value or a map
+// key both reach it, as does either behind an interface — the walk reaches a
+// time held in an `any`, as in Meta.Extra, as the interface value itself. The
+// caller still has to tell that delegation from a type with an encoding of its
+// own.
+func carriedTime(v reflect.Value) (time.Time, bool) {
 	for v.Kind() == reflect.Interface && !v.IsNil() {
 		v = v.Elem()
 	}
-	if v.Type() == timeType {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return time.Time{}, false
+		}
+		return carriedTime(v.Elem())
+	}
+	return valueTime(v)
+}
+
+// valueTime returns the instant an addressable, non-pointer value carries, for
+// the shapes carriedTime lists.
+func valueTime(v reflect.Value) (time.Time, bool) {
+	t := v.Type()
+	if t == timeType {
 		return v.Interface().(time.Time), true
 	}
-	if v.Kind() == reflect.Pointer && v.Type().Elem() == timeType {
-		return v.Elem().Interface().(time.Time), true
+	if t.ConvertibleTo(timeType) {
+		return v.Convert(timeType).Interface().(time.Time), true
+	}
+	if t.Kind() != reflect.Struct {
+		return time.Time{}, false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.Anonymous || f.PkgPath != "" {
+			// An unexported embedded field cannot be read through reflect, so
+			// a time behind one is left to Encode's json.Marshal.
+			continue
+		}
+		fv, ft := v.Field(i), f.Type
+		if ft.Kind() == reflect.Pointer {
+			if fv.IsNil() {
+				continue
+			}
+			fv, ft = fv.Elem(), ft.Elem()
+		}
+		switch {
+		case ft == timeType:
+			return fv.Interface().(time.Time), true
+		case ft.ConvertibleTo(timeType):
+			return fv.Convert(timeType).Interface().(time.Time), true
+		}
 	}
 	return time.Time{}, false
 }
 
-// checkStorableTime reports whether t is stored as the instant it is. A
-// time.Time encodes itself, so the walk reaches it here rather than as a
-// struct, and the check is the encoding/json round trip rather than a copy of
-// its rules: MarshalJSON refuses a year outside [0,9999] and a timezone hour
-// outside [0,23], and writes a zone offset only to the minute, so an offset
-// with seconds in it (every tzdata zone before about 1900) comes back as a
-// different instant with no error at all.
-func checkStorableTime(t time.Time, path string) error {
-	data, err := t.MarshalJSON()
+// renderStorableTextValue returns the text json writes for a value or map key
+// that implements encoding.TextMarshaler, and refuses text the ledger cannot
+// store. A value that carries a time is held to the instant its text survives:
+// json writes an object key through MarshalText and reads it back with
+// UnmarshalText, and it writes a value through the same encoder, so both have
+// the same round trip.
+func renderStorableTextValue(v reflect.Value, path string) (string, error) {
+	if t, ok := carriedTime(v); ok {
+		return renderStorableTimeText(v, t, path)
+	}
+	return renderStorableText(v, path)
+}
+
+// renderStorableTimeText checks a value or map key whose text is time's own
+// RFC 3339 text, and returns that text for the value's path. A text that does
+// not parse as a time is a time-like type with an encoding of its own; only its
+// text is checked.
+func renderStorableTimeText(v reflect.Value, t time.Time, path string) (string, error) {
+	text, err := v.Interface().(encoding.TextMarshaler).MarshalText()
 	if err != nil {
-		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot write (%v)", err)}
+		return "", &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot write (%v)", err)}
+	}
+	if !cairn.StorableText(string(text)) {
+		return "", &NotStorableError{Path: path}
 	}
 	var back time.Time
-	if err := json.Unmarshal(data, &back); err != nil {
-		return &NotStorableError{Path: path, Why: fmt.Sprintf("it is a time encoding/json cannot read back (%v)", err)}
+	if err := back.UnmarshalText(text); err != nil {
+		return string(text), nil
 	}
-	if !back.Equal(t) {
-		return &NotStorableError{Path: path, Why: fmt.Sprintf(
-			"it is %s, whose zone offset JSON writes only to the minute, so it would be stored as %s",
-			t.Format(offsetSecondsLayout), back.Format(offsetSecondsLayout))}
+	if err := checkTimeSurvived(t, back, path); err != nil {
+		return "", err
 	}
-	return nil
+	return string(text), nil
 }
 
 // checkMarshalledJSON reports whether the JSON a MarshalJSON returned can be
@@ -582,6 +694,20 @@ func checkStorableTime(t time.Time, path string) error {
 // sequence (SQLSTATE 22021), and a NUL or an unpaired UTF-16 surrogate escape
 // is rejected as an unsupported Unicode escape (SQLSTATE 22P05). The bytes are
 // the type's to decide, but what jsonb can keep is not.
+//
+// The replacement-character escape is refused for a different reason, and it
+// is the one refusal here that can be a false positive. A marshaler built on
+// an inner json.Marshal — `type plain T; return json.Marshal(plain(v))` — has
+// that encoder replace each invalid byte with \ufffd, so the bytes that come
+// back are valid JSON and jsonb accepts them: the entry holds a replacement
+// character where the caller's byte was, text the caller never sent.
+// encoding/json never escapes a genuine U+FFFD rune — it writes it raw, as its
+// three UTF-8 bytes — and escapes no other rune as \ufffd, so in bytes it
+// produced the escape means it replaced something. A marshaler may return
+// bytes another encoder wrote, though: a json.RawMessage from Python's default
+// json.dumps escapes every non-ASCII rune, so a genuine U+FFFD arrives as
+// \ufffd, and jsonb would store it faithfully. The codec cannot tell the two
+// apart, so it refuses both rather than let a replaced byte through.
 func checkMarshalledJSON(data []byte, path string) error {
 	if !utf8.Valid(data) {
 		return &NotStorableError{Path: path}
@@ -603,8 +729,12 @@ func checkMarshalledJSON(data []byte, path string) error {
 			return nil
 		}
 		switch {
-		case u == 0, u >= 0xdc00 && u <= 0xdfff:
-			// A NUL, or a low surrogate with no high surrogate before it.
+		case u == 0, u == utf8.RuneError, u >= 0xdc00 && u <= 0xdfff:
+			// A NUL; a replacement-character escape; or a low surrogate with
+			// no high surrogate before it. In bytes encoding/json produced
+			// the escape stands in for a byte it could not decode, but another
+			// encoder may have written a genuine U+FFFD that way, and the two
+			// are indistinguishable here; both are refused.
 			return &NotStorableError{Path: path}
 		case u >= 0xd800 && u <= 0xdbff:
 			// A high surrogate is storable only as half of a pair.
@@ -819,12 +949,14 @@ func sortRegistrations(rs []Registration) {
 
 // goTypeString renders a runtime type as go/types does for the manifest: a
 // named type with its full import path, a basic type by name, an unnamed type
-// in go/types' own spelling. reflect's Type.String is not that spelling — it
-// writes `interface {}` and `struct { X int }` where go/types writes `any` and
-// `struct{X int}` — so an unnamed composite is built here rather than borrowed
-// from it. `cmd/cairn-manifest` renders the other half with types.TypeString,
-// and a sum type the two name differently fails codec.CheckRegistrations in
-// both directions for one correct codec.
+// in go/types' own spelling, and an instantiated generic's type arguments
+// separated as go/types separates them. reflect's Type.String is not that
+// spelling — it writes `interface {}` and `struct { X int }` where go/types
+// writes `any` and `struct{X int}`, and joins a generic's type arguments with
+// "," where go/types writes ", " — so an unnamed composite is built here and a
+// name is normalized rather than borrowed from it. `cmd/cairn-manifest` renders
+// the other half with types.TypeString, and a sum type the two name differently
+// fails codec.CheckRegistrations in both directions for one correct codec.
 func goTypeString(t reflect.Type) string {
 	// A defined type is named however its kind looks: `type Listing []string`
 	// is example.com/x.Listing to go/types, not []string. Ask for the name
@@ -832,9 +964,9 @@ func goTypeString(t reflect.Type) string {
 	// cross-check names a different type than the static half.
 	if t.Name() != "" {
 		if t.PkgPath() == "" {
-			return t.Name()
+			return goTypeArgsString(t.Name())
 		}
-		return t.PkgPath() + "." + t.Name()
+		return goTypeArgsString(t.PkgPath() + "." + t.Name())
 	}
 	switch t.Kind() {
 	case reflect.Pointer:
@@ -861,6 +993,54 @@ func goTypeString(t reflect.Type) string {
 		return goInterfaceString(t)
 	}
 	return t.String()
+}
+
+// goTypeArgsString rewrites the type-argument list of an instantiated generic
+// name in go/types' spelling. reflect renders `Pair[Key,string]` where go/types
+// writes `Pair[Key, string]`, so without this a generic sum is named differently
+// by the two halves of the manifest cross-check. reflect exposes the type
+// arguments only as the text of Name(), so each is rewritten in place; recursing
+// into an argument reaches a multi-argument instantiation nested inside another.
+func goTypeArgsString(name string) string {
+	open := strings.IndexByte(name, '[')
+	if open < 0 {
+		return name
+	}
+	args, end, ok := splitTypeArgs(name, open)
+	if !ok {
+		return name
+	}
+	for i, arg := range args {
+		args[i] = goTypeArgsString(strings.TrimSpace(arg))
+	}
+	return name[:open+1] + strings.Join(args, ", ") + name[end:]
+}
+
+// splitTypeArgs splits the type-argument list that starts at name[open] and
+// returns its arguments with the index of the closing bracket. Brackets,
+// parens and braces are counted so a comma inside a nested list is not a
+// separator.
+func splitTypeArgs(name string, open int) ([]string, int, bool) {
+	depth := 0
+	start := open + 1
+	var args []string
+	for i := open; i < len(name); i++ {
+		switch c := name[i]; c {
+		case '[', '(', '{':
+			depth++
+		case ']', ')', '}':
+			depth--
+			if depth == 0 {
+				return append(args, name[start:i]), i, true
+			}
+		case ',':
+			if depth == 1 {
+				args = append(args, name[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 // goInterfaceString writes an interface as `any` or `interface{M() int}`.

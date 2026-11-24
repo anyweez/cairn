@@ -119,6 +119,23 @@ func TestRegisterRejectsTypesOutsideTheSum(t *testing.T) {
 	codec.Register[struct{ X int }](codec.New[shape](), "nope", 1)
 }
 
+func TestRegisterRejectsANameTheLedgerCannotStore(t *testing.T) {
+	for name, bad := range map[string]string{
+		"invalid utf8": "circle\xff",
+		"nul":          "cir\x00cle",
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				p := recover()
+				if p == nil || !strings.Contains(p.(string), "cannot store") {
+					t.Fatalf("expected a panic naming the unstorable name, got %v", p)
+				}
+			}()
+			codec.Register[circle](codec.New[shape](), bad, 1)
+		})
+	}
+}
+
 func TestRegistrationsDescribeTheCodec(t *testing.T) {
 	c := codec.New[shape]()
 	codec.Register[square](c, "square", 2)
@@ -185,6 +202,17 @@ type namedPair [2]string
 type namedCount *int
 type namedList[T any] []T
 
+// A generic sum is named by go/types with ", " between its type arguments;
+// reflect renders the same list with ",".
+type pairSum[A, B any] interface{ isPairSum() }
+type tripleSum[A, B, C any] interface{ isTripleSum() }
+type twoArgSlice[A, B any] []A
+
+type pairItem struct{}
+
+func (pairItem) isPairSum()   {}
+func (pairItem) isTripleSum() {}
+
 func sumNameOf[T any](t *testing.T) string {
 	t.Helper()
 	c := codec.New[T]()
@@ -220,6 +248,33 @@ func TestRegistrationsNameADefinedCompositeAsGoTypesDoes(t *testing.T) {
 	}
 }
 
+// An instantiated generic is named by go/types with ", " between its type
+// arguments, and reflect's Name renders the same list with ",". The extractor
+// records the go/types spelling, so without normalizing it the runtime half of
+// the cross-check reports one correct generic sum as both missing from the
+// manifest and extra in the codecs. Each case compares against go/types' answer
+// for the same source expression, nested instantiations included.
+func TestRegistrationsNameAnInstantiatedGenericAsGoTypesDoes(t *testing.T) {
+	const pkg = "github.com/anyweez/cairn/codec_test"
+	for _, tc := range []struct {
+		name string
+		expr string
+		sum  func(*testing.T) string
+	}{
+		{"two type arguments", "pairSum[namedListing, string]", sumName[pairItem, pairSum[namedListing, string]]},
+		{"three type arguments", "tripleSum[namedListing, string, int]", sumName[pairItem, tripleSum[namedListing, string, int]]},
+		{"a nested two-argument instantiation", "pairSum[pairSum[namedListing, int], string]", sumName[pairItem, pairSum[pairSum[namedListing, int], string]]},
+		{"a two-argument instantiation of a defined slice", "twoArgSlice[namedListing, string]", sumName[twoArgSlice[namedListing, string], twoArgSlice[namedListing, string]]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := goTypesName(t, pkg, tc.expr)
+			if got := tc.sum(t); got != want {
+				t.Errorf("sum: got %q, go/types says %q", got, want)
+			}
+		})
+	}
+}
+
 type hasM struct{}
 
 func (hasM) M() int { return 0 }
@@ -229,11 +284,15 @@ type hasTwo struct{}
 func (hasTwo) M() int   { return 0 }
 func (hasTwo) N(string) {}
 
+type namedParams struct{}
+
+func (namedParams) Accept(x int, done func(n int) error) (err error) { return nil }
+
 // goTypesName type-checks a type expression the way cmd/cairn-manifest reads a
 // sum and returns the string it records for it.
 func goTypesName(t *testing.T, pkg, expr string) string {
 	t.Helper()
-	src := "package codec_test\n\ntype namedListing []string\n\ntype hasM struct{}\n\nfunc (hasM) M() int { return 0 }\n\nvar _ " + expr + "\n"
+	src := "package codec_test\n\ntype namedListing []string\n\ntype pairSum[A, B any] interface{ isPairSum() }\n\ntype tripleSum[A, B, C any] interface{ isTripleSum() }\n\ntype twoArgSlice[A, B any] []A\n\ntype hasM struct{}\n\nfunc (hasM) M() int { return 0 }\n\nvar _ " + expr + "\n"
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "sum.go", src, 0)
 	if err != nil {
@@ -276,6 +335,9 @@ func TestRegistrationsNameAnUnnamedTypeAsGoTypesDoes(t *testing.T) {
 	}{
 		{"the empty interface", "any", sumName[struct{ N int }, any]},
 		{"an interface with a method", "interface{ M() int }", sumName[hasM, interface{ M() int }]},
+		{"an interface with named parameters", "interface{Accept(int, func(int) error) error}", sumName[namedParams, interface {
+			Accept(x int, done func(n int) error) (err error)
+		}]},
 		{"an interface with two methods", "interface{ M() int; N(string) }", sumName[hasTwo, interface {
 			M() int
 			N(string)

@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -80,6 +79,11 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	// ever applying. Any other established rule that never applies in a full
 	// Check fails it: the generator never reaches the rule, so it proves
 	// nothing.
+	//
+	// An ID may name only one rule. An entry whose ID two different rules
+	// carry is refused rather than exempting both, since the checker cannot
+	// tell which of them was meant. The same rule value reached by more than
+	// one check is one rule, so listing its ID is unambiguous.
 	AllowVacuous []string
 }
 
@@ -190,12 +194,17 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		trace = append(trace, fmt.Sprintf("%d. %s", step, describe(msg)))
 
 		before := fingerprint(state)
-		first, ok := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
+		// Each call gets its own copy of the message as sent, the way the
+		// ledger gives Decide the value it decoded from the caller's envelope.
+		// One live value shared by both calls would answer "did the first call
+		// change its input?" under D1's name; msg stays as sent for the trace
+		// and the codec round trip, which is what the ledger stores.
+		first, ok := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, clone(msg)) })
 		j(Total, spec.Check(ok, "Decide panicked on %+v: %v", msg, first.panic))
 		decision := first.value
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state for %+v", msg))
 
-		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, msg) })
+		second, secondOK := guard(func() cairn.Decision[R, Ev, Ef] { return m.Decider.Decide(state, clone(msg)) })
 		j(Total, spec.Check(secondOK, "Decide panicked on its second call with %+v: %v", msg, second.panic))
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state on its second call for %+v", msg))
 		if ok && secondOK {
@@ -299,7 +308,10 @@ func (m Machine[S, M, R, Ev, Ef]) checkSnapshot(j func(spec.Rule, spec.Verdict),
 		if err == nil {
 			err = json.Unmarshal(data, &back)
 		}
-		return spec.Check(err == nil && m.Equal(state, back), "state %+v came back as %+v (%v)", state, back, err)
+		if err == nil && m.Equal(state, back) {
+			return spec.Pass
+		}
+		return spec.Fail("state %s came back as %s (%v)", describeRoundTrip(state), describeRoundTrip(back), err)
 	}))
 }
 
@@ -360,7 +372,10 @@ func roundTripMaybeRefused[T any](c *codec.Codec[T], v T, refused bool) spec.Ver
 	if err != nil {
 		return spec.Fail("%v", err)
 	}
-	return spec.Check(codec.EqualRoundTripped(v, back), "%+v came back as %+v", v, back)
+	if codec.EqualRoundTripped(v, back) {
+		return spec.Pass
+	}
+	return spec.Fail("%s came back as %s", describeRoundTrip(v), describeRoundTrip(back))
 }
 
 // describe renders a value with its type's short name, so a trace reads
@@ -670,30 +685,45 @@ func (m Machine[S, M, R, Ev, Ef]) kindsMatch(t rapid.TB) bool {
 	return ok
 }
 
-// declares reports whether the machine declares any rule with this ID.
-func (r *report) declares(id string) bool {
+// declares returns the rules the machine declares under this ID, one per
+// distinct rule value, in declaration order.
+func (r *report) declares(id string) []spec.Rule {
+	var declared []spec.Rule
 	for _, rule := range r.order {
 		if rule.ID == id {
-			return true
+			declared = append(declared, rule)
 		}
 	}
-	return false
+	return declared
 }
 
 // gateVacuity fails t for every established rule that never applied, unless
 // allowed names it. Proposed rules only report, so their vacuity does too.
+//
+// A rule is identified by its whole value, so an AllowVacuous entry is only an
+// exemption when it names exactly one of the machine's rules. An entry whose
+// ID two different rules carry is refused, because exempting both would report
+// neither and silently prove less than the check claims.
 func (r *report) gateVacuity(t rapid.TB, allowed []string) {
 	t.Helper()
+	exempt := make(map[string]bool, len(allowed))
 	for _, id := range allowed {
-		if !r.declares(id) {
+		switch declared := r.declares(id); len(declared) {
+		case 0:
 			markViolation(t)
 			t.Errorf("AllowVacuous names %s, which is not one of the machine's rules", id)
+		case 1:
+			exempt[id] = true
+		default:
+			markViolation(t)
+			t.Errorf("AllowVacuous names %s, which %d different rules declare, so it cannot say which one may go unapplied (a rule is identified by its whole declaration, not only its ID)",
+				id, len(declared))
 		}
 	}
 	var vacuous []*tally
 	for _, rule := range r.order {
 		tl := r.rules[rule]
-		if tl.applied == 0 && tl.rule.Status == spec.Established && !slices.Contains(allowed, rule.ID) {
+		if tl.applied == 0 && tl.rule.Status == spec.Established && !exempt[rule.ID] {
 			vacuous = append(vacuous, tl)
 		}
 	}

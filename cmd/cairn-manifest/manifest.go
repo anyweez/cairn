@@ -44,15 +44,51 @@ type Codec struct {
 	Name    string `yaml:"name"`
 	Version int    `yaml:"version"`
 	Type    string `yaml:"type"`
+	// Build is the constraint the builds that register this codec share, when
+	// it is not registered in every build: "linux", "windows && amd64". It
+	// comes from the files the registration is written in, unioned when no
+	// build selects two of them, so a tree records the same membership on
+	// every host. Empty means every build. A build that does not register the
+	// codec cannot decode the entries it stored, so -base fails when this
+	// narrows.
+	Build string `yaml:"build,omitempty"`
 	// Upcasts lists the versions that have an upcaster to the next one.
 	Upcasts []int `yaml:"upcasts,omitempty"`
+	// UpcastBuilds records, for an upcaster registered in only some builds,
+	// the version it upcasts from and that build. An upcaster this does not
+	// list is registered in every build.
+	UpcastBuilds []UpcastBuild `yaml:"upcast_builds,omitempty"`
 	// Fields is the JSON shape of the type: one "name: shape" per field, with
-	// "?" after the name of an omitempty field. A literal "?" in the name is
-	// doubled so it can't be read as that marker.
+	// the field's omission options after the name: "?" for omitempty, "?zero"
+	// for omitzero, and "?empty,zero" for both, since the three rules omit
+	// different values. A literal "?" in the name is doubled so it can't be
+	// read as that marker.
 	Fields []string `yaml:"fields"`
 }
 
+// UpcastBuild is one upcaster's build membership: the version it upcasts from,
+// and the constraint selecting the builds that register it.
+type UpcastBuild struct {
+	Version int    `yaml:"version"`
+	Build   string `yaml:"build"`
+}
+
 func (c Codec) key() string { return c.Sum + " " + c.Name }
+
+// upcastBuild returns the constraint the builds that register the upcaster
+// from version share, and whether the codec has one at all. An upcaster that is
+// not listed in UpcastBuilds is registered in every build.
+func (c Codec) upcastBuild(from int) (string, bool) {
+	if !slices.Contains(c.Upcasts, from) {
+		return "", false
+	}
+	for _, u := range c.UpcastBuilds {
+		if u.Version == from {
+			return u.Build, true
+		}
+	}
+	return "", true
+}
 
 // Table is one fsm table declared as a package-level variable.
 type Table struct {
@@ -75,8 +111,14 @@ type Edge struct {
 //
 // A file the current build context excludes is read in a build that includes it,
 // so the manifest is the whole module's spec and not the spec of the platform
-// the tool happens to run on. A file no build this tool can load includes is an
-// error naming the file and its constraint.
+// the tool happens to run on. A file that shares no build with the package
+// beside it is read with that package hidden, since the go command never
+// builds the two together. A file no build this tool can load includes is an
+// error naming the file and its constraint. A registration or an upcaster in a
+// file that only some builds select records that constraint, so -base can see
+// one that moved off a build that already stored its entries. A registration
+// written in more than one file no build includes together records the union of
+// their constraints, since every build that needs it still registers it.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -94,7 +136,7 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 
 	x := &extractor{
 		dir: dir, seen: map[string]bool{}, loaded: map[string][]string{},
-		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string]string{},
+		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string][]codecSite{},
 	}
 	x.extract(pkgs)
 	if len(x.errs) == 0 {
@@ -115,10 +157,20 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
 	}
 
+	// A codec registered once in each of several files no build includes
+	// together is one registration, and its membership is the union of those
+	// files' builds.
+	for key, sites := range x.codecAt {
+		x.codecs[key].Build = mergeBuilds(sites)
+	}
+
 	m := &Manifest{Rules: x.rules, Tables: x.tables, Codecs: []Codec{}}
 	for _, c := range x.codecs {
 		slices.Sort(c.Upcasts)
 		c.Upcasts = slices.Compact(c.Upcasts) // a version upcast twice is replaced, not chained
+		slices.SortFunc(c.UpcastBuilds, func(a, b UpcastBuild) int {
+			return cmp.Or(cmp.Compare(a.Version, b.Version), cmp.Compare(a.Build, b.Build))
+		})
 		m.Codecs = append(m.Codecs, *c)
 	}
 	if m.Rules == nil {
@@ -181,6 +233,17 @@ type upcast struct {
 	sum, name string
 	from      int
 	pos       string
+	// build is the constraint selecting the builds that register the upcaster,
+	// derived from the file the call is written in. Empty means every build.
+	build string
+}
+
+// codecSite is one codec.Register call: the build its file selects and where
+// it is written. A second call under the same sum and name is a duplicate only
+// if a build selects both, so the extractor keeps every call's membership.
+type codecSite struct {
+	build string
+	pos   string
 }
 
 // extract adds the declarations in pkgs to x. A package's files appear again in
@@ -237,7 +300,7 @@ type extractor struct {
 	ruleAt  map[string]string
 	tables  []Table
 	codecs  map[string]*Codec
-	codecAt map[string]string
+	codecAt map[string][]codecSite
 	upcasts []upcast
 	errs    []string
 }
@@ -289,9 +352,10 @@ func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
 	if strings.HasSuffix(name, "_test.go") {
 		return
 	}
+	build := fileBuild(name)
 	ast.Inspect(f, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
-			x.codecCall(p, call)
+			x.codecCall(p, call, build)
 		}
 		return true
 	})
@@ -415,7 +479,7 @@ func (x *extractor) table(p *packages.Package, ident *ast.Ident, value ast.Expr)
 	x.tables = append(x.tables, t)
 }
 
-func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
+func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build string) {
 	info := p.TypesInfo
 	switch {
 	case isFunc(info, call, codecPath, "Register"):
@@ -429,7 +493,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			return
 		}
 		v, sum := inst.TypeArgs.At(0), inst.TypeArgs.At(1)
-		subject := "codec.Register[" + types.TypeString(types.Unalias(v), nil) + "]"
+		subject := "codec.Register[" + typeString(v) + "]"
 		if !x.concrete(p, call.Pos(), v, subject, "the stored shape comes from the caller's type argument") {
 			return
 		}
@@ -448,19 +512,32 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 			// resolve both here or a registration through an alias is recorded
 			// under a name the running program does not have, and Sum and Type
 			// disagree about which one it is.
-			Sum:     types.TypeString(types.Unalias(sum), nil),
+			Sum:     typeString(sum),
 			Name:    constant.StringVal(name),
 			Version: int(n),
-			Type:    types.TypeString(types.Unalias(v), nil),
+			Type:    typeString(v),
+			Build:   build,
 			Fields:  fields(v),
 		}
 		at := x.position(p.Fset, call.Pos())
-		if prev, dup := x.codecAt[c.key()]; dup {
-			x.errorf(p.Fset, call.Pos(), "%s is also registered at %s", c.Name, prev)
+		key := c.key()
+		sites := x.codecAt[key]
+		for _, prev := range sites {
+			if buildsOverlap(prev.build, c.Build) {
+				x.errorf(p.Fset, call.Pos(), "%s is also registered at %s", c.Name, prev.pos)
+				return
+			}
+		}
+		if prev, ok := x.codecs[key]; ok {
+			if why := codecDisagreement(prev, c); why != "" {
+				x.errorf(p.Fset, call.Pos(), "%s is registered at %s, but the two calls disagree: %s", c.Name, sites[0].pos, why)
+				return
+			}
+			x.codecAt[key] = append(sites, codecSite{build: c.Build, pos: at})
 			return
 		}
-		x.codecAt[c.key()] = at
-		x.codecs[c.key()] = c
+		x.codecAt[key] = []codecSite{{build: c.Build, pos: at}}
+		x.codecs[key] = c
 	case isMethod(info, call, codecPath, "Codec", "Upcast"):
 		// The declaring receiver is *codec.Codec[T] whether the caller names it
 		// directly, through an alias, or promotes it from an embedded codec;
@@ -488,17 +565,57 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr) {
 		}
 		n, _ := constant.Int64Val(from)
 		x.upcasts = append(x.upcasts, upcast{
-			sum:  types.TypeString(types.Unalias(sum), nil),
-			name: constant.StringVal(name),
-			from: int(n),
-			pos:  x.position(p.Fset, call.Pos()),
+			sum:   typeString(sum),
+			name:  constant.StringVal(name),
+			from:  int(n),
+			pos:   x.position(p.Fset, call.Pos()),
+			build: build,
 		})
 	case unattributedUpcast(info, call):
 		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
 	}
 }
 
+// codecDisagreement explains why c cannot share a manifest entry with a call
+// already recorded under the same sum and name, or "" when the two agree. Calls
+// no build includes together are one registration only if they say the same
+// thing: one entry cannot carry two versions, types or field shapes.
+func codecDisagreement(prev, c *Codec) string {
+	switch {
+	case prev.Version != c.Version:
+		return fmt.Sprintf("version %d there and version %d here", prev.Version, c.Version)
+	case prev.Type != c.Type:
+		return fmt.Sprintf("type %s there and type %s here", prev.Type, c.Type)
+	case !sameFields(prev.Fields, c.Fields):
+		return fmt.Sprintf("fields [%s] there and [%s] here", strings.Join(prev.Fields, ", "), strings.Join(c.Fields, ", "))
+	}
+	return ""
+}
+
+// mergeBuilds returns the constraint selecting the builds any of sites selects.
+// The builds are sorted first so the same tree records the same union on every
+// host.
+func mergeBuilds(sites []codecSite) string {
+	builds := make([]string, len(sites))
+	for i, s := range sites {
+		builds[i] = s.build
+	}
+	slices.Sort(builds)
+	builds = slices.Compact(builds)
+	if len(builds) == 0 || builds[0] == "" {
+		return ""
+	}
+	union := builds[0]
+	for _, b := range builds[1:] {
+		union = orBuilds(union, b)
+	}
+	return union
+}
+
 func (x *extractor) upcastsToCodecs() {
+	// A version can be upcast from more than one file -- one per build that
+	// registers it -- so its membership is the union of those files' builds.
+	builds := map[string]map[int]string{}
 	for _, u := range x.upcasts {
 		c, ok := x.codecs[Codec{Sum: u.sum, Name: u.name}.key()]
 		if !ok {
@@ -506,6 +623,27 @@ func (x *extractor) upcastsToCodecs() {
 			continue
 		}
 		c.Upcasts = append(c.Upcasts, u.from)
+		byVersion := builds[c.key()]
+		if byVersion == nil {
+			byVersion = map[int]string{}
+			builds[c.key()] = byVersion
+		}
+		// A missing entry is not "every build": only a recorded empty
+		// constraint is. Combine only with another call's membership.
+		if prev, ok := byVersion[u.from]; ok {
+			byVersion[u.from] = orBuilds(prev, u.build)
+		} else {
+			byVersion[u.from] = u.build
+		}
+	}
+	for key, byVersion := range builds {
+		c := x.codecs[key]
+		for from, build := range byVersion {
+			if build == "" { // every build registers it, so there is nothing to record
+				continue
+			}
+			c.UpcastBuilds = append(c.UpcastBuilds, UpcastBuild{Version: from, Build: build})
+		}
 	}
 }
 
@@ -555,6 +693,132 @@ func typeParamIn(t types.Type, seen map[types.Type]bool) string {
 		}
 	}
 	return ""
+}
+
+// typeString renders t as the runtime names it, with every alias resolved and
+// the parameter names reflect cannot see dropped. reflect has no aliases, so
+// codec.Registration names the aliased type wherever one appears. It also has
+// no parameter names — an unnamed interface method or a function type is
+// exposed with their types only — so an expression written
+// `interface{Accept(x int) string}` is named `interface{Accept(int) string}`
+// by the runtime. A codec sum the two halves spell differently is read by
+// codec.CheckRegistrations as both missing from the manifest and extra in the
+// codecs, so the manifest records the reflection's spelling.
+func typeString(t types.Type) string {
+	return types.TypeString(unaliased(t), nil)
+}
+
+// unaliased returns t as reflect exposes it, including inside a type argument
+// or a composite: aliases resolved and the parameter and result names of a
+// function or interface method dropped. Names are kept wherever there is
+// nothing to drop, so the universe's empty interface stays the `any` go/types
+// prints rather than becoming a rebuilt `interface{}`.
+func unaliased(t types.Type) types.Type {
+	if u := types.Unalias(t); u != nil {
+		t = u
+	}
+	switch u := t.(type) {
+	case *types.Named:
+		return unaliasedNamed(u)
+	case *types.Pointer:
+		return types.NewPointer(unaliased(u.Elem()))
+	case *types.Slice:
+		return types.NewSlice(unaliased(u.Elem()))
+	case *types.Array:
+		return types.NewArray(unaliased(u.Elem()), u.Len())
+	case *types.Map:
+		return types.NewMap(unaliased(u.Key()), unaliased(u.Elem()))
+	case *types.Chan:
+		return types.NewChan(u.Dir(), unaliased(u.Elem()))
+	case *types.Signature:
+		return withoutParamNames(u)
+	case *types.Interface:
+		return unaliasedInterface(u)
+	case *types.Struct:
+		return unaliasedStruct(u)
+	}
+	return t
+}
+
+// unaliasedNamed rebuilds an instantiated generic around its runtime type
+// arguments; the runtime type of an instance has them resolved, and
+// types.TypeString would otherwise print the alias they were written with.
+func unaliasedNamed(n *types.Named) types.Type {
+	args := n.TypeArgs()
+	if args.Len() == 0 {
+		return n
+	}
+	resolved := make([]types.Type, args.Len())
+	for i := range resolved {
+		resolved[i] = unaliased(args.At(i))
+	}
+	inst, err := types.Instantiate(nil, n.Origin(), resolved, false)
+	if err != nil {
+		return n
+	}
+	return inst
+}
+
+// unaliasedInterface rebuilds an interface with its methods' parameter names
+// dropped. The empty interface is returned unchanged: rebuilding it would turn
+// the universe's `any` back into an `interface{}`.
+func unaliasedInterface(t *types.Interface) types.Type {
+	if t.NumMethods() == 0 && t.NumEmbeddeds() == 0 {
+		return t
+	}
+	methods := make([]*types.Func, t.NumExplicitMethods())
+	for i := range methods {
+		m := t.ExplicitMethod(i)
+		methods[i] = types.NewFunc(m.Pos(), m.Pkg(), m.Name(), withoutParamNames(m.Type().(*types.Signature)))
+	}
+	embeds := make([]types.Type, t.NumEmbeddeds())
+	for i := range embeds {
+		embeds[i] = unaliased(t.EmbeddedType(i))
+	}
+	iface := types.NewInterfaceType(methods, embeds)
+	iface.Complete()
+	return iface
+}
+
+// unaliasedStruct rebuilds a struct whose field types hold something reflect
+// spells differently, such as a function type with named parameters. The
+// field names and tags are kept: reflect exposes both.
+func unaliasedStruct(t *types.Struct) types.Type {
+	fields := make([]*types.Var, t.NumFields())
+	tags := make([]string, t.NumFields())
+	for i := range fields {
+		f := t.Field(i)
+		fields[i] = types.NewField(f.Pos(), f.Pkg(), f.Name(), unaliased(f.Type()), f.Embedded())
+		tags[i] = t.Tag(i)
+	}
+	return types.NewStruct(fields, tags)
+}
+
+// withoutParamNames returns sig with its parameter and result names dropped.
+// The variadic flag is kept, so the last parameter still prints with `...`.
+func withoutParamNames(sig *types.Signature) *types.Signature {
+	params := make([]*types.Var, sig.Params().Len())
+	for i := range params {
+		p := sig.Params().At(i)
+		params[i] = types.NewParam(p.Pos(), p.Pkg(), "", unaliased(p.Type()))
+	}
+	results := make([]*types.Var, sig.Results().Len())
+	for i := range results {
+		r := sig.Results().At(i)
+		results[i] = types.NewParam(r.Pos(), r.Pkg(), "", unaliased(r.Type()))
+	}
+	return types.NewSignatureType(sig.Recv(), typeParamSlice(sig.RecvTypeParams()), typeParamSlice(sig.TypeParams()), types.NewTuple(params...), types.NewTuple(results...), sig.Variadic())
+}
+
+func typeParamSlice(list *types.TypeParamList) []*types.TypeParam {
+	if list == nil {
+		return nil
+	}
+	out := make([]*types.TypeParam, list.Len())
+	for i := range out {
+		out[i] = list.At(i)
+	}
+	return out
 }
 
 // typeChildren lists the types t contains that could hold a type parameter.
