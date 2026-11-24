@@ -5,7 +5,18 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 )
+
+// renderMode selects what a render must distinguish. A fingerprint answers
+// whether the object graph changed, so it renders a pointer's identity and a
+// slice's spare capacity. The D6/D7 failure detail answers what the round-trip
+// comparison reads: it compares pointees and elements, which ignores both, and
+// a time.Time by its instant rather than by its unexported fields.
+type renderMode struct {
+	identity bool
+	instant  bool
+}
 
 // fingerprint renders a value deeply — through pointers, maps and slices,
 // including unexported fields — so a change anywhere it reaches shows up as a
@@ -13,7 +24,7 @@ import (
 // into a map or slice it shares with the state it was given.
 func fingerprint(v any) string {
 	var b strings.Builder
-	walk(&b, reflect.ValueOf(v), map[visit]bool{})
+	walk(&b, reflect.ValueOf(v), map[visit]bool{}, renderMode{identity: true})
 	return b.String()
 }
 
@@ -51,7 +62,7 @@ func enter(seen map[visit]bool, v reflect.Value) (visit, bool) {
 	return k, true
 }
 
-func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
+func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool, mode renderMode) {
 	if !v.IsValid() {
 		b.WriteString("<nil>")
 		return
@@ -72,9 +83,14 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 		// that swaps their values is a different map. Without the address the
 		// two keys render alike, the swap is invisible, and a D4 mutation
 		// survives. A fingerprint is only ever compared for one object graph
-		// within a run, so the address is stable across the comparison.
-		fmt.Fprintf(b, "&%x", v.Pointer())
-		walk(b, v.Elem(), seen)
+		// within a run, so the address is stable across the comparison. A round
+		// trip compares pointees, so its detail leaves the address out.
+		if mode.identity {
+			fmt.Fprintf(b, "&%x", v.Pointer())
+		} else {
+			b.WriteByte('&')
+		}
+		walk(b, v.Elem(), seen, mode)
 		delete(seen, k)
 	case reflect.Interface:
 		if v.IsNil() {
@@ -82,12 +98,21 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 			return
 		}
 		fmt.Fprintf(b, "(%s)", v.Elem().Type())
-		walk(b, v.Elem(), seen)
+		walk(b, v.Elem(), seen, mode)
 	case reflect.Struct:
+		// The comparison reads a time by its instant, and JSON keeps the
+		// instant but neither the *Location nor the monotonic reading, so a
+		// detail built from its fields would show differences the round trip
+		// ignores. An unexported time is invisible to JSON and cannot change,
+		// so it falls through to the fields it is.
+		if mode.instant && v.Type() == timeType && v.CanInterface() {
+			b.WriteString(v.Interface().(time.Time).UTC().Format(time.RFC3339Nano))
+			return
+		}
 		b.WriteByte('{')
 		for i := range v.NumField() {
 			fmt.Fprintf(b, "%s:", v.Type().Field(i).Name)
-			walk(b, v.Field(i), seen)
+			walk(b, v.Field(i), seen, mode)
 			b.WriteByte(',')
 		}
 		b.WriteByte('}')
@@ -106,16 +131,16 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 		}
 		b.WriteByte('[')
 		for i := range v.Len() {
-			walk(b, v.Index(i), seen)
+			walk(b, v.Index(i), seen, mode)
 			b.WriteByte(',')
 		}
 		// A slice's spare capacity is memory a successor can share: appending
 		// to the given state's slice writes there without changing its length.
-		if v.Kind() == reflect.Slice && v.Cap() > v.Len() {
+		if mode.identity && v.Kind() == reflect.Slice && v.Cap() > v.Len() {
 			b.WriteByte('|')
 			spare := v.Slice(v.Len(), v.Cap())
 			for i := range spare.Len() {
-				walk(b, spare.Index(i), seen)
+				walk(b, spare.Index(i), seen, mode)
 				b.WriteByte(',')
 			}
 		}
@@ -136,8 +161,8 @@ func walk(b *strings.Builder, v reflect.Value, seen map[visit]bool) {
 		iter := v.MapRange()
 		for iter.Next() {
 			var kb, vb strings.Builder
-			walk(&kb, iter.Key(), seen)
-			walk(&vb, iter.Value(), seen)
+			walk(&kb, iter.Key(), seen, mode)
+			walk(&vb, iter.Value(), seen, mode)
 			entries = append(entries, kv{kb.String(), vb.String()})
 		}
 		// Distinct keys can still render alike — no NaN equals another, so a
