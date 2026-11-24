@@ -18,10 +18,11 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// maxBuildsPerFile bounds the builds tried for one file before it is reported
-// as unreadable. A file's constraint selects the build it belongs to, so the
-// first match usually reads it; the bound is here so a tree whose builds all
-// fail to load cannot turn one file into a load per platform.
+// maxBuildsPerFile bounds the loads spent on one file. A file's constraint
+// selects the build it belongs to, so the first match usually reads it; the
+// bound is here so a tree whose builds all fail to load cannot turn one file
+// into a load per platform. Reaching it leaves builds untried, so the search
+// reports that it stopped rather than claiming no build reads the file.
 const maxBuildsPerFile = 8
 
 // buildContext is one build of the module: a GOOS/GOARCH pair and the extra
@@ -55,6 +56,9 @@ func (c buildContext) selects(path string) bool {
 // inherited build selects, so the extractor reads the rest itself: each file is
 // read in a build that includes it, found by matching its name and build line
 // against every platform the toolchain knows and the extra tags its line names.
+// The builds that read most of the file's package are tried first, since a file
+// that uses a constrained sibling's declaration type-checks only where that
+// sibling is read too.
 func (x *extractor) readBuilds(dir string, patterns []string) {
 	for _, path := range x.unread(dir, patterns) {
 		if x.seen[path] {
@@ -125,7 +129,8 @@ func (x *extractor) readInBuild(dir, path string) {
 	var loadErrs []string
 	for _, ctx := range contexts(path) {
 		if tried == maxBuildsPerFile {
-			break
+			x.errs = append(x.errs, searchFailure(x.rel(path), buildConstraint(path), tried, true, loadErrs))
+			return
 		}
 		// A sibling needing the same build has already read this package, or
 		// already failed to; either way that load's errors are this file's.
@@ -148,14 +153,36 @@ func (x *extractor) readInBuild(dir, path string) {
 		}
 	}
 	if len(loadErrs) > 0 {
-		// A build does include the file; it just does not type-check. The
-		// loader's own message names the file and the symbol it could not
-		// resolve, which is the answer, where extracting from the partial type
-		// information it reports anyway would record a guess.
-		x.errs = append(x.errs, loadErrs...)
+		x.errs = append(x.errs, searchFailure(x.rel(path), buildConstraint(path), tried, false, loadErrs))
 		return
 	}
 	x.errs = append(x.errs, fmt.Sprintf("%s: %s: no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest", x.rel(path), buildConstraint(path)))
+}
+
+// searchFailure explains a file the build search could not read. A build that
+// selects the file does include it; the loader's own messages say why it did
+// not type-check there, and carry the file and the symbol it could not resolve
+// where extracting from the partial types the loader reports anyway would
+// record a guess. stopped says the search gave up at maxBuildsPerFile with
+// builds that select the file untried, which has not shown the file to be
+// unreadable, so the error says that rather than naming one build's error as
+// the answer.
+func searchFailure(name, constraint string, tried int, stopped bool, loadErrs []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s: ", name, constraint)
+	switch {
+	case stopped:
+		fmt.Fprintf(&b, "the search stopped after trying %d builds without one that type-checks the file, and builds that select it were left untried", tried)
+	case len(loadErrs) > 0:
+		b.WriteString("no build this tool can load type-checks the file")
+	default:
+		b.WriteString("no build this tool can load includes the file, so a rule, table or registration declared in it would be missing from the manifest")
+	}
+	if len(loadErrs) > 0 {
+		b.WriteString(":\n  ")
+		b.WriteString(strings.Join(loadErrs, "\n  "))
+	}
+	return b.String()
 }
 
 // loadBuild reads pattern in the build ctx describes and adds what it declares
@@ -269,8 +296,15 @@ func hideOverlay(hide []string) (flag string, cleanup func(), err error) {
 	return "-overlay=" + name, func() { os.Remove(name) }, nil
 }
 
-// contexts lists the builds that include path, the inherited build first, so a
-// file the inherited build left out is read in the build it belongs to.
+// contexts lists the builds that include path, ordered by how much of the
+// file's package they read, and the inherited build first among equals.
+//
+// A constrained file often uses a declaration a sibling declares under another
+// build -- a freebsd-only constant, a linux-only type -- so it type-checks only
+// where that sibling is read too, though its own line names no platform. The
+// build that reads the most of the package is the one it belongs to, so it is
+// tried first rather than spending the search's budget on platforms that happen
+// to select the file alone.
 func contexts(path string) []buildContext {
 	tags := extraTags(path)
 	var out []buildContext
@@ -282,7 +316,33 @@ func contexts(path string) []buildContext {
 			}
 		}
 	}
+	mostOfPackageFirst(out, filepath.Dir(path))
 	return out
+}
+
+// mostOfPackageFirst orders builds by how many of dir's Go files they select,
+// stably, so the inherited build keeps its place among builds that read as much
+// of the package as it does.
+func mostOfPackageFirst(builds []buildContext, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && isGoFile(e.Name()) {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	read := make(map[string]int, len(builds))
+	for _, c := range builds {
+		for _, file := range files {
+			if c.selects(file) {
+				read[c.key()]++
+			}
+		}
+	}
+	slices.SortStableFunc(builds, func(a, b buildContext) int { return read[b.key()] - read[a.key()] })
 }
 
 // tagSets lists every subset of tags, none first, so the search can enable the
