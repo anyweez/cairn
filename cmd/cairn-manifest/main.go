@@ -16,7 +16,10 @@
 // a tools file in a package of its own -- is read with that package hidden,
 // since the go command never builds the two together. A file that build reads
 // but that does not type-check under it is an error carrying the loader's
-// message naming the file, not a shape read from partial type information.
+// message naming the file, not a shape read from partial type information. The
+// search tries the builds that read most of a file's package first, and stops
+// after a bounded number of loads: when it stops early it reports that, rather
+// than the file being in no build.
 //
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is
