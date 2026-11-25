@@ -78,9 +78,7 @@ func TestAllowVacuousDoesNotExemptASecondRuleWithTheSameID(t *testing.T) {
 // failure above is the exemption's scope rather than the vacuity gate being
 // off or the never-applies rule being somehow exercised.
 func TestWithoutTheAllowVacuousEntryTheSharedIDRuleIsReportedVacuous(t *testing.T) {
-	if testing.Short() {
-		t.Skip("vacuity is only enforced on a full-length check")
-	}
+	requireVacuityEnforced(t)
 	m := sharedIDMachine()
 	m.AllowVacuous = nil
 	msg, failed, err := spectest.Fails(t, m.Check)
