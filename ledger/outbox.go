@@ -41,8 +41,12 @@ type Dispatcher[Ef any] struct {
 	//
 	// The context carries metadata for any message the handler records: the
 	// producing entry's actor (or "outbox" when it had none) and correlation
-	// ID, Via "outbox", and the delivery's Key as the CausationID. Replace the
-	// actor with ContextWithMeta when the handler acts as itself.
+	// ID, Via "outbox", and the delivery's Key as the CausationID. It carries
+	// nothing else from the context that ran the drain: a follow-up's OccurredAt
+	// is zero and its Extra is empty, rather than that request's. A handler that
+	// has a use for the producing entry's OccurredAt or Extra finds them on the
+	// Delivery and can copy them with ContextWithMeta, which also replaces the
+	// actor when the handler acts as itself.
 	Handle func(ctx context.Context, d Delivery[Ef]) error
 
 	// BatchSize is how many effects one claim takes. Defaults to 20.
@@ -290,7 +294,7 @@ func (d *Dispatcher[Ef]) deliver(ctx context.Context, dl Delivery[Ef], raw []byt
 	if dl.Effect, err = d.Effects.Decode(env); err != nil {
 		return err
 	}
-	return d.Handle(ContextWithMeta(ctx, dl.caused()), dl)
+	return d.Handle(withMetaReplacing(ctx, dl.caused()), dl)
 }
 
 // Run drains the outbox every interval until ctx is done. An error ends it
@@ -317,6 +321,10 @@ func (d *Dispatcher[Ef]) Run(ctx context.Context, interval time.Duration) error 
 // no actor, recorded before entries had one or by a store that does not
 // require one, is attributed to the outbox, so its follow-ups are not refused
 // by a store that does.
+//
+// It deliberately leaves OccurredAt and Extra empty: they would describe the
+// drain caller's request rather than this delivery. A handler that wants the
+// producing entry's values has them on Delivery.Meta.
 func (d Delivery[Ef]) caused() Meta {
 	correlation := d.Meta.CorrelationID
 	if correlation == "" {
