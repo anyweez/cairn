@@ -57,9 +57,9 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	Models     []Refinement[S, M, R]
 
 	// Equal compares states, for the replay (D5) and the snapshot round trip
-	// (D7). Defaults to reflect.DeepEqual, except that a time.Time is compared
-	// by its instant — what JSON keeps and the ledger stores — rather than by
-	// the monotonic clock reading and *Location it drops.
+	// (D7). Defaults to codec.EqualRoundTripped, which compares a time.Time by
+	// its instant — what JSON keeps and the ledger stores — rather than by the
+	// monotonic clock reading and *Location it drops.
 	Equal func(a, b S) bool
 
 	// Steps caps the messages in one run. Defaults to 40.
@@ -372,7 +372,7 @@ func roundTripMaybeRefused[T any](c *codec.Codec[T], v T, refused bool) spec.Ver
 	if err != nil {
 		return spec.Fail("%v", err)
 	}
-	if equalRoundTripped(v, back) {
+	if codec.EqualRoundTripped(v, back) {
 		return spec.Pass
 	}
 	return spec.Fail("%s came back as %s", describeRoundTrip(v), describeRoundTrip(back))
@@ -753,7 +753,7 @@ type Violation struct {
 func (m Machine[S, M, R, Ev, Ef]) CheckReport(t rapid.TB) []Violation {
 	t.Helper()
 	if m.Equal == nil {
-		m.Equal = func(a, b S) bool { return equalRoundTripped(a, b) }
+		m.Equal = func(a, b S) bool { return codec.EqualRoundTripped(a, b) }
 	}
 	if m.Steps == 0 {
 		m.Steps = 40
