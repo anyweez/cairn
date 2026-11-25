@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/token"
 	"go/types"
+	"io"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -194,6 +198,12 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 //
 // Both loads the tool performs go through here: the inherited build's, and the
 // build that includes a file the inherited one left out.
+//
+// A package carrying errors is reported with the go command's own diagnosis of
+// a dependency it could not resolve as well as the type checker's: a go.mod
+// with no go.sum entry for an import is a state a developer is in right after
+// adding the import, and the loader's text -- "could not import x (invalid
+// package name: \"\")" -- names no fix where go names one.
 func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
@@ -224,9 +234,57 @@ func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package
 		}
 	})
 	if len(loadErrs) > 0 {
+		loadErrs = append(loadErrs, depDiagnoses(cfg, patterns...)...)
+		slices.Sort(loadErrs)
+		loadErrs = slices.Compact(loadErrs) // -test and repeated patterns report one problem once
 		return nil, fmt.Errorf("loading packages:\n  %s", strings.Join(loadErrs, "\n  "))
 	}
 	return pkgs, nil
+}
+
+// depDiagnoses returns what the go command says about the packages the load
+// could not resolve, asked of it directly over the same patterns and build
+// context: "missing go.sum entry for module providing package x (imported by
+// y); to add: go get y", "no required module provides package x; to add it:
+// go get x". go/packages parses those from go list and keeps them in an
+// unexported field, so they never reach the package's Errors.
+//
+// Best effort on the failure path only: a go list that fails or prints
+// something other than its JSON returns no diagnoses, and the load's own
+// errors are reported as they were.
+func depDiagnoses(cfg *packages.Config, patterns ...string) []string {
+	args := []string{"list", "-e", "-json=DepsErrors"}
+	if cfg.Tests {
+		args = append(args, "-test")
+	}
+	args = append(args, cfg.BuildFlags...)
+	args = append(args, patterns...)
+	cmd := exec.Command("go", args...)
+	cmd.Dir = cfg.Dir
+	cmd.Env = cfg.Env
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var diagnoses []string
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var p struct {
+			DepsErrors []struct{ Pos, Err string }
+		}
+		if err := dec.Decode(&p); err == io.EOF {
+			return diagnoses
+		} else if err != nil {
+			return diagnoses
+		}
+		for _, e := range p.DepsErrors {
+			if e.Pos == "" {
+				diagnoses = append(diagnoses, e.Err)
+				continue
+			}
+			diagnoses = append(diagnoses, e.Pos+": "+e.Err)
+		}
+	}
 }
 
 type upcast struct {
