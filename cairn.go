@@ -95,8 +95,13 @@ func (d Decider[S, M, R, Ev, Ef]) Fold(state S, events []Ev) S {
 }
 
 // Step decides one message and folds its events, returning the decision and
-// the state after it. A refused decision leaves the state as it was.
+// the state after it. A refused decision leaves the state as it was, even if
+// its decision carries events: a refusal and events together are rejected by
+// the ledger, and Step does not act on them either.
 func (d Decider[S, M, R, Ev, Ef]) Step(state S, msg M) (Decision[R, Ev, Ef], S) {
 	decision := d.Decide(state, msg)
+	if decision.Refused() {
+		return decision, state
+	}
 	return decision, d.Fold(state, decision.Events)
 }
