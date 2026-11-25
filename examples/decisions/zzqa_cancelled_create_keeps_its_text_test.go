@@ -30,31 +30,40 @@ import (
 	"github.com/anyweez/cairn/ledger/ledgertest"
 )
 
-// stallAfterCommitConn delivers the COMMIT's CommandComplete and then blocks
-// the next read until release is closed, failing it. By the time it blocks the
-// server has committed and the client has read the commit tag, so the
-// recording group has a durable entry it has not been able to finish.
-type stallAfterCommitConn struct {
-	net.Conn
+// stallAfterCommit is the state every connection the pool dials shares: the
+// one that reads a COMMIT's CommandComplete blocks its next read until release
+// is closed, failing it. By the time it blocks the server has committed and the
+// client has read the commit tag, so the recording group has a durable entry it
+// has not been able to finish.
+type stallAfterCommit struct {
 	mu      sync.Mutex
 	tail    []byte
 	stall   bool
-	done    bool
 	ready   chan struct{}
 	release chan struct{}
 	once    sync.Once
 }
 
+// stallAfterCommitConn wraps one of the pool's connections. The connection is
+// the wrapper's own, never a field the dial function rewrites: the pool dials
+// again once the first connection is lost, and a wrapper written under a reader
+// still using it is a data race.
+type stallAfterCommitConn struct {
+	net.Conn
+	state *stallAfterCommit
+}
+
 func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.stall {
-		c.mu.Unlock()
-		c.once.Do(func() { close(c.ready) })
-		<-c.release
+	s := c.state
+	s.mu.Lock()
+	if s.stall {
+		s.mu.Unlock()
+		s.once.Do(func() { close(s.ready) })
+		<-s.release
 		return 0, errConnectionLost
 	}
-	tail := c.tail
-	c.mu.Unlock()
+	tail := s.tail
+	s.mu.Unlock()
 
 	n, err := c.Conn.Read(p)
 	if n > 0 {
@@ -64,9 +73,9 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 			if delivered < 0 {
 				delivered = 0
 			}
-			c.mu.Lock()
-			c.stall = true
-			c.mu.Unlock()
+			s.mu.Lock()
+			s.stall = true
+			s.mu.Unlock()
 			if delivered < n {
 				// Drop whatever followed the commit, ReadyForQuery included.
 				return delivered, nil
@@ -78,9 +87,9 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 		} else {
 			tail = scan
 		}
-		c.mu.Lock()
-		c.tail = tail
-		c.mu.Unlock()
+		s.mu.Lock()
+		s.tail = tail
+		s.mu.Unlock()
 	}
 	return n, err
 }
@@ -88,7 +97,7 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 	verify := ledgertest.NewStore(t, ledger.RequireActor(false))
 
-	stall := &stallAfterCommitConn{
+	stall := &stallAfterCommit{
 		ready:   make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -105,8 +114,7 @@ func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		stall.Conn = conn
-		return stall, nil
+		return &stallAfterCommitConn{Conn: conn, state: stall}, nil
 	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {

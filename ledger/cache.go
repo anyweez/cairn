@@ -193,7 +193,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) cacheKey(stream Stream) string {
 // handleCached hands r to the stream's lane and waits for its result. A
 // caller whose context ends while its message is in flight returns at once,
 // and the message may still be recorded, as with any write abandoned
-// mid-flight.
+// mid-flight. Whether it may be is what the error says: see gaveUp.
 func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream Stream, r *request[M, R]) result[R] {
 	r.done = make(chan result[R], 1)
 	lane := laneKey{agg: a, name: stream.String()}
@@ -204,8 +204,22 @@ func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream St
 	case res := <-r.done:
 		return res
 	case <-ctx.Done():
-		return result[R]{err: ctx.Err()}
+		return result[R]{err: gaveUp(ctx, r)}
 	}
+}
+
+// gaveUp is the error for a caller that stopped waiting for its message.
+// Until the batch carrying the message's COMMIT has gone out, nothing can have
+// been recorded and the caller gets its own context's error. After that the
+// message may be in the ledger — the group is not cancelled while other
+// callers still wait, and a commit can happen before its result is read — so
+// the error wraps ErrUnknownOutcome, and a caller holding data the entry would
+// name keeps it.
+func gaveUp[M, R any](ctx context.Context, r *request[M, R]) error {
+	if !r.sent.Load() {
+		return ctx.Err()
+	}
+	return &unknownOutcomeError{err: ctx.Err()}
 }
 
 // drain records a lane's waiting messages until none are left.

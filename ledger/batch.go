@@ -34,6 +34,11 @@ type Batch struct {
 	// connection still reads idle, the same as after a commit, so send must
 	// never claim the message was recorded for it.
 	hasCommit bool
+	// onSend runs once the batch is about to be written, after send has ruled
+	// out that it cannot be written at all. The cached lane uses it to learn
+	// that a message's COMMIT has gone out, so a caller that stops waiting is
+	// told the message may have been recorded (see handleCached).
+	onSend func()
 }
 
 // batchItem is one queued statement: who queued it, empty for the ledger's
@@ -126,6 +131,9 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 	if pg := senderPgConn(s); pg != nil && pg.IsClosed() {
 		nothingSent = true
 	}
+	if b.onSend != nil && !nothingSent {
+		b.onSend()
+	}
 	results := s.SendBatch(ctx, &b.queued)
 	for i, item := range b.items {
 		if err := item.handle(results); err != nil {
@@ -202,8 +210,9 @@ var ErrUnknownOutcome = errors.New("cairn: whether the message was recorded is u
 
 // unknownOutcomeError is an error from a batch whose COMMIT result could not be
 // read, sent over a connection that cannot be inspected to tell whether it
-// committed. It carries the error that says what could not be read, and
-// matches ErrUnknownOutcome.
+// committed, or the answer to a caller that stopped waiting after its message's
+// COMMIT had gone out. It carries the error that says what could not be read or
+// why the caller stopped, and matches ErrUnknownOutcome.
 type unknownOutcomeError struct{ err error }
 
 func (e *unknownOutcomeError) Error() string { return fmt.Sprintf("%v: %v", ErrUnknownOutcome, e.err) }

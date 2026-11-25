@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -256,6 +257,10 @@ type request[M, R any] struct {
 	meta    Meta
 	metaErr error
 	done    chan result[R]
+	// sent records that the batch carrying this message's COMMIT has gone out,
+	// so the message may be in the ledger even if its caller stops waiting. The
+	// batch sets it (see Batch.onSend) and handleCached reads it.
+	sent atomic.Bool
 }
 
 type result[R any] struct {
@@ -431,6 +436,15 @@ func (a *Aggregate[S, M, R, Ev, Ef]) runGroup(ctx context.Context, stream Stream
 	}
 	b.merge(&entryViews)
 	b.end()
+	// From here the message may be recorded, even though its caller may have
+	// stopped waiting. send marks the requests once it knows the batch can be
+	// written at all, so a cancellation that provably sent nothing stays a
+	// plain failure.
+	b.onSend = func() {
+		for _, r := range reqs {
+			r.sent.Store(true)
+		}
+	}
 	if err := b.send(ctx, conn); err != nil {
 		return nil, Loaded[S]{}, Loaded[S]{}, viewError(err, viewAt)
 	}
