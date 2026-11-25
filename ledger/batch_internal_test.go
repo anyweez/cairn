@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -176,3 +177,133 @@ func TestABatchThatDidNotCommitDoesNotSayItDid(t *testing.T) {
 		t.Fatalf("send returned %v, but the transaction had not committed", err)
 	}
 }
+
+// A batch whose context ends after its statements were sent may still have
+// committed: all of them, the COMMIT among them, are on their way before any
+// result is read. Reporting a plain failure would lose the message if the
+// transaction committed, because a caller retries a failure, so the only safe
+// answer is that the outcome is unknown — and a cancellation is not, by
+// itself, proof that nothing was sent.
+func TestAContextThatEndsAfterSendingLeavesTheOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
+	b.end()
+
+	err := b.send(context.Background(), contextEndsSender{})
+	if err == nil {
+		t.Fatal("send returned nil, want the context's error")
+	}
+	if errors.Is(err, ErrRecorded) {
+		t.Fatalf("send returned %v; the COMMIT's result was never read, so it cannot say the message was recorded", err)
+	}
+	if !errors.Is(err, ErrUnknownOutcome) {
+		t.Fatalf("send returned %v, want an error wrapping ErrUnknownOutcome: the context ended after the statements were sent", err)
+	}
+}
+
+// contextEndsSender answers every statement up to the COMMIT, and fails that
+// one with the context ending: the transaction may have committed, and there is
+// no connection left to inspect.
+type contextEndsSender struct{}
+
+func (contextEndsSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	return &contextEndsResults{remaining: b.Len()}
+}
+
+type contextEndsResults struct{ remaining int }
+
+func (r *contextEndsResults) Exec() (pgconn.CommandTag, error) {
+	r.remaining--
+	if r.remaining == 0 {
+		return pgconn.CommandTag{}, context.Canceled
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (r *contextEndsResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (r *contextEndsResults) QueryRow() pgx.Row { return nil }
+
+func (r *contextEndsResults) Close() error { return nil }
+
+// An error pgconn marks safe to retry says the statement that reported it never
+// reached the server, not that the batch did not. Once a connection has failed
+// and been closed, pgconn reports "conn closed", marked safe to retry, for the
+// next result it is asked for — which under the simple protocol is the first,
+// because the whole batch is one write, the COMMIT included. Taking it as proof
+// that nothing committed reports a transaction that may be in the ledger as a
+// plain failure, and a caller that retries it records the message twice.
+func TestASafeToRetryErrorDoesNotProveTheBatchWasNotSent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		failAt int
+	}{
+		{"first result", 0},
+		{"later result", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var b Batch
+			b.own(sqlStep("beginning a transaction"), `BEGIN`)
+			b.own(insertOne, `INSERT INTO committed VALUES (1)`)
+			b.own(insertOne, `INSERT INTO committed VALUES (2)`)
+			b.end()
+
+			err := b.send(context.Background(), closedAfterSender{failAt: tc.failAt})
+			if err == nil {
+				t.Fatal("send returned nil, want the statement's error")
+			}
+			if !errors.Is(err, ErrUnknownOutcome) {
+				t.Fatalf("send returned %v, want an error wrapping ErrUnknownOutcome: nothing stopped the batch being written, so the COMMIT may have run", err)
+			}
+		})
+	}
+}
+
+// closedAfterSender answers every statement before failAt, and fails that one
+// with the error pgconn reports once the connection it sent them on has been
+// closed: "conn closed", which pgconn marks safe to retry.
+type closedAfterSender struct{ failAt int }
+
+func (s closedAfterSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	return &closedAfterResults{failAt: s.failAt}
+}
+
+type closedAfterResults struct {
+	read   int
+	failAt int
+}
+
+func (r *closedAfterResults) Exec() (pgconn.CommandTag, error) {
+	i := r.read
+	r.read++
+	if i == r.failAt {
+		return pgconn.CommandTag{}, closedConnError{}
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (r *closedAfterResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (r *closedAfterResults) QueryRow() pgx.Row { return nil }
+
+func (r *closedAfterResults) Close() error { return nil }
+
+// closedConnError is pgconn's "conn closed", which marks itself safe to retry
+// because the statement it is reported for never reached the server. It says
+// nothing about the statements sent before it, on the same connection.
+type closedConnError struct{}
+
+func (closedConnError) Error() string { return "conn closed" }
+
+func (closedConnError) SafeToRetry() bool { return true }

@@ -117,6 +117,15 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 	if b.Len() == 0 {
 		return nil
 	}
+	// Whether the batch can be written at all is known before it is: a context
+	// already done and a connection already closed both stop pgconn before it
+	// writes anything. A failure afterwards cannot tell the two apart, because a
+	// connection pgconn has to close while the results are read reports itself
+	// the same way it does for one it never wrote to.
+	nothingSent := ctx.Err() != nil
+	if pg := senderPgConn(s); pg != nil && pg.IsClosed() {
+		nothingSent = true
+	}
 	results := s.SendBatch(ctx, &b.queued)
 	for i, item := range b.items {
 		if err := item.handle(results); err != nil {
@@ -136,9 +145,9 @@ func (b *Batch) send(ctx context.Context, s batchSender) error {
 			}
 			if b.commits && b.hasCommit {
 				switch {
-				case committed(s, err, closeErr):
+				case committed(s, nothingSent, err, closeErr):
 					return &recordedError{err: b.failed(j, err)}
-				case !neverCommitted(err, closeErr):
+				case !neverCommitted(nothingSent, err, closeErr):
 					// The COMMIT's result never arrived and the connection is not
 					// there to be inspected, so whether the transaction committed
 					// is unknown: the message may be in the ledger.
@@ -203,19 +212,28 @@ func (e *unknownOutcomeError) Unwrap() error { return e.err }
 
 func (e *unknownOutcomeError) Is(target error) bool { return target == ErrUnknownOutcome }
 
-// neverCommitted reports whether one of errs means no transaction committed:
-// the database refused a statement, which aborts every statement after it, the
-// COMMIT included, or the client could not build one, so the batch was never
-// sent.
-func neverCommitted(errs ...error) bool {
-	for _, err := range errs {
-		var pgErr *pgconn.PgError
-		var prep pgx.ErrPreprocessingBatch
-		if errors.As(err, &pgErr) || errors.As(err, &prep) {
-			return true
-		}
-	}
-	return false
+// neverCommitted reports whether the batch's failure, and the error closing its
+// results, prove no transaction committed: the database refused a statement,
+// which aborts every statement after it, the COMMIT included, the client could
+// not build one, or the batch was never sent at all.
+//
+// The last is known from the context and the connection before the batch was
+// written, not from the error. pgconn marks the errors of a batch it never sent
+// safe to retry, but it marks "conn closed" the same way for every result read
+// after a connection it had to close, and by then every statement of the batch —
+// the COMMIT among them, and under the simple protocol the whole batch is one
+// write — has already gone out. The close error is read even later, so it can
+// never prove the batch was not sent either.
+func neverCommitted(nothingSent bool, err, closeErr error) bool {
+	return nothingSent || refused(err) || refused(closeErr)
+}
+
+// refused reports whether err is the database refusing a statement, or the
+// client failing to build one. Either way nothing after it ran.
+func refused(err error) bool {
+	var pgErr *pgconn.PgError
+	var prep pgx.ErrPreprocessingBatch
+	return errors.As(err, &pgErr) || errors.As(err, &prep)
 }
 
 // committed reports whether s's connection is between transactions after a
@@ -223,9 +241,11 @@ func neverCommitted(errs ...error) bool {
 // transaction leaves behind, 'T' or 'E' that it is still open or aborted, and
 // a closed connection leaves it unknown. s's own result-reading may report a
 // client-side error the database knows nothing about, which is exactly the
-// case this is here to see past.
-func committed(s batchSender, errs ...error) bool {
-	if neverCommitted(errs...) {
+// case this is here to see past. nothingSent and the errors are what send saw
+// before writing the batch and what the failing result and the close reported,
+// which neverCommitted needs to rule a commit out.
+func committed(s batchSender, nothingSent bool, err, closeErr error) bool {
+	if neverCommitted(nothingSent, err, closeErr) {
 		return false
 	}
 	pg := senderPgConn(s)
