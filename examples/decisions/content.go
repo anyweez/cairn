@@ -13,9 +13,13 @@ import (
 // a table (or two) in its own schema, keyed by the same ids; here it is a map
 // so the example runs without a second database.
 //
-// Erasing a person means deleting the rows that name them — their positions'
-// text, and the mapping from their name to their id. The ledger's history still
-// loads and verifies, because it only ever held the id. See docs/REDACTION.md.
+// Erasing a person means deleting the rows that name them — everything they
+// wrote, and the mapping from their name to their id. A text row also records
+// the slot it belongs to (a decision's question, one member's position on it)
+// and the member whose request stored it, so deleting the row a state names
+// releases the versions it replaced, and forgetting a member releases every
+// row they wrote. The ledger's history still loads and verifies, because it
+// only ever held the id. See docs/REDACTION.md.
 type Content struct {
 	mu    sync.Mutex
 	newID func(prefix string) string
@@ -23,6 +27,31 @@ type Content struct {
 	text  map[Ref]string
 	names map[Member]string
 	ids   map[string]Member
+
+	// owner records what names each row of text: the slot the state names it
+	// under, and the member whose request stored it. Both are how a row is
+	// found again; see Delete and Forget.
+	owner map[Ref]rowOwner
+	// held is the member row each request using it is holding, so a name
+	// minted for a request that records nothing is released when the last
+	// request holding it finishes.
+	held map[Member]*memberHold
+}
+
+// rowOwner is what names a row of text: the slot whose state names it, and the
+// member whose request stored it.
+type rowOwner struct {
+	slot   string
+	member Member
+}
+
+// memberHold is one member mapping while requests are using it. A row no
+// recorded request has ever named is released when users reaches zero; one a
+// recorded entry names is kept for good.
+type memberHold struct {
+	name    string
+	users   int
+	durable bool
 }
 
 // NewContent returns an empty table.
@@ -33,6 +62,8 @@ func NewContent() *Content {
 		text:  map[Ref]string{},
 		names: map[Member]string{},
 		ids:   map[string]Member{},
+		owner: map[Ref]rowOwner{},
+		held:  map[Member]*memberHold{},
 	}
 }
 
@@ -40,6 +71,17 @@ func NewContent() *Content {
 // whitespace is stored under no ref, so a message carrying "" is refused by
 // the decider the way a blank title always was.
 func (c *Content) Put(text string) Ref {
+	return c.put("", "", text)
+}
+
+// PutFor stores text and returns the ref that names it, recording the slot the
+// decision's state will name it under and the member whose request stored it.
+// A stored message goes through here; Put is for a row no decision names.
+func (c *Content) PutFor(slot string, by Member, text string) Ref {
+	return c.put(slot, by, text)
+}
+
+func (c *Content) put(slot string, by Member, text string) Ref {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
@@ -48,6 +90,9 @@ func (c *Content) Put(text string) Ref {
 	defer c.mu.Unlock()
 	ref := Ref(c.newID("t-"))
 	c.text[ref] = text
+	if slot != "" {
+		c.owner[ref] = rowOwner{slot: slot, member: by}
+	}
 	return ref
 }
 
@@ -75,14 +120,53 @@ func (c *Content) IndexedText(title, rationale Ref) string {
 	return text
 }
 
-// Delete removes rows of text. It is ordinary deletion, and it is the reason
-// the words are kept here: the ledger's entries still name the refs and the
-// stream still loads and verifies, because it never held what was deleted.
+// Delete removes rows of text, along with the rows they replaced. It is
+// ordinary deletion, and it is the reason the words are kept here: the
+// ledger's entries still name the refs and the stream still loads and
+// verifies, because it never held what was deleted.
+//
+// A ref minted for a slot releases every row that slot has held — the old
+// question an edit replaced, the earlier body a member overwrote — so deleting
+// the row a decision's current state names erases the text it superseded too.
 func (c *Content) Delete(refs ...Ref) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, ref := range refs {
-		delete(c.text, ref)
+		c.release(ref)
+	}
+}
+
+// release deletes ref and, when it belongs to a slot, every row that slot
+// holds. c.mu must be held.
+func (c *Content) release(ref Ref) {
+	if ref == "" {
+		return
+	}
+	owner, ok := c.owner[ref]
+	delete(c.text, ref)
+	delete(c.owner, ref)
+	if !ok || owner.slot == "" {
+		return
+	}
+	for other, o := range c.owner {
+		if o.slot == owner.slot {
+			delete(c.text, other)
+			delete(c.owner, other)
+		}
+	}
+}
+
+// discard removes exactly the rows a request stored for a message it did not
+// record. It does not release their slots: an earlier row in the same slot is
+// still named by the decision's state.
+func (c *Content) discard(refs ...Ref) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, ref := range refs {
+		if ref != "" {
+			delete(c.text, ref)
+			delete(c.owner, ref)
+		}
 	}
 }
 
@@ -90,19 +174,69 @@ func (c *Content) Delete(refs ...Ref) {
 // sight. A name that is only whitespace names nobody, and gets "", which the
 // decider refuses.
 func (c *Content) Member(name string) Member {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return ""
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	id, _ := c.mint(name)
+	return id
+}
+
+// resolve returns the member id a request names as its sender and holds the
+// row until done is called for it, so a row minted for a request that records
+// nothing can be released once the request is over.
+func (c *Content) resolve(name string) Member {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id, _ := c.mint(name)
+	if id != "" {
+		c.held[id].users++
+	}
+	return id
+}
+
+// mint returns the id for name, minting it on first sight, and reports whether
+// it minted it. c.mu must be held.
+func (c *Content) mint(name string) (Member, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
 	if id, ok := c.ids[name]; ok {
-		return id
+		if c.held[id] == nil {
+			c.held[id] = &memberHold{name: name}
+		}
+		return id, false
 	}
 	id := Member(c.newID("m-"))
 	c.ids[name] = id
 	c.names[id] = name
-	return id
+	c.held[id] = &memberHold{name: name}
+	return id, true
+}
+
+// done finishes one request's hold on a member row. A row a recorded request
+// has used — a success, a recorded refusal, or a ledger error that leaves the
+// outcome open — is kept for good; a row only unrecorded requests have held is
+// released when the last of them finishes.
+func (c *Content) done(id Member, recorded bool) {
+	if id == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	row, ok := c.held[id]
+	if !ok {
+		return
+	}
+	if recorded {
+		row.durable = true
+	}
+	row.users--
+	if row.users > 0 || row.durable {
+		return
+	}
+	delete(c.ids, row.name)
+	delete(c.names, id)
+	delete(c.held, id)
 }
 
 // Name returns the name a member id was minted for, or "" once it is
@@ -113,14 +247,25 @@ func (c *Content) Name(id Member) string {
 	return c.names[id]
 }
 
-// Forget erases a person: it deletes the link from their name to their id, and
-// the name itself. The ledger is untouched and keeps the member id it always
-// had, which is the arrangement docs/REDACTION.md describes.
+// Forget erases a person: it deletes every row of text their requests stored,
+// the link from their name to their id, and the name itself. The ledger is
+// untouched and keeps the member id it always had, which is the arrangement
+// docs/REDACTION.md describes.
 func (c *Content) Forget(id Member) {
+	if id == "" {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if name, ok := c.names[id]; ok {
 		delete(c.ids, name)
 		delete(c.names, id)
+	}
+	delete(c.held, id)
+	for ref, owner := range c.owner {
+		if owner.member == id {
+			delete(c.text, ref)
+			delete(c.owner, ref)
+		}
 	}
 }
