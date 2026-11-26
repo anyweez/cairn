@@ -35,10 +35,10 @@ func (zzqaNumberLiteral) isZZQANumberMsg() {}
 
 type zzqaNumberMsg interface{ isZZQANumberMsg() }
 
-// A message the codec and json.Marshal accept but the ledger's jsonb column
-// cannot store must fail with a cairn error naming the value, like every other
-// value the ledger refuses, rather than with a raw Postgres SQLSTATE from the
-// insert.
+// A message json.Marshal accepts but the ledger's jsonb column cannot store
+// must be refused by the codec with a cairn error naming the value, like every
+// other value the ledger cannot keep, rather than fail the insert with a raw
+// Postgres SQLSTATE.
 func TestAMessageNumberJSONBCannotStoreIsRefusedBeforeTheInsert(t *testing.T) {
 	t.Parallel()
 	for name, msg := range map[string]zzqaNumberMsg{
@@ -47,13 +47,15 @@ func TestAMessageNumberJSONBCannotStoreIsRefusedBeforeTheInsert(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			// The premise: the codec accepts it and json.Marshal writes it, so
-			// nothing before the insert says the value cannot be stored.
-			if err := codec.CheckStorable(msg); err != nil {
-				t.Fatalf("the codec already refuses this value, so it is not the case under test: %v", err)
-			}
+			// The premise: json.Marshal writes this value, so the only thing
+			// that can refuse it is jsonb's own numeric range. The codec must
+			// refuse it first; accepting it is the defect, and the insert is
+			// then the first thing to say so.
 			if _, err := json.Marshal(msg); err != nil {
 				t.Fatalf("json.Marshal refuses this value, so it is not the case under test: %v", err)
+			}
+			if err := codec.CheckStorable(msg); err == nil {
+				t.Fatal("the codec accepts a value jsonb cannot store, so the insert is the first thing to refuse it")
 			}
 
 			msgs := codec.New[zzqaNumberMsg]()
