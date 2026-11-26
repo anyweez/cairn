@@ -43,7 +43,7 @@ import (
 
 func main() {
 	dir := flag.String("dir", ".", "the module to read")
-	out := flag.String("o", "spec.manifest.yaml", "the manifest to write, relative to -dir; - for stdout")
+	out := flag.String("o", "spec.manifest.yaml", "the manifest to write, relative to -dir unless absolute; - for stdout")
 	base := flag.String("base", "", "an earlier manifest (YAML, or the JSON of older versions), relative to the current directory, to check codec changes against")
 	flag.Parse()
 	patterns := flag.Args()
@@ -93,7 +93,13 @@ func run(dir, out, base string, patterns []string) error {
 		_, err = os.Stdout.Write(data)
 		return err
 	}
-	return writeFile(filepath.Join(dir, out), data)
+	// An absolute -o names the file on its own. Joining it onto -dir would
+	// re-root it there -- filepath.Join("/repo", "/tmp/out.yaml") is
+	// "/repo/tmp/out.yaml" -- and write a file the caller did not name.
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return writeFile(out, data)
 }
 
 // readBase decodes a -base manifest, refusing a file that is not a manifest at
