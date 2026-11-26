@@ -221,7 +221,12 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		// is reached, and each is checked against the invariants — not only the
 		// state the whole message nets to.
 		var folded []S
-		for _, e := range decision.Events {
+		// The ledger stores a decision's events before it folds them, so a
+		// reload folds the values Decide produced. An Evolve may write through
+		// a reference an event carries; folding the live values would let that
+		// write rewrite the events D5 replays and D6 round-trips. Fold a copy
+		// and keep the decided events as the ones the ledger stores.
+		for _, e := range clone(decision.Events) {
 			mark := fingerprint(after)
 			next, ok := guard(func() S { return m.Decider.Evolve(after, e) })
 			j(Total, spec.Check(ok, "Evolve panicked on %+v: %v", e, next.panic))
