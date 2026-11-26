@@ -82,8 +82,9 @@ func (c *Content) PutFor(slot string, by Member, text string) Ref {
 }
 
 func (c *Content) put(slot string, by Member, text string) Ref {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	// Whitespace is how a blank row is detected, not something to rewrite:
+	// the text the caller sent is the text the row keeps.
+	if strings.TrimSpace(text) == "" {
 		return ""
 	}
 	c.mu.Lock()
