@@ -36,9 +36,7 @@ func idMergeMachine() spectest.Machine[int, int, int, int, struct{}] {
 }
 
 func TestTwoRulesSharingAnIDAreNotMerged(t *testing.T) {
-	if testing.Short() {
-		t.Skip("vacuity is only enforced on a full-length check")
-	}
+	requireVacuityEnforced(t)
 
 	// Two different rules, one ID. The first never applies; the second applies
 	// on every state and holds. Merged by ID, the first looks exercised and

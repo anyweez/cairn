@@ -79,10 +79,11 @@ func StorableText(s string) bool {
 func (r *Refusal) Error() string { return r.Code + ": " + r.Message }
 
 // Is matches another refusal with the same code, so errors.Is works against a
-// sentinel built with only a code.
+// sentinel built with only a code. A nil refusal or a nil sentinel matches
+// nothing, rather than panicking the caller's error check.
 func (r *Refusal) Is(target error) bool {
 	t, ok := target.(*Refusal)
-	return ok && t.Code == r.Code
+	return ok && r != nil && t != nil && t.Code == r.Code
 }
 
 // Fold applies events to a state in order.
@@ -94,8 +95,13 @@ func (d Decider[S, M, R, Ev, Ef]) Fold(state S, events []Ev) S {
 }
 
 // Step decides one message and folds its events, returning the decision and
-// the state after it. A refused decision leaves the state as it was.
+// the state after it. A refused decision leaves the state as it was, even if
+// its decision carries events: a refusal and events together are rejected by
+// the ledger, and Step does not act on them either.
 func (d Decider[S, M, R, Ev, Ef]) Step(state S, msg M) (Decision[R, Ev, Ef], S) {
 	decision := d.Decide(state, msg)
+	if decision.Refused() {
+		return decision, state
+	}
 	return decision, d.Fold(state, decision.Events)
 }

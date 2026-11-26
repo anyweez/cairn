@@ -1,6 +1,8 @@
 package spectest_test
 
 import (
+	"flag"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -10,6 +12,28 @@ import (
 	"github.com/anyweez/cairn/spec"
 	"github.com/anyweez/cairn/spectest"
 )
+
+// requireVacuityEnforced skips a test that asserts vacuity fails the check
+// unless the run reaches the same full-length threshold the gate uses. rapid
+// lowers its check count under -short and a lowered -rapid.checks lowers it
+// directly, and below the threshold the checker only reports vacuity.
+func requireVacuityEnforced(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("vacuity is only enforced on a full-length check")
+	}
+	f := flag.Lookup("rapid.checks")
+	if f == nil {
+		t.Fatal("rapid's -rapid.checks flag is not registered")
+	}
+	checks, err := strconv.Atoi(f.Value.String())
+	if err != nil {
+		t.Fatalf("cannot read -rapid.checks: %v", err)
+	}
+	if checks < spectest.VacuityRuns {
+		t.Skipf("vacuity is only enforced on a full-length check (%d runs, fewer than %d)", checks, spectest.VacuityRuns)
+	}
+}
 
 // unreachable can only apply above 1000, and the counter below never gets
 // past 40. It is a fixture, not one of cairn's rules, so it is built in a
@@ -52,9 +76,7 @@ func TestEmptyFailureDetailFailsTheCheck(t *testing.T) {
 }
 
 func TestVacuousEstablishedRuleFails(t *testing.T) {
-	if testing.Short() {
-		t.Skip("vacuity is only enforced on a full-length check")
-	}
+	requireVacuityEnforced(t)
 	msg, failed, err := spectest.Fails(t, counter(unreachable()).Check)
 	if err != nil || !failed || !strings.Contains(msg, "C1 is vacuous") {
 		t.Fatalf("a rule that never applies must fail the check, got err=%v %q", err, msg)
@@ -66,9 +88,7 @@ func TestVacuousEstablishedRuleFails(t *testing.T) {
 // draws are rejected, so an established rule none of them reached must still
 // fail it: the -short exception must not become a hole at full length.
 func TestVacuousEstablishedRuleStillFailsWhenTheGeneratorRejectsDraws(t *testing.T) {
-	if testing.Short() {
-		t.Skip("vacuity is only enforced on a full-length check")
-	}
+	requireVacuityEnforced(t)
 	m := counter(unreachable())
 	draws := 0
 	m.Messages = func(t *rapid.T, _ int) int {

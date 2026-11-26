@@ -90,6 +90,14 @@ func ContextWithMeta(ctx context.Context, m Meta) context.Context {
 	return context.WithValue(ctx, metaKey{}, MetaFrom(ctx).over(m))
 }
 
+// withMetaReplacing returns ctx carrying m instead of whatever metadata it
+// already had. ContextWithMeta merges on purpose, for a request that adds a
+// field; the dispatcher needs the delivery's metadata alone, so the context
+// that ran the drain contributes none of its OccurredAt or Extra.
+func withMetaReplacing(ctx context.Context, m Meta) context.Context {
+	return context.WithValue(ctx, metaKey{}, m)
+}
+
 // MetaFrom returns a copy of the metadata ctx carries.
 func MetaFrom(ctx context.Context) Meta {
 	m, _ := ctx.Value(metaKey{}).(Meta)

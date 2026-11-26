@@ -43,8 +43,10 @@ From an up-to-date main whose last CI run passed:
    cz changelog --dry-run --unreleased-version v0.2.0        # its notes
    ```
 
-   `cz bump --get-next` exits 21 with `NO_COMMITS_TO_BUMP` when nothing since
-   the last tag warrants a release.
+   `cz bump --get-next` exits 3 with `NO_COMMITS_FOUND` when no commit has
+   landed since the last tag, and 21 with `NO_COMMITS_TO_BUMP` when commits
+   have landed but none of them warrants a release. Either one means there is
+   nothing to ship: say so and stop.
 
 2. **Open a release PR** that adds the new section to `CHANGELOG.md`:
 

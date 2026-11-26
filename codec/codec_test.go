@@ -284,6 +284,10 @@ type hasTwo struct{}
 func (hasTwo) M() int   { return 0 }
 func (hasTwo) N(string) {}
 
+type namedParams struct{}
+
+func (namedParams) Accept(x int, done func(n int) error) (err error) { return nil }
+
 // goTypesName type-checks a type expression the way cmd/cairn-manifest reads a
 // sum and returns the string it records for it.
 func goTypesName(t *testing.T, pkg, expr string) string {
@@ -331,6 +335,9 @@ func TestRegistrationsNameAnUnnamedTypeAsGoTypesDoes(t *testing.T) {
 	}{
 		{"the empty interface", "any", sumName[struct{ N int }, any]},
 		{"an interface with a method", "interface{ M() int }", sumName[hasM, interface{ M() int }]},
+		{"an interface with named parameters", "interface{Accept(int, func(int) error) error}", sumName[namedParams, interface {
+			Accept(x int, done func(n int) error) (err error)
+		}]},
 		{"an interface with two methods", "interface{ M() int; N(string) }", sumName[hasTwo, interface {
 			M() int
 			N(string)

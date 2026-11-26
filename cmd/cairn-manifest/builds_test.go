@@ -262,6 +262,12 @@ func TestFileBuildReadsTheFileNameAndTheBuildLine(t *testing.T) {
 		{"foo.go", "/*\n//go:build linux\n*/\n\npackage x\n", ""},
 		// go/build ignores a legacy line that follows a block comment.
 		{"foo.go", "/* c */\n// +build linux\n\npackage x\n", ""},
+		// A blank line does not bring a legacy line after a block comment back.
+		{"foo.go", "/* c */\n\n// +build linux\n\npackage x\n", ""},
+		// A legacy line in the package documentation group is not a header.
+		{"foo.go", "// +build linux\npackage x\n", ""},
+		// A //go:build line is, even with no blank line before the clause.
+		{"foo.go", "//go:build linux\npackage x\n", "linux"},
 		{"foo.go", "\ufeff//go:build linux\n\npackage x\n", "linux"},
 	} {
 		path := filepath.Join(t.TempDir(), tc.name)
@@ -494,6 +500,48 @@ var NeverBuiltRule = spec.Rule{ID: "N1", Kind: spec.Can, Status: spec.Proposed, 
 				t.Errorf("rules: %v, want the package's rule and the one declared beside it", got)
 			}
 		})
+	}
+}
+
+// The search tries the builds that read most of the file's package first. A
+// file whose own line names only a tag can use a declaration a sibling declares
+// for one platform, so it type-checks only in the build that reads that
+// sibling. Here a_use.go is in every build that enables the tag, but only the
+// freebsd ones also read bsd.go. Sorting the candidates must put those first,
+// or the budget is spent on platforms where the declaration is missing.
+func TestContextsTryTheBuildThatReadsMostOfThePackage(t *testing.T) {
+	dir := writeModule(t, `module example.com/order
+
+go 1.26.0
+`, map[string]string{
+		"events.go": "package events\n",
+		"a_use.go":  "//go:build cairnqa\n\npackage events\n\nconst _ = BSDOnly\n",
+		"bsd.go":    "//go:build cairnqa && freebsd\n\npackage events\n\nconst BSDOnly = 1\n",
+	})
+
+	contexts := contexts(filepath.Join(dir, "a_use.go"))
+	if len(contexts) == 0 {
+		t.Fatal("no build selects a file tagged cairnqa")
+	}
+	if got := contexts[0].goos; got != "freebsd" {
+		t.Fatalf("the first build tried is %s; want freebsd, the only one that reads bsd.go as well", got)
+	}
+}
+
+// A search that stopped at maxBuildsPerFile has not shown the file to be in no
+// build, so its error must not say so. It names the file and its constraint,
+// says the search stopped, and carries the loader's messages for the builds it
+// did try -- the file may still be readable, and the next reader must be able to
+// tell that from a broken file's error.
+func TestASearchThatStoppedEarlySaysSo(t *testing.T) {
+	err := searchFailure("a_use.go", "//go:build cairnqa", 8, true, []string{"loading packages:\n  ./a_use.go:14:6: undefined: BSDOnly"})
+	for _, want := range []string{"a_use.go", "//go:build cairnqa", "the search stopped after trying 8 builds", "builds that select it were left untried", "undefined: BSDOnly"} {
+		if !strings.Contains(err, want) {
+			t.Errorf("the error does not say %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err, "no build this tool can load includes the file") {
+		t.Errorf("an incomplete search claims the file is in no build:\n%s", err)
 	}
 }
 

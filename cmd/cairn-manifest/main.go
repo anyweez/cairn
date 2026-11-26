@@ -19,7 +19,10 @@
 // a tools file in a package of its own -- is read with that package hidden,
 // since the go command never builds the two together. A file that build reads
 // but that does not type-check under it is an error carrying the loader's
-// message naming the file, not a shape read from partial type information.
+// message naming the file, not a shape read from partial type information. The
+// search tries the builds that read most of a file's package first, and stops
+// after a bounded number of loads: when it stops early it reports that, rather
+// than the file being in no build.
 //
 // With -base, the manifest is also compared with an earlier one, and the
 // command fails if a stored type changed in a way that breaks reading what is
@@ -174,12 +177,32 @@ func encode(m *Manifest) ([]byte, error) {
 // entries already stored under old.
 func Incompatible(old, m *Manifest) []string {
 	now := map[string]Codec{}
+	byName := map[string][]Codec{}
 	for _, c := range m.Codecs {
 		now[c.key()] = c
+		byName[c.Name] = append(byName[c.Name], c)
+	}
+	base := map[string]bool{}
+	for _, c := range old.Codecs {
+		base[c.key()] = true
 	}
 	var problems []string
 	for _, was := range old.Codecs {
 		c, ok := now[was.key()]
+		if !ok {
+			// A stored entry is keyed by its codec name, so a sum this
+			// manifest spells differently still describes the same stored
+			// type. A base manifest written before the runtime's rendering
+			// of a type expression was corrected names the sum the old way,
+			// and comparing the two spellings as keys would report every
+			// entry it stored as removed. Codec names are unique only within
+			// a sum, so the candidate has to be one the base does not list
+			// under its own spelling: one that it does has already matched an
+			// old entry, and pairing this one with it would hide a removal.
+			if same := byName[was.Name]; len(same) == 1 && !base[same[0].key()] {
+				c, ok = same[0], true
+			}
+		}
 		switch {
 		case !ok:
 			problems = append(problems, fmt.Sprintf("%s (%s) was removed; entries already stored with it can't be decoded", was.Name, was.Sum))

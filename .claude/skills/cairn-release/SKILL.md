@@ -37,8 +37,11 @@ stop and report.
 cz bump --get-next --yes
 ```
 
-- Exit 21 (`NO_COMMITS_TO_BUMP`): nothing since the last tag warrants a
-  release. Say so and stop.
+- Exit 3 (`NO_COMMITS_FOUND`): no commits since the last tag. This is the
+  ordinary state of an up-to-date main right after a release.
+- Exit 21 (`NO_COMMITS_TO_BUMP`): commits have landed since the last tag, but
+  none of them warrants a release.
+- Either of those means "nothing to ship": say so and stop.
 - Otherwise it prints the next version, `X.Y.Z`. The tag is `vX.Y.Z`.
 
 Render the notes with

@@ -20,6 +20,15 @@ postgres=$(fixture_name cairn-test-postgres 55871 "$pg_port")
 # container name is: a session on another CAIRN_TEST_PORT gets host ports of
 # its own, so its container never holds the ports the default session asks for.
 proxy_port=$(fixture_port 55872 55871 "$pg_port" "${CAIRN_TOXIPROXY_PORT:-}")
+# The proxy listens on the port it publishes: the container is mapped
+# host:container 1:1, so a host port of 0 asks Docker for a port the toxiproxy
+# cannot be told to listen on. Refuse it here rather than hand docker run a
+# container port of 0 and let it fail with a message that does not say why.
+if [ "$proxy_port" = 0 ]; then
+  echo "cairn: CAIRN_TOXIPROXY_PORT=0 asks for host port 0, which the toxiproxy" >&2
+  echo "       cannot listen on; give it the port it should publish" >&2
+  exit 1
+fi
 # A toxiproxy publishes its control API beside the proxy, and both ports are
 # fixed when the container is created. A session that moves the proxy port has
 # to move the API port with it: otherwise it asks for 8474, which the default
@@ -48,6 +57,11 @@ if ! container_publishes "$proxy" 8474 "$api_port" ||
     ghcr.io/shopify/toxiproxy:2.9.0 >/dev/null
 fi
 lock_release
+# Every address printed or polled below is read back from the container rather
+# than built from the request: the API's host port may be Docker's choice
+# (`-p 127.0.0.1:0:8474`), and the request does not know which port that is.
+api_port=$(container_host_port "$proxy" 8474)
+proxy_port=$(container_host_port "$proxy" "$proxy_port")
 api="http://127.0.0.1:${api_port}"
 for _ in $(seq 1 40); do
   curl -sf "$api/version" >/dev/null 2>&1 && up=1 && break

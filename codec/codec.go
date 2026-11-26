@@ -1104,12 +1104,22 @@ func goFuncString(t reflect.Type) string {
 	return s + " (" + strings.Join(results, ", ") + ")"
 }
 
-// Registrations returns the registrations of all four codecs, sorted.
+// Registrations returns the registrations of all four codecs, sorted. A nil
+// codec has no registrations to report; spectest allows a partial Set, so it is
+// skipped rather than dereferenced.
 func (s *Set[M, R, Ev, Ef]) Registrations() []Registration {
-	codecs := []interface{ Registrations() []Registration }{s.Messages, s.Results, s.Events, s.Effects}
 	var out []Registration
-	for _, c := range codecs {
-		out = append(out, c.Registrations()...)
+	if s.Messages != nil {
+		out = append(out, s.Messages.Registrations()...)
+	}
+	if s.Results != nil {
+		out = append(out, s.Results.Registrations()...)
+	}
+	if s.Events != nil {
+		out = append(out, s.Events.Registrations()...)
+	}
+	if s.Effects != nil {
+		out = append(out, s.Effects.Registrations()...)
 	}
 	sortRegistrations(out)
 	return out

@@ -401,6 +401,35 @@ func TestExtractReadsARuleWrittenWithAnAliasedLiteral(t *testing.T) {
 	}
 }
 
+// A module whose import no required module provides. go list records the
+// diagnosis in the package's DepsErrors, which go/packages keeps unexported, so
+// the load reports only the type checker's "invalid package name". The go
+// command names the fix -- `go get go.yaml.in/yaml/v3` -- and so must the tool.
+// The module with the package required but no go.sum entry is the same shape
+// with a different go list message, pinned by
+// TestQAAnUntidyModuleReportsTheGoCommandDiagnosis.
+func TestExtractRefusesAnImportNoRequiredModuleProvides(t *testing.T) {
+	// go.yaml.in/yaml/v3 is this tool's own dependency, so the module cache
+	// already holds it and the fixture needs no network: whether a module is
+	// required is decided in go.mod, whatever the proxy would say.
+	t.Setenv("GOPROXY", "off")
+	dir := writeModule(t, "module example.com/unrequired\n\ngo 1.26.0\n", map[string]string{
+		"unrequired.go": `package unrequired
+
+import "go.yaml.in/yaml/v3"
+
+var _ = yaml.Marshal
+`,
+	})
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("a module importing a package no module provides was read; want an error")
+	}
+	if !strings.Contains(err.Error(), "no required module provides package go.yaml.in/yaml/v3") {
+		t.Errorf("the error must carry the go command's diagnosis of the missing module, got:\n%v", err)
+	}
+}
+
 // The committed manifest is what cairn's own code says.
 func TestCairnManifestIsCurrent(t *testing.T) {
 	m, err := Extract("../..", "./...")
@@ -605,5 +634,35 @@ func TestIncompatible(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A sum the runtime names differently after a rendering fix describes the same
+// stored type: entries are keyed by the codec name, which did not change. A
+// base manifest written before the fix must not read as a removal.
+func TestIncompatibleAcceptsARecorrectedSum(t *testing.T) {
+	fields := []string{"a: string"}
+	old := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(x int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	now := &Manifest{Codecs: []Codec{{Sum: "interface{Accept(int) string}", Name: "x.accepted", Version: 1, Fields: fields}}}
+	if problems := Incompatible(old, now); len(problems) > 0 {
+		t.Fatalf("Incompatible reports %q for a corrected sum spelling; the stored type is unchanged", problems)
+	}
+}
+
+// A codec name is unique only within a sum, so two sums can both have stored an
+// entry under one name. When the base holds both and the manifest keeps one,
+// the fallback for a respelled sum must not pair the dropped entry with the
+// survivor that the base already lists: that is a removal, not a renaming.
+func TestIncompatibleReportsARemovalBesideARespelledSum(t *testing.T) {
+	fields := []string{"a: string"}
+	old := &Manifest{Codecs: []Codec{
+		{Sum: "x.First", Name: "x.happened", Version: 1, Fields: fields},
+		{Sum: "x.Second", Name: "x.happened", Version: 1, Fields: fields},
+	}}
+	now := &Manifest{Codecs: []Codec{
+		{Sum: "x.First", Name: "x.happened", Version: 1, Fields: fields},
+	}}
+	if got, want := strings.Join(Incompatible(old, now), "\n"), "x.happened (x.Second) was removed"; !strings.Contains(got, want) {
+		t.Fatalf("Incompatible reports %q, want %q: the entry the manifest dropped is a removal", got, want)
 	}
 }

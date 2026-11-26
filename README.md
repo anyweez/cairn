@@ -315,6 +315,13 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   happened. Either error wraps `ErrRecorded`, which says the message is in the
   ledger even though the caller cannot be given its result. A caller must not
   replay it unless it carries an idempotency key.
+
+  A connection that goes away before the COMMIT's response is read is a case
+  the ledger cannot answer: the commit may be durable, but a closed connection
+  cannot be inspected to tell. That error wraps `ErrUnknownOutcome` instead,
+  which says the message may be in the ledger. A caller that holds data the
+  entry would name keeps it, the same as for `ErrRecorded`, because the entry
+  may point at it and a close is not a rollback.
 - **Replay verification.** `Aggregate.Verify` re-decides every stored message
   with today's code and reports each divergence. State between messages comes
   from the stored events, so one divergence doesn't cascade. A stored result
