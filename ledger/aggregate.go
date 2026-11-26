@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -256,6 +257,11 @@ type request[M, R any] struct {
 	meta    Meta
 	metaErr error
 	done    chan result[R]
+	// state says whether a group has claimed this message yet: see waiting,
+	// grouped and abandoned in cache.go. The lane and a caller that gives up
+	// claim it with a compare-and-swap, so the two cannot both decide the
+	// message is unrecorded.
+	state atomic.Uint32
 }
 
 type result[R any] struct {

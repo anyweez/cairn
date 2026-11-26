@@ -188,6 +188,10 @@ func TestACallerGivingUpDoesNotCancelTheOthersInItsGroup(t *testing.T) {
 	if !errors.Is(gaveUp, context.Canceled) {
 		t.Fatalf("the caller that gave up got %v, want context.Canceled", gaveUp)
 	}
+	if !errors.Is(gaveUp, ErrUnknownOutcome) {
+		t.Fatalf("the caller that gave up got %v, want an error wrapping ErrUnknownOutcome: "+
+			"its message shared the group's transaction and was recorded", gaveUp)
+	}
 	if waitedErr != nil {
 		t.Fatalf("the caller that waited: %v", waitedErr)
 	}
@@ -197,6 +201,41 @@ func TestACallerGivingUpDoesNotCancelTheOthersInItsGroup(t *testing.T) {
 	}
 	if entries[1].TxID != entries[2].TxID {
 		t.Fatalf("the two callers' messages did not share a transaction: %d and %d", entries[1].TxID, entries[2].TxID)
+	}
+}
+
+// A caller that stops waiting while its message is still in the lane is told
+// its own context ended and nothing was recorded: no group has claimed the
+// message, so none can. One whose message a group already holds is told the
+// outcome is unknown, because that group may still commit it. Either way the
+// error matches the caller's own context error.
+func TestACallerThatGaveUpIsToldWhetherAGroupClaimedItsMessage(t *testing.T) {
+	t.Parallel()
+	store := &Store{cache: newStateCache(1, 0)}
+	agg := &Aggregate[tally, bump, int, bumped, struct{}]{Store: store, Kind: "tally"}
+	stream := agg.Stream("a")
+	// A worker already holds the lane, so handleCached queues its message and
+	// waits; nothing answers it, and the caller's context is what ends.
+	store.cache.lanes[laneKey{agg: agg, name: stream.String()}] = []any{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, c := range []struct {
+		name        string
+		state       uint32
+		wantUnknown bool
+	}{
+		{"still in the lane", waiting, false},
+		{"claimed by a group", grouped, true},
+	} {
+		r := &request[bump, int]{ctx: ctx, done: make(chan result[int], 1)}
+		r.state.Store(c.state)
+		err := agg.handleCached(ctx, stream, r).err
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: the caller that gave up got %v, want context.Canceled", c.name, err)
+		}
+		if got := errors.Is(err, ErrUnknownOutcome); got != c.wantUnknown {
+			t.Fatalf("%s: the caller that gave up got %v, want an error wrapping ErrUnknownOutcome: %t", c.name, err, c.wantUnknown)
+		}
 	}
 }
 

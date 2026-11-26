@@ -202,8 +202,10 @@ var ErrUnknownOutcome = errors.New("cairn: whether the message was recorded is u
 
 // unknownOutcomeError is an error from a batch whose COMMIT result could not be
 // read, sent over a connection that cannot be inspected to tell whether it
-// committed. It carries the error that says what could not be read, and
-// matches ErrUnknownOutcome.
+// committed, or the answer to a caller that stopped waiting after its message
+// joined a recording group that may still commit it. It carries the error that
+// says what could not be read or why the caller stopped, and matches
+// ErrUnknownOutcome.
 type unknownOutcomeError struct{ err error }
 
 func (e *unknownOutcomeError) Error() string { return fmt.Sprintf("%v: %v", ErrUnknownOutcome, e.err) }

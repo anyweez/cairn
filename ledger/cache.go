@@ -193,7 +193,7 @@ func (a *Aggregate[S, M, R, Ev, Ef]) cacheKey(stream Stream) string {
 // handleCached hands r to the stream's lane and waits for its result. A
 // caller whose context ends while its message is in flight returns at once,
 // and the message may still be recorded, as with any write abandoned
-// mid-flight.
+// mid-flight. Whether it may be is what the error says: see gaveUp.
 func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream Stream, r *request[M, R]) result[R] {
 	r.done = make(chan result[R], 1)
 	lane := laneKey{agg: a, name: stream.String()}
@@ -204,8 +204,32 @@ func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream St
 	case res := <-r.done:
 		return res
 	case <-ctx.Done():
-		return result[R]{err: ctx.Err()}
+		return result[R]{err: gaveUp(ctx, r)}
 	}
+}
+
+// A request's state, from the lane until it is answered. A caller giving up
+// and the lane taking the message into a group claim the request with a
+// compare-and-swap, so exactly one wins and neither can second-guess the
+// other's answer.
+const (
+	waiting   uint32 = iota // still in the lane; no group has claimed it
+	grouped                 // part of a group that may still record it
+	abandoned               // its caller gave up before any group claimed it
+)
+
+// gaveUp is the error for a caller that stopped waiting for its message. Until
+// a group has claimed the message nothing can record it, and the caller gets
+// its own context's error, so a request that never left the lane leaves
+// nothing behind. Once a group holds it the message may be in the ledger: the
+// group is not cancelled while other callers still wait, and a commit can
+// happen before its result is read. The error then wraps ErrUnknownOutcome, and
+// a caller holding data the entry would name keeps it.
+func gaveUp[M, R any](ctx context.Context, r *request[M, R]) error {
+	if r.state.CompareAndSwap(waiting, abandoned) {
+		return ctx.Err()
+	}
+	return &unknownOutcomeError{err: ctx.Err()}
 }
 
 // drain records a lane's waiting messages until none are left.
@@ -220,6 +244,12 @@ func (a *Aggregate[S, M, R, Ev, Ef]) drain(stream Stream, lane laneKey) {
 			r := item.(*request[M, R])
 			if err := r.ctx.Err(); err != nil {
 				r.done <- result[R]{err: err}
+				continue
+			}
+			if !r.state.CompareAndSwap(waiting, grouped) {
+				// The caller gave up as the lane took its message. It
+				// already has its context's error, which is honest: no group
+				// claims a message this one left behind.
 				continue
 			}
 			reqs = append(reqs, r)
