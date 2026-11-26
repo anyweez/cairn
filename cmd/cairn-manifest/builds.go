@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -119,20 +120,13 @@ func wholeModule(dir string, patterns []string) bool {
 }
 
 // modulePath returns the module path go.mod in dir declares, or "" when dir has
-// no readable go.mod.
+// no readable go.mod or it names no module.
 func modulePath(dir string) string {
 	data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[0] != "module" {
-			continue
-		}
-		return strings.Trim(fields[1], `"`)
-	}
-	return ""
+	return modfile.ModulePath(data)
 }
 
 // readInBuild reads one file in a build that includes it.
