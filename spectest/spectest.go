@@ -57,9 +57,10 @@ type Machine[S, M, R, Ev, Ef any] struct {
 	Models     []Refinement[S, M, R]
 
 	// Equal compares states, for the replay (D5) and the snapshot round trip
-	// (D7). Defaults to codec.EqualRoundTripped, which compares a time.Time by
-	// its instant — what JSON keeps and the ledger stores — rather than by the
-	// monotonic clock reading and *Location it drops.
+	// (D7). Defaults to codec.EqualRoundTripped, which compares a time by its
+	// instant and offset — what JSON keeps and the ledger stores — rather than
+	// by the monotonic clock reading and *Location it drops, and treats two
+	// NaNs of the same float type as the same value.
 	Equal func(a, b S) bool
 
 	// Steps caps the messages in one run. Defaults to 40.
@@ -208,7 +209,7 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		j(Total, spec.Check(secondOK, "Decide panicked on its second call with %+v: %v", msg, second.panic))
 		j(Isolated, spec.Check(fingerprint(state) == before, "Decide modified its state on its second call for %+v", msg))
 		if ok && secondOK {
-			j(Deterministic, spec.Check(reflect.DeepEqual(decision, second.value),
+			j(Deterministic, spec.Check(codec.EqualRoundTripped(decision, second.value),
 				"decided %+v, then %+v", decision, second.value))
 		}
 
