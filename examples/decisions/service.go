@@ -123,8 +123,9 @@ func (s *Service) forget(refs ...Ref) {
 
 // uncertain reports the two ledger errors that leave it open whether the
 // message was recorded: ErrRecorded says the transaction committed but its
-// result could not be read, and ErrUnknownOutcome says the connection went away
-// before the COMMIT's response arrived.
+// result could not be read, and ErrUnknownOutcome says the commit may have
+// happened — the connection went away before the COMMIT's response arrived, or
+// the caller stopped waiting after a recording group had taken its message.
 func uncertain(err error) bool {
 	return errors.Is(err, ledger.ErrRecorded) || errors.Is(err, ledger.ErrUnknownOutcome)
 }
@@ -145,8 +146,9 @@ func mayHaveRecorded(err error) bool {
 // nothing was recorded. Either uncertain error leaves that open: the entry may
 // name these refs, and nothing else holds the words, so deleting them would
 // leave a decision nothing can answer with. Every other error — a refusal, a
-// guard, a validation failure, a transaction the database rolled back — means
-// no entry names them, so the cleanup runs.
+// guard, a validation failure, a transaction the database rolled back, or a
+// cancellation that provably sent nothing — means no entry names them, so the
+// cleanup runs.
 func (s *Service) forgetUnlessRecorded(err error, refs ...Ref) {
 	if uncertain(err) {
 		return

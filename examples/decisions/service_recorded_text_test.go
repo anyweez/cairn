@@ -159,6 +159,21 @@ func TestACreateAGuardRefusesLeavesNoTextBehind(t *testing.T) {
 	}
 }
 
+// A caller that gives up before its message is sent recorded nothing, so the
+// text it stored must still be removed: keeping text for an outcome the ledger
+// cannot rule out must not turn into keeping it for every cancellation.
+func TestACancelledCreateLeavesNoTextBehind(t *testing.T) {
+	svc := NewService(ledgertest.NewStore(t, ledger.RequireActor(false)))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := svc.Create(ctx, "ana", "Ship the beta?", "yes", "not yet"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create returned %v, want the caller's context cancellation", err)
+	}
+	if rows := storedRows(svc); rows != 0 {
+		t.Fatalf("a cancelled Create left %d rows of text behind, want none", rows)
+	}
+}
+
 // storedRows is how many rows the register's own table holds.
 func storedRows(svc *Service) int {
 	svc.Content.mu.Lock()
