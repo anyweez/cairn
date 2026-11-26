@@ -214,7 +214,8 @@ func (e *unknownOutcomeError) Is(target error) bool { return target == ErrUnknow
 
 // neverCommitted reports whether the batch's failure, and the error closing its
 // results, prove no transaction committed: the database refused a statement,
-// which aborts every statement after it, the COMMIT included, the client could
+// which aborts every statement after it, the COMMIT included, the COMMIT
+// answered with the ROLLBACK tag an aborted transaction gets, the client could
 // not build one, or the batch was never sent at all.
 //
 // The last is known from the context and the connection before the batch was
@@ -225,7 +226,23 @@ func (e *unknownOutcomeError) Is(target error) bool { return target == ErrUnknow
 // write — has already gone out. The close error is read even later, so it can
 // never prove the batch was not sent either.
 func neverCommitted(nothingSent bool, err, closeErr error) bool {
-	return nothingSent || refused(err) || refused(closeErr)
+	return nothingSent || refused(err) || refused(closeErr) || rolledBack(err) || rolledBack(closeErr)
+}
+
+// rolledBackError is a COMMIT Postgres answered with the ROLLBACK tag: the
+// transaction had already been aborted by an earlier statement, so committing
+// it rolled it back and nothing it carried was recorded.
+type rolledBackError struct{ tag pgconn.CommandTag }
+
+func (e *rolledBackError) Error() string {
+	return fmt.Sprintf("cairn: committing: the transaction was rolled back (%s)", e.tag)
+}
+
+// rolledBack reports whether err is that COMMIT tag: proof the transaction
+// rolled back rather than committed, whatever the connection reads afterwards.
+func rolledBack(err error) bool {
+	var rb *rolledBackError
+	return errors.As(err, &rb)
 }
 
 // refused reports whether err is the database refusing a statement, or the

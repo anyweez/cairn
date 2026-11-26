@@ -178,6 +178,52 @@ func TestABatchThatDidNotCommitDoesNotSayItDid(t *testing.T) {
 	}
 }
 
+// A COMMIT that Postgres answers with the ROLLBACK tag ran in a transaction an
+// earlier statement had already aborted: nothing in the batch was recorded,
+// and the caller must hear a definite failure rather than an unknown outcome.
+func TestABatchWhoseCommitRolledBackDoesNotSayItMayHaveCommitted(t *testing.T) {
+	t.Parallel()
+
+	var b Batch
+	b.own(sqlStep("beginning a transaction"), `BEGIN`)
+	b.own(insertOne, `INSERT INTO committed VALUES (1)`)
+	b.end()
+
+	err := b.send(context.Background(), rolledBackSender{})
+	if err == nil {
+		t.Fatal("send returned nil, want the rollback's error")
+	}
+	if errors.Is(err, ErrRecorded) || errors.Is(err, ErrUnknownOutcome) {
+		t.Fatalf("send returned %v; the COMMIT tag says the transaction rolled back, so nothing was recorded", err)
+	}
+}
+
+// rolledBackSender answers every statement up to the COMMIT, and answers that
+// with the tag Postgres sends for a transaction it has already aborted.
+type rolledBackSender struct{}
+
+func (rolledBackSender) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	return &rolledBackResults{remaining: b.Len()}
+}
+
+type rolledBackResults struct{ remaining int }
+
+func (r *rolledBackResults) Exec() (pgconn.CommandTag, error) {
+	r.remaining--
+	if r.remaining == 0 {
+		return pgconn.NewCommandTag("ROLLBACK"), nil
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (r *rolledBackResults) Query() (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (r *rolledBackResults) QueryRow() pgx.Row { return nil }
+
+func (r *rolledBackResults) Close() error { return nil }
+
 // A batch whose context ends after its statements were sent may still have
 // committed: all of them, the COMMIT among them, are on their way before any
 // result is read. Reporting a plain failure would lose the message if the
