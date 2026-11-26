@@ -401,6 +401,35 @@ func TestExtractReadsARuleWrittenWithAnAliasedLiteral(t *testing.T) {
 	}
 }
 
+// A module whose import no required module provides. go list records the
+// diagnosis in the package's DepsErrors, which go/packages keeps unexported, so
+// the load reports only the type checker's "invalid package name". The go
+// command names the fix -- `go get go.yaml.in/yaml/v3` -- and so must the tool.
+// The module with the package required but no go.sum entry is the same shape
+// with a different go list message, pinned by
+// TestQAAnUntidyModuleReportsTheGoCommandDiagnosis.
+func TestExtractRefusesAnImportNoRequiredModuleProvides(t *testing.T) {
+	// go.yaml.in/yaml/v3 is this tool's own dependency, so the module cache
+	// already holds it and the fixture needs no network: whether a module is
+	// required is decided in go.mod, whatever the proxy would say.
+	t.Setenv("GOPROXY", "off")
+	dir := writeModule(t, "module example.com/unrequired\n\ngo 1.26.0\n", map[string]string{
+		"unrequired.go": `package unrequired
+
+import "go.yaml.in/yaml/v3"
+
+var _ = yaml.Marshal
+`,
+	})
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("a module importing a package no module provides was read; want an error")
+	}
+	if !strings.Contains(err.Error(), "no required module provides package go.yaml.in/yaml/v3") {
+		t.Errorf("the error must carry the go command's diagnosis of the missing module, got:\n%v", err)
+	}
+}
+
 // The committed manifest is what cairn's own code says.
 func TestCairnManifestIsCurrent(t *testing.T) {
 	m, err := Extract("../..", "./...")
