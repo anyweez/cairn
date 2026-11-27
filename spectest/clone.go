@@ -18,6 +18,11 @@ import (
 // second call receives, and rewrite the message D6 compares against what the
 // codec kept: two false verdicts about a decider the ledger supports.
 //
+// The same isolation is what a rule's check, a refinement model and the
+// Messages generator get: the run hands each callback a clone of the state,
+// message or decision it owns, so a check that sorts a slice it was given
+// cannot change what later messages are decided from or what D5 replays.
+//
 // A field with an unexported name is copied like any other, though
 // encoding/json neither writes it nor reads it back. The checker holds the
 // message as sent, and a field the codec drops is a loss D6 reports; sharing it

@@ -191,7 +191,14 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		if collectorStopped(outer) {
 			return
 		}
-		msg := m.Messages(rt, state)
+		// Every user callback below is handed a copy of what the run owns, the
+		// way the ledger hands Decide the value it decoded. A state, message or
+		// decision holds slices, maps and pointers, so passing the run's own
+		// value would let a check that sorts one — an ordinary way to write
+		// "these are in order" — change what later messages are decided from
+		// and what D5 folds, and report the checker's write as a divergence in
+		// the machine.
+		msg := m.Messages(rt, clone(state))
 		trace = append(trace, fmt.Sprintf("%d. %s", step, describe(msg)))
 
 		before := fingerprint(state)
@@ -247,10 +254,10 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 
 		tr := spec.Transition[S, M, R, Ev, Ef]{Before: state, Msg: msg, Decision: decision, After: after}
 		for _, l := range m.Laws {
-			j(l.Rule, checked(func() spec.Verdict { return l.Check(tr) }))
+			j(l.Rule, checked(func() spec.Verdict { return l.Check(clone(tr)) }))
 		}
 		for _, c := range m.Changes {
-			j(c.Rule, checked(func() spec.Verdict { return c.Check(state, msg, after) }))
+			j(c.Rule, checked(func() spec.Verdict { return c.Check(clone(state), clone(msg), clone(after)) }))
 		}
 		for i, r := range models {
 			for _, v := range r.step(msg, decision.Result, decision.Refusal, after) {
@@ -296,7 +303,7 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 // checkState checks every invariant against one state.
 func (m Machine[S, M, R, Ev, Ef]) checkState(j func(spec.Rule, spec.Verdict), state S) {
 	for _, inv := range m.Invariants {
-		j(inv.Rule, checked(func() spec.Verdict { return inv.Check(state) }))
+		j(inv.Rule, checked(func() spec.Verdict { return inv.Check(clone(state)) }))
 	}
 }
 
@@ -508,7 +515,7 @@ func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict {
 	if _, failed := r.initial.Failed(); failed {
 		return r.initial
 	}
-	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(impl, r.state) })
+	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(impl), r.state) })
 	_, r.diverged = v.Failed()
 	return v
 }
@@ -539,7 +546,7 @@ func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, af
 
 func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
 	step, ok := guard(func() modelStep[MS, R] {
-		next, want, wantRefusal := r.def.Step(r.state, msg)
+		next, want, wantRefusal := r.def.Step(r.state, clone(msg))
 		return modelStep[MS, R]{next: next, want: want, refusal: wantRefusal}
 	})
 	if !ok {
@@ -557,13 +564,13 @@ func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal,
 	}
 	if refusal == nil && wantRefusal == nil {
 		verdicts = append(verdicts, modelChecked("SameResult", func() spec.Verdict {
-			return spec.Check(r.def.SameResult(result, want), "machine returned %+v, model %+v", result, want)
+			return spec.Check(r.def.SameResult(clone(result), want), "machine returned %+v, model %+v", result, want)
 		}))
 	}
 	if wantRefusal == nil {
 		r.state = next
 	}
-	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(after, r.state) }))
+	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(after), r.state) }))
 }
 
 // ---- report -----------------------------------------------------------------
