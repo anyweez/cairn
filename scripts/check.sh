@@ -31,6 +31,7 @@ go test -race ./...
 bash scripts/lib-lock_test.sh
 bash scripts/zzqa_lock_acquire_ends_when_its_directory_is_unusable_test.sh
 bash scripts/zzqa_lock_acquire_succeeds_once_the_holder_releases_test.sh
+bash scripts/zzqa_lock_acquire_recovers_a_dead_claim_under_contention_test.sh
 bash scripts/zzqa_lock_takeover_does_not_take_a_live_lock_test.sh
 
 go -C cmd/cairn-manifest vet ./...
