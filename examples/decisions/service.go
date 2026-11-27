@@ -102,8 +102,9 @@ func rationaleSlot(id string) string           { return "rationale/" + id }
 // when the text travelled in it. The slot and the member are recorded with the
 // row so an erasure can find every version of it later.
 func (s *Service) store(what, slot string, by Member, text string) (Ref, error) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	// The trim decides only whether there is any text to store. The caller's
+	// text is stored as sent, whitespace and all.
+	if strings.TrimSpace(text) == "" {
 		return "", nil
 	}
 	if !cairn.StorableText(text) {
