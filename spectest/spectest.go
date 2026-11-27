@@ -269,7 +269,14 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 			}
 		}
 
-		events = append(events, decision.Events...)
+		// D5 replays the history the ledger stores: every event in its own
+		// envelope, each decoded on its own, so no two events share a value a
+		// fold can write through. Copy each event on its own, as the fold above
+		// does, rather than appending the live values the whole decision still
+		// shares.
+		for _, e := range decision.Events {
+			events = append(events, clone(e))
+		}
 		state = after
 		// Checked where they always were, after the laws and changes, so a
 		// transition a law already rejects stays attributed to that law. A
