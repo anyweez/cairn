@@ -10,6 +10,7 @@ package codec_test
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -21,6 +22,33 @@ type rtStamped struct{ At time.Time }
 // rtHiddenStamp is a struct JSON cannot see into: an unexported field is not
 // encoded, so a snapshot of it drops the field.
 type rtHiddenStamp struct{ at time.Time }
+
+// rtSealed writes its unexported time through its own JSON methods, the way an
+// application keeps a message's fields private and still stores them.
+type rtSealed struct{ at time.Time }
+
+func (s rtSealed) MarshalJSON() ([]byte, error) { return json.Marshal(s.at) }
+
+func (s *rtSealed) UnmarshalJSON(data []byte) error { return json.Unmarshal(data, &s.at) }
+
+// rtNamedTime is a type whose underlying type is time.Time and which delegates
+// its encoding to time's own.
+type rtNamedTime time.Time
+
+func (t rtNamedTime) MarshalJSON() ([]byte, error) { return time.Time(t).MarshalJSON() }
+
+func (t *rtNamedTime) UnmarshalJSON(data []byte) error {
+	var tt time.Time
+	if err := json.Unmarshal(data, &tt); err != nil {
+		return err
+	}
+	*t = rtNamedTime(tt)
+	return nil
+}
+
+// rtEmbeddedTime carries a time.Time as an embedded field, whose methods JSON
+// promotes.
+type rtEmbeddedTime struct{ time.Time }
 
 // rtCarried holds a time behind an interface, where json reaches the concrete
 // value, as a message's `any` field does.
@@ -49,6 +77,10 @@ func TestEqualRoundTripped(t *testing.T) {
 	// so the bytes differ even though time.Time.Equal calls the pair equal.
 	cet := time.Date(2026, time.March, 4, 23, 0, 0, 0, time.FixedZone("CET", 3600))
 	eet := cet.In(time.FixedZone("EET", 2*3600))
+	// Pointer keys are compared by what they reach, not the address.
+	p1, p2, p3 := 1, 1, 2
+	// A NaN never equals itself, including as a map key.
+	nan := math.NaN()
 
 	for _, tc := range []struct {
 		name string
@@ -149,6 +181,66 @@ func TestEqualRoundTripped(t *testing.T) {
 			name: "a hidden field a snapshot drops",
 			a:    rtHiddenStamp{at: named},
 			b:    rtJSONRoundTrip(t, rtHiddenStamp{at: named}),
+			want: false,
+		},
+		{
+			name: "a type defined over time.Time",
+			a:    struct{ At rtNamedTime }{At: rtNamedTime(named)},
+			b:    rtJSONRoundTrip(t, struct{ At rtNamedTime }{At: rtNamedTime(named)}),
+			want: true,
+		},
+		{
+			name: "a type embedding time.Time",
+			a:    rtEmbeddedTime{Time: named},
+			b:    rtJSONRoundTrip(t, rtEmbeddedTime{Time: named}),
+			want: true,
+		},
+		{
+			name: "a named time whose instant moved",
+			a:    struct{ At rtNamedTime }{At: rtNamedTime(named)},
+			b:    struct{ At rtNamedTime }{At: rtNamedTime(named.Add(time.Nanosecond))},
+			want: false,
+		},
+		{
+			name: "an unexported time the type's own encoding writes",
+			a:    rtSealed{at: named},
+			b:    rtJSONRoundTrip(t, rtSealed{at: named}),
+			want: true,
+		},
+		{
+			name: "two NaNs of the same float type",
+			a:    struct{ N float64 }{N: nan},
+			b:    struct{ N float64 }{N: nan},
+			want: true,
+		},
+		{
+			name: "a NaN against a number",
+			a:    struct{ N float64 }{N: nan},
+			b:    struct{ N float64 }{N: 1},
+			want: false,
+		},
+		{
+			name: "a map keyed by NaN",
+			a:    map[float64]int{nan: 1},
+			b:    map[float64]int{nan: 1},
+			want: true,
+		},
+		{
+			name: "a map keyed by NaN with a changed value",
+			a:    map[float64]int{nan: 1},
+			b:    map[float64]int{nan: 2},
+			want: false,
+		},
+		{
+			name: "a map keyed by a pointer that reaches the same value",
+			a:    map[*int]string{&p1: "one"},
+			b:    map[*int]string{&p2: "one"},
+			want: true,
+		},
+		{
+			name: "a map keyed by a pointer that reaches a different value",
+			a:    map[*int]string{&p1: "one"},
+			b:    map[*int]string{&p3: "one"},
 			want: false,
 		},
 		{
