@@ -146,7 +146,7 @@ var Bank = cairn.Decider[Account, Msg, int, Event, Effect]{
 	Decide: func(a Account, m Msg) decision {
 		switch m := m.(type) {
 		case Deposit:
-			if m.Amount <= 0 {
+			if m.Amount <= 0 || m.Amount > math.MaxInt-a.Balance {
 				return refuse("invalid", "deposit of %d", m.Amount)
 			}
 			return accept(a.Balance+m.Amount, []Event{Deposited{m.Amount}})
