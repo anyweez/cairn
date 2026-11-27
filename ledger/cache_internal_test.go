@@ -127,7 +127,9 @@ func TestAGroupStopsBeforeARepeatedIdempotencyKey(t *testing.T) {
 
 // A caller that gives up while its message shares a transaction with others
 // returns at once, and the others are still recorded: the group's transaction
-// ends only when every caller in it has given up.
+// ends only when every caller in it has given up. The message the caller gave
+// up on is in that transaction too, so the caller is told the outcome is
+// unknown rather than that nothing was recorded.
 func TestACallerGivingUpDoesNotCancelTheOthersInItsGroup(t *testing.T) {
 	// Not parallel: it holds a stream's lane open for a caller that gives up.
 	ctx := context.Background()
@@ -188,6 +190,10 @@ func TestACallerGivingUpDoesNotCancelTheOthersInItsGroup(t *testing.T) {
 	if !errors.Is(gaveUp, context.Canceled) {
 		t.Fatalf("the caller that gave up got %v, want context.Canceled", gaveUp)
 	}
+	if !errors.Is(gaveUp, ErrUnknownOutcome) {
+		t.Fatalf("the caller that gave up got %v, want an error wrapping ErrUnknownOutcome: "+
+			"its message was in the group's transaction and may still be recorded", gaveUp)
+	}
 	if waitedErr != nil {
 		t.Fatalf("the caller that waited: %v", waitedErr)
 	}
@@ -197,6 +203,76 @@ func TestACallerGivingUpDoesNotCancelTheOthersInItsGroup(t *testing.T) {
 	}
 	if entries[1].TxID != entries[2].TxID {
 		t.Fatalf("the two callers' messages did not share a transaction: %d and %d", entries[1].TxID, entries[2].TxID)
+	}
+}
+
+// A caller that gives up while its message is still waiting in the lane is
+// told nothing was recorded, because the lane drops it: the two cannot both
+// decide that, so the message is not recorded after the caller has been told
+// it was not.
+func TestACallerThatGivesUpWhileItsMessageWaitsIsToldNothingWasRecorded(t *testing.T) {
+	// Not parallel: it holds a stream's lane open so a message queues behind it.
+	ctx := context.Background()
+	store := New(emptyDatabase(t), RequireActor(false))
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	agg := newTally(t, store)
+	lane := laneKey{agg: agg, name: agg.Stream("a").String()}
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	agg.Views = []View[tally]{{Name: "tally", Write: func(_ *Batch, at Loaded[tally], _ Entry) error {
+		if at.State.N == 1 {
+			// Hold the lane with the first message, so the message under test
+			// waits behind it and no group can have taken it.
+			close(holding)
+			<-release
+		}
+		return nil
+	}}}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if _, err := agg.Handle(ctx, "a", bump{}); err != nil {
+			t.Error(err)
+		}
+	})
+	<-holding
+
+	gone, cancel := context.WithCancel(ctx)
+	defer cancel()
+	answered := make(chan error, 1)
+	wg.Go(func() {
+		_, err := agg.Handle(gone, "a", bump{})
+		answered <- err
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		store.cache.mu.Lock()
+		queued := len(store.cache.lanes[lane])
+		store.cache.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the message never reached the lane: %d waiting", queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	gaveUp := <-answered
+	if !errors.Is(gaveUp, context.Canceled) {
+		t.Fatalf("the caller that gave up got %v, want context.Canceled", gaveUp)
+	}
+	if errors.Is(gaveUp, ErrUnknownOutcome) {
+		t.Fatalf("the caller that gave up got %v, but its message was still waiting in the lane and no group holds it", gaveUp)
+	}
+	close(release)
+	wg.Wait()
+
+	entries, err := store.ReadStream(ctx, agg.Stream("a"), 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("%d entries, %v; want 1: the message whose caller gave up must not be recorded", len(entries), err)
 	}
 }
 

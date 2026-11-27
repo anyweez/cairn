@@ -68,9 +68,13 @@ transaction at a time:
   held for no round trip at all, only the commit's flush.
 - **Messages that arrive together are recorded together.** Those that queue
   while a stream's transaction is in flight are decided in order and recorded
-  in its next transaction, up to 100 at a time. Each caller still returns
-  only once its own message is committed. Views and snapshots are written
-  once per transaction, from the state after its last message.
+  in its next transaction, up to 100 at a time. Each caller still returns only
+  once its own message is committed, unless it gives up first: one whose
+  message is still waiting in the lane gets its context error and nothing is
+  recorded, and one whose message a group has taken gets an error wrapping
+  `ErrUnknownOutcome`, because the transaction may still commit. Views and
+  snapshots are written once per transaction, from the state after its last
+  message.
 - **A stale cache records nothing.** If another process has written the
   stream, the lock fails, as does a duplicate idempotency key on its unique
   index. Nothing is recorded, and the messages are decided again from the

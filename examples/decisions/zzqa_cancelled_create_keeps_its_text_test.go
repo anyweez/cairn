@@ -34,12 +34,22 @@ import (
 // the next read until release is closed, failing it. By the time it blocks the
 // server has committed and the client has read the commit tag, so the
 // recording group has a durable entry it has not been able to finish.
+//
+// One is made for each connection the pool dials: when the caller gives up,
+// pgx dials one of its own to send a cancellation request, and that connection
+// must pass through rather than stall as well.
 type stallAfterCommitConn struct {
 	net.Conn
-	mu      sync.Mutex
-	tail    []byte
-	stall   bool
-	done    bool
+	shared *stalledCommit
+	mu     sync.Mutex
+	tail   []byte
+	stall  bool
+}
+
+// stalledCommit is what the test shares with every connection the pool dials:
+// the signal that the COMMIT has been read, and the release of the read after
+// it.
+type stalledCommit struct {
 	ready   chan struct{}
 	release chan struct{}
 	once    sync.Once
@@ -49,8 +59,7 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	if c.stall {
 		c.mu.Unlock()
-		c.once.Do(func() { close(c.ready) })
-		<-c.release
+		<-c.shared.release
 		return 0, errConnectionLost
 	}
 	tail := c.tail
@@ -67,6 +76,7 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 			c.mu.Lock()
 			c.stall = true
 			c.mu.Unlock()
+			c.shared.once.Do(func() { close(c.shared.ready) })
 			if delivered < n {
 				// Drop whatever followed the commit, ReadyForQuery included.
 				return delivered, nil
@@ -88,7 +98,7 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 	verify := ledgertest.NewStore(t, ledger.RequireActor(false))
 
-	stall := &stallAfterCommitConn{
+	stall := &stalledCommit{
 		ready:   make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -105,8 +115,7 @@ func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		stall.Conn = conn
-		return stall, nil
+		return &stallAfterCommitConn{Conn: conn, shared: stall}, nil
 	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
