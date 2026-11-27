@@ -480,7 +480,7 @@ func commitStep(r pgx.BatchResults) error {
 		return fmt.Errorf("cairn: committing: %w", err)
 	}
 	if tag.String() != "COMMIT" {
-		return fmt.Errorf("cairn: committing: the transaction was rolled back (%s)", tag)
+		return &rolledBackError{tag: tag}
 	}
 	return nil
 }

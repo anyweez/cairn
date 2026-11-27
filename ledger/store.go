@@ -201,22 +201,46 @@ var ErrNotLocked = errors.New("cairn: stream is not locked in this transaction")
 //
 // fn may run its own statements on tx, such as claiming a number from an
 // application table. Each costs a round trip; see docs/CONVENTIONS.md.
+//
+// The transaction is committed by this function, and its outcome is reported
+// the way Handle reports one: a commit whose response was lost returns an
+// error wrapping ErrRecorded or ErrUnknownOutcome, so a caller can tell a
+// message that may be in the ledger from one the database rolled back. See
+// README, "Told when a message was recorded".
 func (s *Store) Transact(ctx context.Context, streams []Stream, fn func(tx *Tx) error) error {
-	return pgx.BeginFunc(ctx, s.pool, func(ptx pgx.Tx) error {
-		tx := &Tx{tx: ptx}
-		if len(streams) > 0 {
-			var b Batch
-			l, err := queueLock(&b, streams)
-			if err != nil {
-				return err
-			}
-			if err := b.send(ctx, ptx); err != nil {
-				return err
-			}
-			tx.locks = l
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	// release rolls back a transaction a failure left open and returns the
+	// connection; after a commit it reads idle and is only released.
+	defer release(conn)
+	ptx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	tx := &Tx{tx: ptx}
+	if len(streams) > 0 {
+		var b Batch
+		l, err := queueLock(&b, streams)
+		if err != nil {
+			return err
 		}
-		return fn(tx)
-	})
+		if err := b.send(ctx, ptx); err != nil {
+			return err
+		}
+		tx.locks = l
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	// The COMMIT goes out in a batch, as Handle's does, so send can classify a
+	// commit whose response was lost instead of returning the driver's error
+	// raw: pgx's own Commit reads the tag no one can see, and a connection
+	// dropped on either side of it comes back as a plain failure.
+	var commit Batch
+	commit.end()
+	return commit.send(ctx, ptx)
 }
 
 // errLockAfterWrite is cairn.lock_streams refusing a transaction that has
