@@ -115,8 +115,9 @@ func (c *Codec[T]) Encode(v T) (Envelope, error) {
 }
 
 // NotStorableError names the field of a value the ledger cannot store: text
-// jsonb would rewrite or reject, or a time its JSON encoding cannot carry as
-// the same instant. It is returned by Encode and reported by CheckStorable.
+// jsonb would rewrite or reject, a JSON number outside the range jsonb's
+// numeric holds, or a time its JSON encoding cannot carry as the same instant.
+// It is returned by Encode and reported by CheckStorable.
 type NotStorableError struct {
 	Path string
 	// Why says what makes the value unstorable, for a value refused for
@@ -134,12 +135,19 @@ func (e *NotStorableError) Error() string {
 // CheckStorable reports whether every value in v can be stored in the ledger
 // and read back unchanged. json.Marshal replaces a string that is not valid
 // UTF-8 with U+FFFD, and Postgres jsonb cannot represent a NUL, so either
-// would silently store text the caller never wrote. A time.Time is checked
-// through its JSON encoding, because json.Marshal reports a year it cannot
-// write only at encode time and rounds a zone offset with seconds in it to
-// the minute without reporting anything, storing an instant that was never
-// sent. A time used as a map key is checked through its MarshalText round
-// trip instead, because that is how json writes and reads an object key.
+// would silently store text the caller never wrote. A JSON number is checked
+// against the range Postgres numeric holds, because jsonb parses a number into
+// numeric and the insert would otherwise be the first thing to refuse it. That
+// covers a json.Number, which json.Marshal writes as a bare number rather than
+// the string its kind suggests, and every number in the bytes a MarshalJSON
+// returned; a json.Number in a field whose tag carries the `string` option is
+// written inside a JSON string instead, so only its text is checked. A
+// time.Time is checked through its JSON encoding, because json.Marshal reports
+// a year it cannot write only at encode time and rounds a zone offset with
+// seconds in it to the minute without reporting anything, storing an instant
+// that was never sent. A time used as a map key is checked through its
+// MarshalText round trip instead, because that is how json writes and reads an
+// object key.
 //
 // It walks the same values json.Marshal does. A type with its own MarshalText
 // is checked through the text it returns, because json writes it through its
@@ -234,6 +242,11 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	}
 	switch v.Kind() {
 	case reflect.String:
+		if v.Type() == jsonNumberType {
+			// json.Marshal writes a json.Number unquoted, so its text becomes
+			// jsonb's numeric rather than a string.
+			return checkJSONNumber(v.String(), path)
+		}
 		if !cairn.StorableText(v.String()) {
 			return &NotStorableError{Path: path}
 		}
@@ -258,6 +271,12 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 			if err != nil {
 				// An embedded pointer on the path is nil, so json writes no
 				// field beyond it.
+				continue
+			}
+			if f.quoted {
+				if err := checkStorableQuoted(fv, path+"."+f.path, seen); err != nil {
+					return err
+				}
 				continue
 			}
 			if err := checkStorable(fv, path+"."+f.path, seen); err != nil {
@@ -307,11 +326,37 @@ func checkStorable(v reflect.Value, path string, seen map[visit]bool) error {
 	return nil
 }
 
+// checkStorableQuoted checks a struct field whose JSON tag carries the
+// `string` option, which makes json.Marshal write the field's scalar inside a
+// JSON string. Only a json.Number is checked differently: json writes its
+// literal quoted, so jsonb stores text and its numeric range does not matter.
+// Everything else takes the ordinary walk — a string still needs storable
+// text, and encoding/json ignores the option for a type that decides its own
+// bytes. The option is set only for a scalar field or one pointer to it, so
+// there is at most one pointer to follow.
+func checkStorableQuoted(v reflect.Value, path string, seen map[visit]bool) error {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if v.Type() == jsonNumberType {
+		if !cairn.StorableText(v.String()) {
+			return &NotStorableError{Path: path}
+		}
+		return nil
+	}
+	return checkStorable(v, path, seen)
+}
+
 // storableField is a field encoding/json writes for a struct type: the index
-// path to it and the Go field names along that path, for an error message.
+// path to it, the Go field names along that path for an error message, and
+// whether the field's tag carries the `string` option.
 type storableField struct {
-	index []int
-	path  string
+	index  []int
+	path   string
+	quoted bool
 }
 
 // storableFieldsCache holds the resolved fields of a struct type. The set
@@ -340,6 +385,7 @@ type fieldCandidate struct {
 	index  []int  // path from the root struct
 	tagged bool   // its JSON tag named it, which breaks a depth tie
 	path   string // its Go field names, for an error message
+	quoted bool   // its tag carries the `string` option
 }
 
 func computeStorableFields(t reflect.Type) []storableField {
@@ -385,7 +431,7 @@ func computeStorableFields(t reflect.Type) []storableField {
 				if tag == "-" {
 					continue
 				}
-				name, _, _ := strings.Cut(tag, ",")
+				name, opts, _ := strings.Cut(tag, ",")
 				if !validJSONTag(name) {
 					// json discards an invalid tag name and falls back to the Go
 					// field name, so the field is untagged for dominance too.
@@ -410,7 +456,7 @@ func computeStorableFields(t reflect.Type) []storableField {
 					if name == "" {
 						name = f.Name
 					}
-					c := fieldCandidate{name: name, index: index, tagged: tagged, path: fieldPath}
+					c := fieldCandidate{name: name, index: index, tagged: tagged, path: fieldPath, quoted: quotedField(opts, ft)}
 					cands = append(cands, c)
 					if count[q.typ] > 1 {
 						cands = append(cands, c)
@@ -463,9 +509,28 @@ func computeStorableFields(t reflect.Type) []storableField {
 	slices.SortFunc(cands, func(a, b fieldCandidate) int { return slices.Compare(a.index, b.index) })
 	fields := make([]storableField, len(cands))
 	for i, c := range cands {
-		fields[i] = storableField{index: c.index, path: c.path}
+		fields[i] = storableField{index: c.index, path: c.path, quoted: c.quoted}
 	}
 	return fields
+}
+
+// quotedField reports whether encoding/json writes this field inside a JSON
+// string because its tag carries the `string` option. The option applies only
+// to a scalar field — string, number or bool — so json ignores it for a
+// struct, slice, map or interface, and it follows one unnamed pointer to the
+// scalar it points at.
+func quotedField(opts string, ft reflect.Type) bool {
+	if !slices.Contains(strings.Split(opts, ","), "string") {
+		return false
+	}
+	switch ft.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
 }
 
 // validJSONTag reports whether s may name a JSON field, mirroring
@@ -695,6 +760,9 @@ func renderStorableTimeText(v reflect.Value, t time.Time, path string) (string, 
 // is rejected as an unsupported Unicode escape (SQLSTATE 22P05). The bytes are
 // the type's to decide, but what jsonb can keep is not.
 //
+// A number in those bytes is checked too: jsonb parses it into numeric, whose
+// range is narrower than JSON's.
+//
 // The replacement-character escape is refused for a different reason, and it
 // is the one refusal here that can be a false positive. A marshaler built on
 // an inner json.Marshal — `type plain T; return json.Marshal(plain(v))` — has
@@ -750,7 +818,174 @@ func checkMarshalledJSON(data []byte, path string) error {
 		}
 		i += 6
 	}
+	return checkMarshalledNumbers(data, path)
+}
+
+// jsonNumberType is encoding/json's number literal passthrough. Its Go kind is
+// String, but json.Marshal writes it as a bare number rather than a quoted
+// string, so its text has to be held to the range jsonb's numeric holds.
+var jsonNumberType = reflect.TypeFor[json.Number]()
+
+const (
+	// jsonb stores a JSON number as Postgres numeric, which holds at most
+	// 131072 digits before the decimal point and 16383 after it.
+	maxNumericIntegerDigits = 131072
+	maxNumericScale         = 16383
+)
+
+// checkMarshalledNumbers refuses a JSON number in data that jsonb cannot
+// store. json.Marshal compacts a MarshalJSON's bytes but does not parse their
+// numbers, so a number out of numeric's range reaches the insert and fails
+// there with a raw SQLSTATE. A number token is the only place a bare digit
+// appears outside a string, so the strings are skipped and every other digit
+// run is a number to check.
+func checkMarshalledNumbers(data []byte, path string) error {
+	for i := 0; i < len(data); {
+		switch c := data[i]; {
+		case c == '"':
+			i++
+			for i < len(data) && data[i] != '"' {
+				if data[i] == '\\' {
+					i++
+				}
+				i++
+			}
+			i++
+		case c == '-' || isJSONNumberDigit(c):
+			end := i + 1
+			for end < len(data) && isJSONNumberByte(data[end]) {
+				end++
+			}
+			if err := checkJSONNumber(string(data[i:end]), path); err != nil {
+				return err
+			}
+			i = end
+		default:
+			i++
+		}
+	}
 	return nil
+}
+
+// checkJSONNumber reports whether the JSON number literal lit fits in jsonb,
+// naming path when it does not. An empty literal is json.Number's zero value,
+// which json.Marshal writes as 0. A literal that is not a JSON number is
+// accepted: json.Marshal refuses it, so there is no entry to keep.
+//
+// jsonb parses the literal into Postgres numeric, whose two limits are
+// independent. The scale is the fraction's length less the exponent, floored
+// at zero, and trailing zeros count because numeric keeps the scale it was
+// given; a negative exponent moves zeros into the fraction, which is why
+// 1e-16384 is refused. The digits before the decimal point are the literal's
+// significant digits, shifted by the exponent, so a zero mantissa has none
+// however large its exponent: 0e200000 is storable and 0e-16384 is not.
+func checkJSONNumber(lit, path string) error {
+	i := 0
+	if i < len(lit) && lit[i] == '-' {
+		i++
+	}
+	intStart := i
+	for i < len(lit) && isJSONNumberDigit(lit[i]) {
+		i++
+	}
+	intPart := lit[intStart:i]
+	if intPart == "" || (len(intPart) > 1 && intPart[0] == '0') {
+		// Not a JSON number: it has no integer digits, or a leading zero.
+		return nil
+	}
+	fracStart, fracEnd := i, i
+	if i < len(lit) && lit[i] == '.' {
+		i++
+		fracStart = i
+		for i < len(lit) && isJSONNumberDigit(lit[i]) {
+			i++
+		}
+		fracEnd = i
+		if fracEnd == fracStart {
+			return nil
+		}
+	}
+	// hugeExponent is far past anything that could still be storable, and
+	// saturating there keeps the arithmetic below well inside int64.
+	const hugeExponent = int64(1) << 40
+	exp := int64(0)
+	if i < len(lit) && (lit[i] == 'e' || lit[i] == 'E') {
+		i++
+		neg := false
+		if i < len(lit) && (lit[i] == '+' || lit[i] == '-') {
+			neg = lit[i] == '-'
+			i++
+		}
+		expStart := i
+		for i < len(lit) && isJSONNumberDigit(lit[i]) {
+			i++
+		}
+		if i == expStart {
+			return nil
+		}
+		digits := strings.TrimLeft(lit[expStart:i], "0")
+		if len(digits) > 12 {
+			exp = hugeExponent
+		} else {
+			for _, c := range []byte(digits) {
+				exp = exp*10 + int64(c-'0')
+			}
+		}
+		if neg {
+			exp = -exp
+		}
+	}
+	if i != len(lit) {
+		// Trailing text: not a JSON number, so json.Marshal refuses it.
+		return nil
+	}
+	fracLen := int64(fracEnd - fracStart)
+	if fracLen-exp > maxNumericScale {
+		return notStorableNumber(lit, path)
+	}
+	if zero, significant := numberDigits(intPart, lit[fracStart:fracEnd]); !zero &&
+		significant-fracLen+exp > maxNumericIntegerDigits {
+		return notStorableNumber(lit, path)
+	}
+	return nil
+}
+
+// numberDigits returns whether every digit of a JSON number's mantissa is a
+// zero, and how many significant digits it has: its integer digits when the
+// integer part is not zero, otherwise the fraction from its first nonzero
+// digit. Trailing zeros count, as numeric's scale keeps them.
+func numberDigits(intPart, frac string) (zero bool, significant int64) {
+	if intPart != "0" {
+		return false, int64(len(intPart) + len(frac))
+	}
+	first := strings.IndexFunc(frac, func(r rune) bool { return r != '0' })
+	if first < 0 {
+		return true, 0
+	}
+	return false, int64(len(frac) - first)
+}
+
+// notStorableNumber refuses a number literal jsonb cannot hold, showing enough
+// of it to identify the value without repeating a payload that may be huge.
+func notStorableNumber(lit, path string) error {
+	const shown = 40
+	digits := lit
+	if len(digits) > shown {
+		digits = digits[:shown] + "..."
+	}
+	return &NotStorableError{Path: path, Why: fmt.Sprintf(
+		"it is the JSON number %s, which jsonb cannot store: numeric holds at most %d digits before the decimal point and %d after it",
+		digits, maxNumericIntegerDigits, maxNumericScale)}
+}
+
+// isJSONNumberDigit reports whether c is a decimal digit of a JSON number.
+func isJSONNumberDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// isJSONNumberByte reports whether c may appear in a JSON number token. A run
+// of them from a '-' or a digit is the token; checkJSONNumber decides whether
+// it is a number at all.
+func isJSONNumberByte(c byte) bool {
+	return isJSONNumberDigit(c) || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'
 }
 
 // jsonHex4 reads the four hex digits of a \u escape, reporting whether b holds
