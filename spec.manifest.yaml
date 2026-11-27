@@ -9,7 +9,7 @@ rules:
   - id: D2
     kind: never
     status: established
-    statement: Decide or Evolve panics.
+    statement: Initial, Decide or Evolve panics.
     package: github.com/anyweez/cairn/spectest
   - id: D3
     kind: never

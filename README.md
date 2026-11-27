@@ -340,7 +340,7 @@ Every machine is held to the framework's rules (D1–D7) in addition to its own:
 | Rule | Statement |
 |---|---|
 | D1 | Decide is deterministic. |
-| D2 | Decide and Evolve never panic. |
+| D2 | Initial, Decide and Evolve never panic. |
 | D3 | A refusal carries no events or effects. |
 | D4 | Decide and Evolve never modify the state they're given. This catches a map shared between states. |
 | D5 | Folding a run's events from the initial state reproduces the run. |

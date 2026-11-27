@@ -29,7 +29,7 @@ var (
 	Deterministic = spec.Rule{ID: "D1", Kind: spec.Never, Status: spec.Established,
 		Statement: "The same state and message produce two different decisions."}
 	Total = spec.Rule{ID: "D2", Kind: spec.Never, Status: spec.Established,
-		Statement: "Decide or Evolve panics."}
+		Statement: "Initial, Decide or Evolve panics."}
 	RefusalInert = spec.Rule{ID: "D3", Kind: spec.Never, Status: spec.Established,
 		Statement: "A refused decision carries events or effects."}
 	Isolated = spec.Rule{ID: "D4", Kind: spec.Never, Status: spec.Established,
