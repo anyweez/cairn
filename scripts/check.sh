@@ -26,12 +26,29 @@ export CAIRN_TEST_DATABASE_URL
 export CAIRN_REQUIRE_DATABASE=1
 go test -race ./...
 
-# The fixture scripts' lock library is shell, so no Go test reaches its
-# failure paths: without these, a regression shows up as a hung fixture.
-bash scripts/lib-lock_test.sh
-bash scripts/zzqa_lock_acquire_ends_when_its_directory_is_unusable_test.sh
-bash scripts/zzqa_lock_acquire_succeeds_once_the_holder_releases_test.sh
-bash scripts/zzqa_lock_takeover_does_not_take_a_live_lock_test.sh
+# The fixture scripts are shell, so no Go test reaches their failure paths:
+# without these, a regression shows up as a hung or misconfigured fixture.
+# Run every committed shell test in scripts/ -- the *_test.sh beside what they
+# cover, and the zzqa_* regressions a QA pass commits -- so a test added later
+# is part of the gate without editing this file. A test exits 2 when the host
+# cannot run it at all (no Docker daemon, no tmpfs), which is a skip, not a
+# regression: "cannot check here" and "this broke" have to stay distinct.
+seen=" "
+for test in scripts/*_test.sh scripts/zzqa_*.sh; do
+  # A zzqa_*_test.sh matches both patterns; run it once.
+  case $seen in *" $test "*) continue ;; esac
+  seen="$seen$test "
+  status=0
+  bash "$test" || status=$?
+  case $status in
+  0) ;;
+  2) echo "skip: $test (the host cannot run it)" ;;
+  *)
+    echo "FAIL: $test exited $status" >&2
+    exit "$status"
+    ;;
+  esac
+done
 
 go -C cmd/cairn-manifest vet ./...
 go -C cmd/cairn-manifest test ./...

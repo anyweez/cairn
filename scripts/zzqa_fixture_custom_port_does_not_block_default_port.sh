@@ -15,6 +15,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 source scripts/containers.sh
+. scripts/lib-test.sh
+require_docker "the custom fixture port test"
 
 custom_pg=56099
 postgres_default=cairn-test-postgres

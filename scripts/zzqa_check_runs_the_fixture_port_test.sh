@@ -12,13 +12,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# The gate's shell-test lines are `bash scripts/<name>.sh` or
-# `scripts/<name>.sh`; match either, and allow trailing arguments.
-if ! grep -Eq '^[[:space:]]*(bash[[:space:]]+)?scripts/fixture-port_test\.sh([[:space:]]|$)' scripts/check.sh; then
+# The gate may name a test outright or run it through a glob, so every
+# scripts/<name>.sh token in check.sh is expanded the way the shell would
+# expand it.
+covered=()
+while IFS= read -r token; do
+  for path in $token; do
+    [ -f "$path" ] && covered+=("$path")
+  done
+done < <(grep -oE 'scripts/[A-Za-z0-9_.*-]+\.sh' scripts/check.sh || true)
+
+case " ${covered[*]-} " in
+*" scripts/fixture-port_test.sh "*) ;;
+*)
   echo "FAIL: scripts/check.sh does not run scripts/fixture-port_test.sh" >&2
   echo "      a regression in scripts/containers.sh's fixture_port helper passes the gate" >&2
   exit 1
-fi
+  ;;
+esac
 
 # The gate must also accept the test: running it directly is what the gate will
 # do, and it is the check that the invocation above is worth adding.

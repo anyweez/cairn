@@ -4,6 +4,8 @@
 # container another session is using on a different port.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/lib-test.sh
+require_docker "the PgBouncer port test"
 
 name=cairn-test-pgbouncer
 custom_port=56073

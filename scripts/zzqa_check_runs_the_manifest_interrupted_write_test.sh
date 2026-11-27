@@ -29,12 +29,25 @@ if [ ! -f "$test" ]; then
 	exit 1
 fi
 
-if ! grep -q 'zzqa_manifest_interrupted_write_keeps_the_base' scripts/check.sh; then
+# The gate may name a test outright or run it through a glob, so every
+# scripts/<name>.sh token in check.sh is expanded the way the shell would
+# expand it.
+covered=()
+while IFS= read -r token; do
+	for path in $token; do
+		[ -f "$path" ] && covered+=("$path")
+	done
+done < <(grep -oE 'scripts/[A-Za-z0-9_.*-]+\.sh' scripts/check.sh || true)
+
+case " ${covered[*]-} " in
+*" $test "*) ;;
+*)
 	echo "FAIL: scripts/check.sh does not run $test" >&2
 	echo "      the regression for an interrupted manifest write is never run," >&2
 	echo "      though no Go test reaches that failure path" >&2
 	exit 1
-fi
+	;;
+esac
 
 # The test is run by the gate and still catches the regression it was written
 # for. It needs no Docker and no database; it exits 2 rather than 0 when the
