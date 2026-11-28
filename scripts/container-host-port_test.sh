@@ -9,6 +9,8 @@ set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/containers.sh"
+. "$here/lib-test.sh"
+require_docker "the container host-port test"
 
 name=cairn-test-container-host-port
 # The fixture container scripts/test-postgres.sh starts for CAIRN_TEST_PORT=0. It

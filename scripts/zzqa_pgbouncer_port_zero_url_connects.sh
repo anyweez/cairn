@@ -10,6 +10,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+. scripts/lib-test.sh
+require_docker "the PgBouncer port-0 test"
 
 name=cairn-test-pgbouncer-0
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
@@ -21,8 +23,8 @@ echo "printed: $url"
 
 printed_port=$(printf '%s' "$url" | sed -E 's#.*@127\.0\.0\.1:([0-9]+)/.*#\1#')
 if [ -z "$printed_port" ]; then
-  echo "could not read a port from the URL" >&2
-  exit 2
+  echo "FAIL: could not read a port from the printed URL" >&2
+  exit 1
 fi
 
 mapping=$(docker port "$name" 5432 | head -1)
