@@ -441,7 +441,8 @@ entries already in the ledger unreadable.
 `Handle` costs two round trips to Postgres, and one stream's lock is held for
 about one and a half of them, so throughput depends mostly on the link's
 latency and the connection pool's size. Set the pool size explicitly:
-pgxpool's default of 4 connections caps throughput long before anything else.
+pgxpool's default is the greater of 4 connections and the number of CPUs, which
+on a 4-CPU host caps throughput long before anything else.
 A store also keeps recently used streams' state in memory, so a message to a
 cached stream costs one round trip. Messages that arrive together for one
 stream are recorded in one transaction. That pays most when each stream's
