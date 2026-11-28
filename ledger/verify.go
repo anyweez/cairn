@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"reflect"
 
+	"github.com/anyweez/cairn"
 	"github.com/anyweez/cairn/codec"
 )
 
@@ -69,7 +70,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 	}
 
 	var out []Divergence
-	state := a.Decider.Initial()
+	state, err := a.guardedInitial(stream)
+	if err != nil {
+		return out, err
+	}
 	for _, e := range entries {
 		diverge := func(aspect Aspect, stored, now any) {
 			out = append(out, Divergence{Stream: e.Stream, Seq: e.Seq, Aspect: aspect,
@@ -84,11 +88,16 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 		msg, err := a.Codecs.Messages.Decode(e.Message)
 		if err != nil {
 			diverge(Undecodable, e.Message.Type, err)
-			state = a.Decider.Fold(state, storedEvents)
+			if state, err = a.guardedFold(e, state, storedEvents); err != nil {
+				return out, err
+			}
 			continue
 		}
 
-		d := a.Decider.Decide(state, msg)
+		d, err := a.guardedDecide(e, state, msg)
+		if err != nil {
+			return out, err
+		}
 
 		verdictDiffers := true
 		switch {
@@ -135,9 +144,50 @@ func (a *Aggregate[S, M, R, Ev, Ef]) Verify(ctx context.Context, id string) ([]D
 			}
 		}
 
-		state = a.Decider.Fold(state, storedEvents)
+		if state, err = a.guardedFold(e, state, storedEvents); err != nil {
+			return out, err
+		}
 	}
 	return out, nil
+}
+
+// guardedInitial, guardedDecide and guardedFold call the application's
+// Decider during an audit, turning a panic into an error that names the entry
+// the audit had reached. Fold is the one that reaches the application's code
+// through its event loop rather than directly, so its error says what was
+// being folded rather than naming a function the caller did not write.
+//
+// Verify replays history written by earlier code, which is exactly when a
+// Decider meets a message or event shape it no longer handles. A panic on one
+// entry is a finding about that entry, not a reason to lose the divergences
+// already found, so it is reported at the entry instead of unwinding out of
+// the audit. The write path's recovery in record is the same rule: application
+// code panicking is a failure to report, not one that ends the process.
+func (a *Aggregate[S, M, R, Ev, Ef]) guardedInitial(stream Stream) (state S, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("cairn: %s: Decider.Initial panicked before the audit reached an entry: %v", stream, p)
+		}
+	}()
+	return a.Decider.Initial(), nil
+}
+
+func (a *Aggregate[S, M, R, Ev, Ef]) guardedDecide(e Entry, state S, msg M) (d cairn.Decision[R, Ev, Ef], err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("cairn: %s#%d: Decider.Decide panicked: %v", e.Stream, e.Seq, p)
+		}
+	}()
+	return a.Decider.Decide(state, msg), nil
+}
+
+func (a *Aggregate[S, M, R, Ev, Ef]) guardedFold(e Entry, state S, events []Ev) (next S, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("cairn: %s#%d: panicked folding the stored events: %v", e.Stream, e.Seq, p)
+		}
+	}()
+	return a.Decider.Fold(state, events), nil
 }
 
 // VerifyAll verifies every stream of the aggregate's kind that exists when it
