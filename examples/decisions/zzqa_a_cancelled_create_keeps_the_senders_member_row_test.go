@@ -36,7 +36,10 @@ import (
 
 // stallControl is shared by every connection the pool opens: the first
 // connection to reach its COMMIT closes stalled, and every connection waits
-// for release before delivering the ReadyForQuery that follows.
+// for release before delivering the ReadyForQuery that follows. Both
+// cancellation reproductions in this package use it: this one, and
+// TestACancelledCreateKeepsTheTextItsRecordedEntryNames in
+// zzqa_cancelled_create_keeps_its_text_test.go.
 type stallControl struct {
 	stalled chan struct{}
 	release chan struct{}
@@ -121,7 +124,8 @@ func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
 
 // stallAfterCommitRegister returns a service over the same database as verify
 // whose connection delivers the COMMIT tag and then blocks before the
-// ReadyForQuery.
+// ReadyForQuery. It is shared with the text-row reproduction in
+// zzqa_cancelled_create_keeps_its_text_test.go.
 func stallAfterCommitRegister(t *testing.T, verify *ledger.Store) (*Service, <-chan struct{}, func()) {
 	t.Helper()
 	control := newStallControl()

@@ -8,122 +8,29 @@ package decisions
 // text the message stored, so a committed entry is left naming refs whose rows
 // are gone.
 //
-// The connection below stalls the read that follows the COMMIT's
-// CommandComplete, so the server has committed and the client has read the
-// commit tag, but the recording group cannot finish. The test cancels the
-// caller then, waits for Create to return, and only then lets the recording
-// group finish. That makes the order deterministic: the entry is durable, and
-// the caller was answered with context.Canceled rather than a recorded error.
+// The stalling connection is shared with the member-row reproduction in
+// zzqa_a_cancelled_create_keeps_the_senders_member_row_test.go: it delivers the
+// COMMIT's CommandComplete and withholds the read that follows, so the server
+// has committed and the client has read the commit tag, but the recording group
+// cannot finish. The test cancels the caller then, waits for Create to return,
+// and only then lets the recording group finish. That makes the order
+// deterministic: the entry is durable, and the caller was answered with
+// context.Canceled rather than a recorded error.
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"net"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/anyweez/cairn/ledger"
 	"github.com/anyweez/cairn/ledger/ledgertest"
 )
 
-// stallAfterCommitConn delivers the COMMIT's CommandComplete and then blocks
-// the next read until release is closed, failing it. By the time it blocks the
-// server has committed and the client has read the commit tag, so the
-// recording group has a durable entry it has not been able to finish.
-//
-// One is made for each connection the pool dials: when the caller gives up,
-// pgx dials one of its own to send a cancellation request, and that connection
-// must pass through rather than stall as well.
-type stallAfterCommitConn struct {
-	net.Conn
-	shared *stalledCommit
-	mu     sync.Mutex
-	tail   []byte
-	stall  bool
-}
-
-// stalledCommit is what the test shares with every connection the pool dials:
-// the signal that the COMMIT has been read, and the release of the read after
-// it.
-type stalledCommit struct {
-	ready   chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (c *stallAfterCommitConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.stall {
-		c.mu.Unlock()
-		<-c.shared.release
-		return 0, errConnectionLost
-	}
-	tail := c.tail
-	c.mu.Unlock()
-
-	n, err := c.Conn.Read(p)
-	if n > 0 {
-		scan := append(append([]byte(nil), tail...), p[:n]...)
-		if i := bytes.Index(scan, commitComplete); i >= 0 {
-			delivered := i + len(commitComplete) - len(tail)
-			if delivered < 0 {
-				delivered = 0
-			}
-			c.mu.Lock()
-			c.stall = true
-			c.mu.Unlock()
-			c.shared.once.Do(func() { close(c.shared.ready) })
-			if delivered < n {
-				// Drop whatever followed the commit, ReadyForQuery included.
-				return delivered, nil
-			}
-			return n, nil
-		}
-		if len(scan) > len(commitComplete) {
-			tail = scan[len(scan)-len(commitComplete):]
-		} else {
-			tail = scan
-		}
-		c.mu.Lock()
-		c.tail = tail
-		c.mu.Unlock()
-	}
-	return n, err
-}
-
 func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 	verify := ledgertest.NewStore(t, ledger.RequireActor(false))
-
-	stall := &stalledCommit{
-		ready:   make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	cfg := verify.Pool().Config().Copy()
-	cfg.MaxConns = 1
-	cfg.MinConns = 0
-	dial := cfg.ConnConfig.DialFunc
-	if dial == nil {
-		d := &net.Dialer{Timeout: 5 * time.Second}
-		dial = d.DialContext
-	}
-	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dial(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		return &stallAfterCommitConn{Conn: conn, shared: stall}, nil
-	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("opening the pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	svc := NewService(ledger.New(pool, ledger.RequireActor(false)))
+	svc, stalled, release := stallAfterCommitRegister(t, verify)
+	defer release()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -141,13 +48,13 @@ func TestACancelledCreateKeepsTheTextItsRecordedEntryNames(t *testing.T) {
 	// that follows it is outstanding. Cancel the caller, then wait for Create
 	// to take the cancellation path before letting the recording group finish.
 	select {
-	case <-stall.ready:
+	case <-stalled:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the Create never reached its COMMIT")
 	}
 	cancel()
 	got := <-answered
-	close(stall.release)
+	release()
 
 	if !errors.Is(got.err, context.Canceled) {
 		t.Fatalf("Create returned %v, want the caller's context cancellation; "+
