@@ -21,7 +21,11 @@
 # gone is taken over, and so is one that records no PID and has stayed empty for
 # more than a minute, which is the window between mkdir and writing the
 # metadata. A recorded PID that is still alive keeps the lock however long it
-# takes; a first-time `docker pull` inside `docker run` can exceed a minute.
+# takes -- a first-time `docker pull` inside `docker run` can exceed a minute --
+# but only while it can still be the process that took the lock, because a PID
+# outlives the process it names: a holder killed while holding the lock leaves
+# its number to be handed out again, and the unrelated process that gets it is
+# alive forever as far as `kill -0` is concerned (see _lock_pid_reused).
 # A caller whose read straddles a release sees no PID and no directory: it
 # retries and acquires, rather than reporting a stale lock that is not there.
 # An EXIT trap releases the lock when the critical section fails or the script
@@ -46,6 +50,62 @@ _lock_inode() {
   local listing
   listing=$(ls -di "$1" 2>/dev/null) || true
   printf '%s\n' "${listing%% *}"
+}
+
+# Whether PID names a process at all. `kill -0` fails for a process that
+# exists but belongs to another user, so a live holder in a shared TMPDIR would
+# read as gone; ps answers for a process this user may not signal.
+_lock_process_alive() {
+  kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
+}
+
+# The seconds a process has been running, from ps's POSIX etime field
+# ([[dd-]hh:]mm:ss). ps cannot report a process that is gone, and prints
+# nothing here either, so a caller never mistakes a missing process for a young
+# one.
+_lock_process_age() {
+  local e days hms h= m= s= age
+  e=$(ps -p "$1" -o etime= 2>/dev/null) || return 0
+  e=${e#"${e%%[![:space:]]*}"}
+  e=${e%"${e##*[![:space:]]}"}
+  [ -n "$e" ] || return 0
+  case $e in
+    *-*) days=${e%%-*}; hms=${e#*-} ;;
+    *) days=0; hms=$e ;;
+  esac
+  case $hms in
+    *:*:*) h=${hms%%:*}; hms=${hms#*:}; m=${hms%%:*}; s=${hms#*:} ;;
+    *:*) h=0; m=${hms%%:*}; s=${hms#*:} ;;
+    *) return 0 ;;
+  esac
+  case $days$h$m$s in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  # ps zero-pads each field, and bash reads 08 and 09 as bad octal.
+  age=$((10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s))
+  printf '%s\n' "$age"
+}
+
+# Whether the PID a lock records cannot be the process that took it. A PID is
+# unique only while its process lives: a holder killed while holding the lock
+# leaves the number to be handed out again, and the process that gets it is
+# alive but has never seen this lock, so `kill -0` alone would keep the lock
+# from every later caller forever. The holder records when it took the lock and
+# started no later than that, so a recorded PID whose process has been running
+# for less time than the lock has been held is not the holder. The comparison
+# allows two seconds, because ps reports whole seconds.
+#
+# A lock whose recorded time is missing or unreadable is left alone: nobody can
+# tell it from a live holder's, and taking a live holder's lock is the failure
+# this lock exists to prevent.
+_lock_pid_reused() {
+  local pid=$1 since=$2 age
+  case ${since:-} in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  age=$(_lock_process_age "$pid")
+  [ -n "$age" ] || return 1
+  [ "$((age + 2))" -lt "$(( $(date +%s) - since ))" ]
 }
 
 # A stale lock is moved aside before it is deleted. Renaming is one step, so
@@ -93,7 +153,11 @@ _lock_claim() {
     if [ -n "$owner" ]; then
       _lock_claim_seen=
       _lock_claim_ino=
-      if kill -0 "$owner" 2>/dev/null; then
+      # A claim lives for milliseconds, so its taker is alive unless it was
+      # killed part-way; a recorded PID that belonged to somebody else is the
+      # same reused number, and waiting on it would leave the claim forever.
+      if _lock_process_alive "$owner" &&
+         ! _lock_pid_reused "$owner" "$(cat "$claim/at" 2>/dev/null || true)"; then
         return 2
       fi
       # A taker killed while taking the lock over leaves a claim that nothing
@@ -133,6 +197,7 @@ _lock_claim() {
     _lock_claim_ino=
   done
   printf '%s\n' "$$" >"$claim/pid" 2>/dev/null || true
+  date +%s >"$claim/at" 2>/dev/null || true
   if [ "$(_lock_inode "$dir")" = "$inode" ] &&
      [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$pid" ]; then
     return 0
@@ -191,9 +256,14 @@ lock_acquire() {
       # let a second caller into the check-then-act and reintroduce the
       # name-conflict race this lock exists to prevent.
       seen=
-      if ! kill -0 "$pid" 2>/dev/null; then
+      if ! _lock_process_alive "$pid"; then
         stale=1
         reason="holder $pid is gone"
+      elif _lock_pid_reused "$pid" "$(cat "$dir/at" 2>/dev/null || true)"; then
+        # The number is alive but belongs to a process that started after the
+        # lock was taken, so the holder is gone and its PID was handed on.
+        stale=1
+        reason="holder $pid is gone; its PID now names another process"
       fi
     else
       # An empty read is also what a caller sees when lock_release has just
