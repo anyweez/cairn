@@ -184,9 +184,14 @@ func encode(m *Manifest) ([]byte, error) {
 func Incompatible(old, m *Manifest) []string {
 	now := map[string]Codec{}
 	byName := map[string][]Codec{}
+	// sumsNow is the sums this manifest still declares. A codec name missing
+	// from a sum that is still here has left it, which is a move; one missing
+	// from a sum that is gone was re-spelled, which is not.
+	sumsNow := map[string]bool{}
 	for _, c := range m.Codecs {
 		now[c.key()] = c
 		byName[c.Name] = append(byName[c.Name], c)
+		sumsNow[c.Sum] = true
 	}
 	base := map[string]bool{}
 	for _, c := range old.Codecs {
@@ -205,8 +210,20 @@ func Incompatible(old, m *Manifest) []string {
 			// a sum, so the candidate has to be one the base does not list
 			// under its own spelling: one that it does has already matched an
 			// old entry, and pairing this one with it would hide a removal.
-			if same := byName[was.Name]; len(same) == 1 && !base[same[0].key()] {
+			//
+			// That reading only holds while the sum the base named is gone
+			// from this manifest. A codec that left a sum still declared here
+			// moved into another one, and the entries it stored were decoded
+			// through the codec of the sum it left, which no longer has the
+			// name, so they can't be read.
+			same := byName[was.Name]
+			candidate := len(same) == 1 && !base[same[0].key()]
+			switch {
+			case candidate && !sumsNow[was.Sum]:
 				c, ok = same[0], true
+			case candidate && sumsNow[was.Sum]:
+				problems = append(problems, fmt.Sprintf("%s moved from sum %s to %s, so the codec it left can no longer decode the entries it stored", was.Name, was.Sum, same[0].Sum))
+				continue
 			}
 		}
 		switch {
