@@ -13,10 +13,27 @@
 #
 # Passes once a failed or interrupted write leaves the previous output
 # byte-identical, so the retry compares against the real previous manifest.
+#
+# Exits 2 on a host that cannot give the check an unprivileged mount namespace
+# with tmpfs, since nothing can be proved there.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 root=$(pwd)
+
+# The failed write needs a filesystem small enough to fill, which needs an
+# unprivileged mount namespace with tmpfs. Probe both on their own before the
+# real run: a host that forbids them (GitHub's ubuntu-latest restricts
+# unprivileged user namespaces) cannot run this check at all, and that is
+# "cannot check here" -- exit 2 -- not a regression in the write, which is
+# exit 1. The gate reports exit 2 as a skip rather than a failure.
+probe=$(mktemp -d)
+if ! unshare -Ur -m sh -c 'mount -t tmpfs -o size=64k tmpfs "$1"' sh "$probe" >/dev/null 2>&1; then
+	rmdir "$probe"
+	echo "skip: no unprivileged mount namespace/tmpfs here"
+	exit 2
+fi
+rmdir "$probe"
 
 bin=$(mktemp -d)/cairn-manifest
 go -C cmd/cairn-manifest build -o "$bin" .
