@@ -829,8 +829,10 @@ func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []st
 			return nil, err
 		}
 	}
+	// A caller asking for no entries gets none and keeps its cursor. The
+	// projection's default BatchSize is its own to apply, not every reader's.
 	if limit <= 0 {
-		limit = 100
+		return nil, nil
 	}
 	sql, args := readAllSQL(after, limit, kinds)
 
@@ -863,6 +865,7 @@ func readAll(ctx context.Context, q querier, after Cursor, limit int, kinds []st
 
 // ReadAll returns up to limit entries after the cursor, in transaction order
 // (each stream's entries in seq order), optionally only of the given kinds.
+// A limit of zero or less returns no entries and leaves the cursor unchanged.
 // Entries from a transaction still in flight in this database are held back
 // until every older one here has finished, so a reader that advances its
 // cursor past what it read never misses an entry. A transaction open in
