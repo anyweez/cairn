@@ -618,6 +618,16 @@ func TestIncompatible(t *testing.T) {
 		// The comma in a function signature does not separate fields.
 		{"nested fields reordered beside a function signature", one("o: {f: func(int, string) error, a: string}"), one("o: {a: string, f: func(int, string) error}"), ""},
 
+		// A JSON name may legally hold "{", "[", "(" or even ": " (see
+		// isValidTag), and the name is not structure. The walk has to start at the
+		// shape rather than at the entry's first "{", or a name's punctuation
+		// leaves the members unsorted.
+		{"nested fields reordered behind a braced key", one("x{y: {a: string, b: int}"), one("x{y: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a bracketed key", one("x[y: {a: string, b: int}"), one("x[y: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a parenthesised key", one("x(y: {a: string, b: int}"), one("x(y: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a key holding a balanced brace", one("x{y}: {a: string, b: int}"), one("x{y}: {b: int, a: string}"), ""},
+		{"nested fields reordered behind a key holding an inner separator", one("x: y: {a: string, b: int}"), one("x: y: {b: int, a: string}"), ""},
+
 		// A real change below the top level is still a wire change.
 		{"nested field renamed", one("o: {a: string, b: int}"), one("o: {a: string, c: int}"), "changed shape without a version bump"},
 		{"nested field retyped", one("o: {a: string, b: int}"), one("o: {a: string, b: string}"), "changed shape without a version bump"},
@@ -631,6 +641,12 @@ func TestIncompatible(t *testing.T) {
 		{"nested omitzero added to omitempty", one("o: {a?: string}"), one("o: {a?empty,zero: string}"), "changed shape without a version bump"},
 		{"nested string option added", one("o: {a: int}"), one("o: {a: string(int)}"), "changed shape without a version bump"},
 		{"nested reorder hides a rename", one("o: {a: string, b: int}"), one("o: {b: int, c: string}"), "changed shape without a version bump"},
+		// Starting the walk at the shape must not make a real change behind a
+		// name's punctuation invisible.
+		{"nested field renamed behind a braced key", one("x{y: {a: string, b: int}"), one("x{y: {a: string, c: int}"), "changed shape without a version bump"},
+		{"nested field added behind a braced key", one("x{y: {a: string}"), one("x{y: {a: string, b: int}"), "changed shape without a version bump"},
+		{"nested omitempty added behind a braced key", one("x{y: {a: string}"), one("x{y: {a?: string}"), "changed shape without a version bump"},
+		{"nested reorder hides a rename behind a braced key", one("x{y: {a: string, b: int}"), one("x{y: {b: int, c: string}"), "changed shape without a version bump"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := strings.Join(Incompatible(&Manifest{Codecs: tc.old}, &Manifest{Codecs: tc.now}), "\n")

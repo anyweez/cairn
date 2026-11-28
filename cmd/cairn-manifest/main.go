@@ -397,29 +397,73 @@ func canonicalFields(fields []string) []string {
 	return out
 }
 
-// canonicalShape returns shape with the members of every struct it holds
-// sorted, so reordering a nested struct's fields leaves it unchanged. The
-// walk is recursive because a member's shape may hold structs of its own, and
-// it counts brackets rather than searching for ", " because a generic type
-// name or a function signature holds commas that do not separate members.
-func canonicalShape(shape string) string {
+// canonicalShape returns a rendered field entry with the members of every
+// struct it holds sorted, so reordering a nested struct's fields leaves it
+// unchanged. The walk is recursive because a member's shape may hold structs of
+// its own, and it counts brackets rather than searching for ", " because a
+// generic type name or a function signature holds commas that do not separate
+// members.
+//
+// An entry is "name: shape", and a JSON name may legally hold "{" or "[" (see
+// isValidTag), so the name is not structure. Starting the walk at the entry's
+// first "{" put it inside such a name, where the brackets never match and the
+// members went unsorted: a harmless reorder was then reported as a wire
+// change. The walk starts at the shape instead, found by shapeStart.
+func canonicalShape(entry string) string {
+	prefix, shape := "", entry
+	if at, ok := shapeStart(entry); ok {
+		prefix, shape = entry[:at], entry[at:]
+	}
 	open := strings.IndexByte(shape, '{')
 	if open < 0 {
-		return shape
+		return entry
 	}
 	close, ok := matchingClose(shape, open)
 	if !ok {
-		// A shape the shaper does not normally produce: a JSON tag may hold "{",
-		// which makes the rendering ambiguous. Compare it as it is rather than
-		// risk folding two shapes that are not the same one.
-		return shape
+		// A shape the shaper does not normally produce: a JSON name nested in
+		// it may hold "{", which makes the rendering ambiguous. Compare it as it
+		// is rather than risk folding two shapes that are not the same one.
+		return entry
 	}
 	members := splitMembers(shape[open+1 : close])
 	for i, m := range members {
 		members[i] = canonicalShape(m)
 	}
 	slices.Sort(members)
-	return shape[:open] + "{" + strings.Join(members, ", ") + "}" + canonicalShape(shape[close+1:])
+	return prefix + shape[:open] + "{" + strings.Join(members, ", ") + "}" + canonicalShape(shape[close+1:])
+}
+
+// shapeStart returns where the shape begins in a rendered field entry,
+// "name: shape". A shape is a rendered type expression, so its brackets are
+// balanced, while the name may hold "{", "[" or even ": " itself. The shape is
+// therefore what follows the last ": " the rest of the entry balances from: a
+// ": " inside the shape stands inside a bracket, so what follows it has
+// unmatched closers and cannot qualify.
+func shapeStart(entry string) (int, bool) {
+	start := -1
+	for i := 0; i+2 <= len(entry); i++ {
+		if entry[i] == ':' && entry[i+1] == ' ' && balanced(entry[i+2:]) {
+			start = i + 2
+		}
+	}
+	return start, start >= 0
+}
+
+// balanced reports whether every bracket s opens is closed again.
+func balanced(s string) bool {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
 }
 
 // matchingClose returns the index of the bracket that closes the one at open.
