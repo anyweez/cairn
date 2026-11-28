@@ -2,6 +2,7 @@ package ledger_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/anyweez/cairn"
@@ -132,5 +133,131 @@ func TestVerifyReportsOneDivergencePerAspect(t *testing.T) {
 				t.Fatalf("got %v, want one %s divergence at seq %d", divergences, tc.aspect, tc.seq)
 			}
 		})
+	}
+}
+
+// Verify replays history written by earlier code, so a Decider meeting a
+// message or event shape it no longer handles is the case the audit most has
+// to report. A panic there is a finding about one entry: Verify must not let
+// it escape, must say which entry it happened at, and must keep the
+// divergences it already found. The write path recovers the same panic in
+// record, so ending the caller on one here would be the audit doing worse than
+// the writer.
+func TestVerifyReportsADeciderPanicAtTheEntry(t *testing.T) {
+	t.Parallel()
+
+	// The first entry is re-decided with a changed result, so every case that
+	// reaches it has a divergence in hand before the panic.
+	diverging := func(s counter, m msg) cairn.Decision[int, event, effect] {
+		d := decide(s, m)
+		if s.Total == 0 {
+			d.Result = 424242
+		}
+		return d
+	}
+
+	cases := []struct {
+		name  string
+		found int    // divergences the panic must leave in place
+		want  string // what the error must name
+		setup func(t *testing.T, agg counterAgg)
+	}{
+		{
+			name: "Initial", want: "counter/a",
+			setup: func(t *testing.T, agg counterAgg) {
+				agg.Decider.Initial = func() counter { panic("today's code has no initial state") }
+			},
+		},
+		{
+			name: "Decide", found: 1, want: "counter/a#2",
+			setup: func(t *testing.T, agg counterAgg) {
+				agg.Decider.Decide = func(s counter, m msg) cairn.Decision[int, event, effect] {
+					if s.Total != 0 {
+						panic("today's decider cannot decide a message it used to")
+					}
+					return diverging(s, m)
+				}
+			},
+		},
+		{
+			name: "Fold", found: 1, want: "counter/a#2",
+			setup: func(t *testing.T, agg counterAgg) {
+				agg.Decider.Decide = diverging
+				agg.Decider.Evolve = func(s counter, e event) counter {
+					if s.Total != 0 {
+						panic("today's fold cannot fold an event it used to")
+					}
+					return counterDecider.Evolve(s, e)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agg := newCounter(t)
+			for i := 0; i < 2; i++ {
+				if _, err := agg.Handle(ctx, "a", add{1, 10}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.setup(t, agg)
+
+			var (
+				divergences []ledger.Divergence
+				err         error
+			)
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						t.Fatalf("Verify let a panic in %s escape: %v", tc.name, p)
+					}
+				}()
+				divergences, err = agg.Verify(ctx, "a")
+			}()
+
+			if len(divergences) != tc.found {
+				t.Fatalf("%s panic changed what the audit found: got %v, want %d divergence(s)", tc.name, divergences, tc.found)
+			}
+			if tc.found == 1 && divergences[0].Seq != 1 {
+				t.Fatalf("%s panic lost the divergence found at a#1: got %v", tc.name, divergences)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s panic reported err=%v, want one naming %s", tc.name, err, tc.want)
+			}
+		})
+	}
+}
+
+// VerifyAll keeps the divergences from earlier streams when a later stream's
+// audit panics, the same way it already keeps them when Verify returns an
+// error for one.
+func TestVerifyAllKeepsEarlierStreamsWhenALaterAuditPanics(t *testing.T) {
+	t.Parallel()
+	agg := newCounter(t)
+	// Streams are audited in id order, so a's entry is re-decided first.
+	for _, id := range []string{"a", "b"} {
+		if _, err := agg.Handle(ctx, id, add{1, 10}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decided := 0
+	agg.Decider.Decide = func(s counter, m msg) cairn.Decision[int, event, effect] {
+		decided++
+		if decided == 2 {
+			panic("today's decider cannot decide a message it used to")
+		}
+		d := decide(s, m)
+		d.Result = 424242
+		return d
+	}
+
+	divergences, err := agg.VerifyAll(ctx)
+	if err == nil || !strings.Contains(err.Error(), "counter/b#1") {
+		t.Fatalf("VerifyAll reported err=%v, want one naming counter/b#1", err)
+	}
+	if len(divergences) != 1 || divergences[0].Stream.ID != "a" || divergences[0].Aspect != ledger.Returned {
+		t.Fatalf("VerifyAll lost stream a's divergence when stream b's audit panicked: got %v", divergences)
 	}
 }
