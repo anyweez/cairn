@@ -27,17 +27,52 @@ import (
 // addressable, so a marshaler with a pointer receiver on that type is not
 // used and its fields are what is stored.
 func fields(t types.Type) []string {
-	s := &shaper{active: map[types.Type]bool{}}
+	f, _ := shapeFields(t)
+	return f
+}
+
+// typeKey names a declared type as the manifest compares it across builds: its
+// package path and the name it is declared under. Two declarations with the
+// same key are one type to the program and to the manifest, so a stored shape
+// can only resolve through one of them.
+//
+// It is a shape concept rather than a manifest one because the render is what
+// decides which declarations a stored type depends on.
+type typeKey struct{ pkg, name string }
+
+// shapeFields renders t's JSON shape and names every declared type the render
+// resolved through, so the extractor can tell which declarations that shape
+// depends on. A type whose render ends at an opaque marshaler contributes
+// nothing beyond itself: its fields are not written, so they cannot change the
+// stored shape.
+func shapeFields(t types.Type) ([]string, map[typeKey]bool) {
+	s := &shaper{active: map[types.Type]bool{}, refs: map[typeKey]bool{}}
+	// The registered type's own declaration decides its shape, whichever
+	// branch below renders it.
+	s.ref(t)
 	if _, ok := t.Underlying().(*types.Struct); ok && !s.opaque(t, false) {
-		return s.structFields(t, false)
+		return s.structFields(t, false), s.refs
 	}
-	return []string{"=: " + s.shape(t, false)}
+	return []string{"=: " + s.shape(t, false)}, s.refs
 }
 
 type shaper struct {
 	// active holds the named types being rendered, so a recursive type ends
 	// at its name instead of looping.
 	active map[types.Type]bool
+	// refs is where the declared types a render resolves through are
+	// recorded. It is nil in a shaper built only to render.
+	refs map[typeKey]bool
+}
+
+// ref records that the render depends on t's declaration, if t has one.
+func (s *shaper) ref(t types.Type) {
+	if s.refs == nil {
+		return
+	}
+	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil {
+		s.refs[typeKey{pkg: named.Obj().Pkg().Path(), name: named.Obj().Name()}] = true
+	}
 }
 
 // shape renders a type as JSON sees it: a named string type is a string, a
@@ -50,6 +85,7 @@ func (s *shaper) shape(t types.Type, addr bool) string {
 	// (and TypeString) understands. Resolve it first so an alias cannot slip
 	// past the recursion guard.
 	t = types.Unalias(t)
+	s.ref(t)
 	// encoding/json special-cases json.Number, writing it as a bare number
 	// rather than the quoted string its underlying kind would suggest. It is
 	// the only basic kind it rewrites this way, so a change between
@@ -195,6 +231,10 @@ func (s *shaper) structFields(t types.Type, addr bool) []string {
 				continue
 			}
 			visited[q.typ] = true
+			// An embedded struct is flattened into its outer type rather than
+			// rendered as itself, so record it here: its declaration is what
+			// decides which fields the outer type holds.
+			s.ref(q.typ)
 			st, ok := q.typ.Underlying().(*types.Struct)
 			if !ok {
 				continue

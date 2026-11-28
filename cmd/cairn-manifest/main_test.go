@@ -596,6 +596,10 @@ func TestIncompatible(t *testing.T) {
 		{"added", nil, []Codec{codec(1, v1)}, ""},
 		{"bumped with an upcaster", []Codec{codec(1, v1)}, []Codec{codec(2, v2, 1)}, ""},
 		{"removed", []Codec{codec(1, v1)}, nil, "x.happened (x.Event) was removed"},
+		// A codec that leaves a sum the manifest still declares leaves that
+		// sum's codec unable to decode the entries it stored, though the type
+		// itself is unchanged. Only a sum gone from the manifest was respelled.
+		{"moved to another sum the manifest declares", []Codec{{Sum: "x.Event", Name: "x.happened", Version: 1, Fields: v1}}, []Codec{{Sum: "x.Event", Name: "x.other", Version: 1, Fields: v1}, {Sum: "x.Admin", Name: "x.happened", Version: 1, Fields: v1}}, "moved from sum x.Event to x.Admin"},
 		{"went back", []Codec{codec(2, v2, 1)}, []Codec{codec(1, v1)}, "went back from version 2 to 1"},
 		{"reshaped", []Codec{codec(1, v1)}, []Codec{codec(1, v2)}, "changed shape without a version bump"},
 		{"no upcaster", []Codec{codec(1, v1)}, []Codec{codec(3, v2, 2)}, "no upcaster from version 1"},

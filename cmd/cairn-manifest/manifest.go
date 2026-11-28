@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -123,6 +124,13 @@ type Edge struct {
 // one that moved off a build that already stored its entries. A registration
 // written in more than one file no build includes together records the union of
 // their constraints, since every build that needs it still registers it.
+//
+// A stored type's shape must be the module's too, not the host's. Every type a
+// shape resolves through is read in each build that declares it, and one
+// declared differently in two files no build includes together is an error
+// naming the type and both files: two declarations have two shapes, and the
+// manifest can state one. A module whose every Go file the inherited build
+// excludes is read in a build that includes them, the same as one file.
 func Extract(dir string, patterns ...string) (*Manifest, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
@@ -134,15 +142,25 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		Tests: true,
 	}
 	pkgs, err := loadPackages(cfg, patterns...)
-	if err != nil {
+	// A load that matched no package is not yet an answer: the module may be
+	// valid, with every file behind a constraint this host's build does not
+	// select. readBuilds reads those files, and the refusal stands only when
+	// no build adds one.
+	var none noPackagesError
+	noPackages := errors.As(err, &none)
+	if err != nil && !noPackages {
 		return nil, err
 	}
 
 	x := &extractor{
 		dir: dir, seen: map[string]bool{}, loaded: map[string][]string{},
-		ruleAt: map[string]string{}, codecs: map[string]*Codec{}, codecAt: map[string][]codecSite{},
+		ruleAt: map[string]string{}, tableAt: map[string]string{},
+		codecs: map[string]*Codec{}, codecAt: map[string][]codecSite{},
+		typeDecl: map[typeKey][]typeDecl{}, shapeRef: map[typeKey]map[string]bool{},
 	}
-	x.extract(pkgs)
+	if !noPackages {
+		x.extract(pkgs)
+	}
 	if len(x.errs) == 0 {
 		// A file the inherited build context left out declares nothing the
 		// manifest can see, so the build-constrained half of the module is
@@ -150,6 +168,10 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		// it cannot read: the error is the answer, and a second load only
 		// spends time on it.
 		x.readBuilds(dir, patterns)
+		// A shape is settled only once every build has been read: a type
+		// declared once per platform resolves through one declaration in each
+		// build, and the render above saw only the host's.
+		x.checkShapeBuilds()
 	}
 	x.upcastsToCodecs()
 	if len(x.errs) > 0 {
@@ -159,6 +181,11 @@ func Extract(dir string, patterns ...string) (*Manifest, error) {
 		slices.Sort(x.errs)
 		x.errs = slices.Compact(x.errs)
 		return nil, fmt.Errorf("%s", strings.Join(x.errs, "\n"))
+	}
+	if noPackages && len(x.seen) == 0 {
+		// Nothing was read and no build adds a file: the load's own message is
+		// the answer, not a manifest that says the module declares nothing.
+		return nil, err
 	}
 
 	// A codec registered once in each of several files no build includes
@@ -225,7 +252,7 @@ func loadPackages(cfg *packages.Config, patterns ...string) ([]*packages.Package
 		if _, err := packages.Load(cause, patterns...); err != nil {
 			return nil, fmt.Errorf("loading packages: %w", err)
 		}
-		return nil, fmt.Errorf("loading packages: no packages match %s in %s", strings.Join(patterns, " "), cfg.Dir)
+		return nil, noPackagesError{fmt.Sprintf("loading packages: no packages match %s in %s", strings.Join(patterns, " "), cfg.Dir)}
 	}
 	var loadErrs []string
 	packages.Visit(pkgs, nil, func(p *packages.Package) {
@@ -296,6 +323,21 @@ type upcast struct {
 	build string
 }
 
+// noPackagesError is a load that matched no package: what a module with no Go
+// files produces, and also what a module whose every file this host's build
+// excludes produces. Extract tells the two apart by looking for files a build
+// that includes them can read.
+type noPackagesError struct{ msg string }
+
+func (e noPackagesError) Error() string { return e.msg }
+
+// typeDecl is one declaration of a named type, as one build's load resolved
+// it. A type declared once per platform has one of these per build.
+type typeDecl struct {
+	at  string // the declaration's position, named the way the module's files are
+	typ types.Type
+}
+
 // codecSite is one codec.Register call: the build its file selects and where
 // it is written. A second call under the same sum and name is a duplicate only
 // if a build selects both, so the extractor keeps every call's membership.
@@ -357,10 +399,17 @@ type extractor struct {
 	rules   []Rule
 	ruleAt  map[string]string
 	tables  []Table
+	tableAt map[string]string
 	codecs  map[string]*Codec
 	codecAt map[string][]codecSite
 	upcasts []upcast
-	errs    []string
+	// typeDecl holds every declaration of each named type read in any build,
+	// and shapeRef the named types each stored type's shape resolves through.
+	// Together they are how a shape declared per platform is found rather than
+	// taken from whichever platform read it last.
+	typeDecl map[typeKey][]typeDecl
+	shapeRef map[typeKey]map[string]bool
+	errs     []string
 }
 
 func (x *extractor) errorf(fset *token.FileSet, pos token.Pos, format string, args ...any) {
@@ -405,6 +454,11 @@ func (x *extractor) file(p *packages.Package, f *ast.File, name string) {
 				}
 			}
 		}
+	}
+	// A test file declares a test's own types, not the module's: a stored type
+	// is declared in the code the ledger runs.
+	if !strings.HasSuffix(name, "_test.go") {
+		x.declaredTypes(p, f)
 	}
 	// Codecs registered only in tests never write to the ledger.
 	if strings.HasSuffix(name, "_test.go") {
@@ -497,6 +551,17 @@ func (x *extractor) table(p *packages.Package, ident *ast.Ident, value ast.Expr)
 		x.errorf(p.Fset, ident.Pos(), "table %s must be built by a direct fsm.New call", ident.Name)
 		return
 	}
+	// Two declarations under one name cannot both be in the manifest: a table
+	// carries no build, so a reviewer could not tell which build declares which
+	// -- and one of them would be missing from a manifest that only kept the
+	// first. Refusing is what the tool does with anything it cannot state
+	// exactly, and it names the other declaration's file.
+	at := x.position(p.Fset, ident.Pos())
+	if prev, dup := x.tableAt[name]; dup {
+		x.errorf(p.Fset, ident.Pos(), "table %s is also declared at %s", name, prev)
+		return
+	}
+	x.tableAt[name] = at
 	if call.Ellipsis.IsValid() {
 		x.errorf(p.Fset, call.Pos(), "table %s must list its edges, not pass a slice", ident.Name)
 		return
@@ -565,6 +630,8 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			return
 		}
 		n, _ := constant.Int64Val(version)
+		shape, refs := shapeFields(v)
+		x.noteShapeRefs(refs, constant.StringVal(name))
 		c := &Codec{
 			// reflect resolves an alias, so the runtime names the aliased type;
 			// resolve both here or a registration through an alias is recorded
@@ -575,7 +642,7 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 			Version: int(n),
 			Type:    typeString(v),
 			Build:   build,
-			Fields:  fields(v),
+			Fields:  shape,
 		}
 		at := x.position(p.Fset, call.Pos())
 		key := c.key()
@@ -631,6 +698,90 @@ func (x *extractor) codecCall(p *packages.Package, call *ast.CallExpr, build str
 		})
 	case unattributedUpcast(info, call):
 		x.errorf(p.Fset, call.Pos(), "Upcast: %s declares its own Upcast, so the codec it registers on cannot be read; call Upcast on the codec itself", types.TypeString(info.Selections[call.Fun.(*ast.SelectorExpr)].Recv(), nil))
+	}
+}
+
+// noteShapeRefs records that codec's shape resolves through refs, so a second
+// declaration of any of them is compared once every build has been read.
+func (x *extractor) noteShapeRefs(refs map[typeKey]bool, codec string) {
+	for ref := range refs {
+		if x.shapeRef[ref] == nil {
+			x.shapeRef[ref] = map[string]bool{}
+		}
+		x.shapeRef[ref][codec] = true
+	}
+}
+
+// declaredTypes records the types f declares, with the build's own type
+// information, so a type declared once per platform can be compared after every
+// build has been read.
+func (x *extractor) declaredTypes(p *packages.Package, f *ast.File) {
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			obj, ok := p.TypesInfo.Defs[ts.Name].(*types.TypeName)
+			if !ok || obj.Pkg() == nil || obj.Type() == nil {
+				continue
+			}
+			key := typeKey{pkg: obj.Pkg().Path(), name: obj.Name()}
+			x.typeDecl[key] = append(x.typeDecl[key], typeDecl{at: x.position(p.Fset, ts.Pos()), typ: obj.Type()})
+		}
+	}
+}
+
+// checkShapeBuilds refuses a stored type whose shape resolves through a type
+// declared in more than one file. Two declarations of one type are necessarily
+// in files no build includes together -- a module that could build both would
+// not compile -- so the shape belongs to a build rather than to the module. The
+// manifest states one shape and records no build for it, so a difference is an
+// error naming the type and the two declarations, in the same way as a
+// registration the tool cannot state exactly.
+func (x *extractor) checkShapeBuilds() {
+	var keys []typeKey
+	for key := range x.shapeRef {
+		if len(x.typeDecl[key]) > 1 {
+			keys = append(keys, key)
+		}
+	}
+	slices.SortFunc(keys, func(a, b typeKey) int {
+		return cmp.Or(cmp.Compare(a.pkg, b.pkg), cmp.Compare(a.name, b.name))
+	})
+	for _, key := range keys {
+		x.refuseShapeDifference(key)
+	}
+}
+
+// refuseShapeDifference compares the declarations of one type in the stored
+// shape. Two declarations that render the same shape are one shape, so a type
+// given the same fields on every platform is not refused. Field order is
+// ignored, as the -base comparison ignores it: decoding matches JSON keys by
+// name.
+func (x *extractor) refuseShapeDifference(key typeKey) {
+	decls := slices.Clone(x.typeDecl[key])
+	// Sorted by position so the same tree is refused in the same words on
+	// every host, whichever declaration this host's build resolved.
+	slices.SortFunc(decls, func(a, b typeDecl) int { return cmp.Compare(a.at, b.at) })
+	want := fields(decls[0].typ)
+	codecs := make([]string, 0, len(x.shapeRef[key]))
+	for name := range x.shapeRef[key] {
+		codecs = append(codecs, name)
+	}
+	slices.Sort(codecs)
+	for _, d := range decls[1:] {
+		got := fields(d.typ)
+		if sameFields(want, got) {
+			continue
+		}
+		x.errs = append(x.errs, fmt.Sprintf(
+			"%s: type %s.%s is also declared at %s with a different shape ([%s] there and [%s] here), so the shape of the stored type %s depends on the build and the manifest can't state it",
+			decls[0].at, key.pkg, key.name, d.at, strings.Join(want, ", "), strings.Join(got, ", "), strings.Join(codecs, ", ")))
 	}
 }
 
