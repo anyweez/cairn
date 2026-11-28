@@ -230,11 +230,15 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 		// state the whole message nets to.
 		var folded []S
 		// The ledger stores a decision's events before it folds them, so a
-		// reload folds the values Decide produced. An Evolve may write through
-		// a reference an event carries; folding the live values would let that
-		// write rewrite the events D5 replays and D6 round-trips. Fold a copy
-		// and keep the decided events as the ones the ledger stores.
-		for _, e := range clone(decision.Events) {
+		// reload folds the values Decide produced. It writes every event in its
+		// own envelope and folds the value decoded back, so two events that
+		// name one pointer, map or slice reach Evolve as two values and a write
+		// through one cannot reach its sibling. Copy each event on its own for
+		// the same reason — one clone of the whole slice keeps the sharing — and
+		// keep the decided events as the ones the ledger stores and D6
+		// round-trips.
+		for _, decided := range decision.Events {
+			e := clone(decided)
 			mark := fingerprint(after)
 			next, ok := guard(func() S { return m.Decider.Evolve(after, e) })
 			j(Total, spec.Check(ok, "Evolve panicked on %+v: %v", e, next.panic))
@@ -265,7 +269,14 @@ func (m Machine[S, M, R, Ev, Ef]) run(rt *rapid.T, outer rapid.TB, rep *report) 
 			}
 		}
 
-		events = append(events, decision.Events...)
+		// D5 replays the history the ledger stores: every event in its own
+		// envelope, each decoded on its own, so no two events share a value a
+		// fold can write through. Copy each event on its own, as the fold above
+		// does, rather than appending the live values the whole decision still
+		// shares.
+		for _, e := range decision.Events {
+			events = append(events, clone(e))
+		}
 		state = after
 		// Checked where they always were, after the laws and changes, so a
 		// transition a law already rejects stays attributed to that law. A
