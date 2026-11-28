@@ -387,7 +387,17 @@ is read with that package's files hidden, since the go command never builds the
 two together. A tree therefore produces the same manifest on every host, so the
 committed file is current everywhere and `-base` never reads a type that one
 platform stores and another does not as removed. A file no build includes is an
-error naming the file and its constraint.
+error naming the file and its constraint. A module whose every file is behind a
+constraint this host's build does not select is read the same way, rather than
+refused as empty.
+
+A stored type's *shape* is the module's too, not the host's. A type declared
+once per platform — a field type with one representation under `//go:build
+linux` and another elsewhere, or the stored type itself declared that way — has
+one shape per build, and the manifest records no build for a shape. So the tool
+refuses it with an error naming the type and the declarations that disagree,
+rather than committing whichever one this host resolved. Two declarations that
+render the same shape are one shape and are read normally.
 
 A registration or an upcaster written in a constrained file carries that
 constraint into the manifest, so the manifest says which builds can decode the
@@ -397,7 +407,9 @@ of their constraints. Two calls one build does include together are a
 duplicate, as are calls that disagree about the version, type or shape under
 one name. Moving one from one platform's file to another's changes no name,
 version or shape, but it takes the code path away from a build that already
-stored entries, so `-base` reports it.
+stored entries, so `-base` reports it. Two tables declared under one name are
+refused rather than listed twice: a table records no build, so the manifest
+could not say which build declares which.
 
 Each of these must be stated with constants. A rule, table or registration
 the tool can't read exactly is an error, not a guess. So is a registration

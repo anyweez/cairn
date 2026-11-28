@@ -13,10 +13,12 @@ name=cairn-lock-test
 lock=$tmp/$name.lock
 holder=
 old_holder=
+reused=
 
 cleanup() {
   [ -z "$holder" ] || kill "$holder" 2>/dev/null || true
   [ -z "$old_holder" ] || kill "$old_holder" 2>/dev/null || true
+  [ -z "$reused" ] || kill "$reused" 2>/dev/null || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -33,13 +35,15 @@ wait_for() {
   ! kill -0 "$pid" 2>/dev/null
 }
 
-# A live holder keeps the lock however long it has held it: its PID is alive,
-# and the time it took the lock is long past.
+# A live holder keeps the lock, however long it takes: its PID is alive, and
+# it took the lock after it started, as every holder does. A first-time
+# `docker pull` inside `docker run` can keep it that way for more than a
+# minute, so no age of its own takes the lock from it.
 sleep 30 &
 holder=$!
 mkdir "$lock"
 printf '%s\n' "$holder" >"$lock/pid"
-printf '%s\n' 0 >"$lock/at"
+date +%s >"$lock/at"
 
 TMPDIR=$tmp bash -c ". '$here/lib-lock.sh'; lock_acquire $name" >/dev/null 2>&1 &
 waiter=$!
@@ -52,6 +56,29 @@ kill "$waiter" 2>/dev/null
 wait "$waiter" 2>/dev/null
 [ "$(cat "$lock/pid" 2>/dev/null)" = "$holder" ] ||
   fail "the live holder's lock was replaced"
+
+# A PID is only unique while its process lives. A holder killed while holding
+# the lock leaves its number behind, the kernel hands it to an unrelated
+# process, and `kill -0` says that process is alive -- so a lock carrying a
+# number that started long after the lock was taken is not held by anybody and
+# must be taken over at once, or every later fixture run waits forever.
+sleep 30 &
+reused=$!
+rm -rf "$lock"
+mkdir "$lock"
+printf '%s\n' "$reused" >"$lock/pid"
+printf '%s\n' "$(( $(date +%s) - 3600 ))" >"$lock/at"
+TMPDIR=$tmp bash -c ". '$here/lib-lock.sh'; lock_acquire $name" >/dev/null 2>&1 &
+acquirer=$!
+wait_for "$acquirer" 5 || {
+  kill "$acquirer" 2>/dev/null
+  fail "a lock whose recorded PID had been reused was never taken over"
+}
+wait "$acquirer" || fail "the caller exited non-zero after taking over a reused PID's lock"
+[ -d "$lock" ] && fail "the caller did not release the lock"
+kill "$reused" 2>/dev/null
+wait "$reused" 2>/dev/null
+reused=
 
 # A holder killed before it recorded itself leaves no PID to check, so the lock
 # is taken over once it has stayed empty for more than a minute. A date that
@@ -111,7 +138,7 @@ wait "$acquirer" 2>/dev/null
 acquirer=
 rm -rf "$lock"
 
-echo "ok: a live holder keeps the lock, a gone or unrecorded one is taken over, and an unrecorded claim is not"
+echo "ok: a live holder keeps the lock, a gone or reused one is taken over, and an unrecorded claim is not"
 
 # A lock taken over while its holder is still working belongs to its new
 # holder. The old holder's release must remove the directory it created, not

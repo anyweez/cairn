@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -87,7 +88,7 @@ func (x *extractor) unread(dir string, patterns []string) []string {
 	for _, path := range x.ignored {
 		add(path)
 	}
-	if slices.Contains(patterns, "./...") {
+	if wholeModule(dir, patterns) {
 		files, err := moduleGoFiles(dir)
 		if err != nil {
 			x.errs = append(x.errs, err.Error())
@@ -99,6 +100,33 @@ func (x *extractor) unread(dir string, patterns []string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// wholeModule reports whether the patterns select the whole module rooted at
+// dir rather than part of it, which is what makes walking every Go file under
+// dir the right way to find a package no build this host makes can see. A
+// package whose every file a build constraint excludes does not appear in the
+// load at all, so it is named in no package's ignored files; only the walk
+// finds it. The go command spells the whole module "./..." and "<module
+// path>/..."; a narrower pattern -- "./pkg/...", or one package's import path
+// -- selects a subset whose excluded packages are not the manifest's, and must
+// not pull the rest of the module in.
+func wholeModule(dir string, patterns []string) bool {
+	whole := []string{"./..."}
+	if path := modulePath(dir); path != "" {
+		whole = append(whole, path+"/...")
+	}
+	return slices.ContainsFunc(patterns, func(p string) bool { return slices.Contains(whole, p) })
+}
+
+// modulePath returns the module path go.mod in dir declares, or "" when dir has
+// no readable go.mod or it names no module.
+func modulePath(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	if err != nil {
+		return ""
+	}
+	return modfile.ModulePath(data)
 }
 
 // readInBuild reads one file in a build that includes it.

@@ -575,6 +575,109 @@ func TestBuildsOverlap(t *testing.T) {
 	}
 }
 
+// A table carries no build in the manifest, so two declarations under one name
+// cannot both be stated: one would be dropped, and a reviewer could not tell
+// which build declares which. The tool refuses and names the other file, the
+// way it refuses a duplicate rule ID.
+func TestATableDeclaredInTwoBuildsFilesIsRefused(t *testing.T) {
+	dir := writeModule(t, `module example.com/duptable
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"lifecycle_linux.go": `//go:build linux
+
+package duptable
+
+import "github.com/anyweez/cairn/blocks/fsm"
+
+type State string
+
+var Lifecycle = fsm.New(
+	fsm.Edge[State, string]{From: "open", On: "close", To: "closed"},
+)
+`,
+		"lifecycle_other.go": `//go:build !linux
+
+package duptable
+
+import "github.com/anyweez/cairn/blocks/fsm"
+
+type State string
+
+var Lifecycle = fsm.New(
+	fsm.Edge[State, string]{From: "closed", On: "reopen", To: "open"},
+)
+`,
+	})
+
+	_, err := Extract(dir, "./...")
+	if err == nil {
+		t.Fatal("two tables declared under one name must be refused, not listed twice")
+	}
+	for _, want := range []string{"duptable.Lifecycle", "lifecycle_linux.go", "lifecycle_other.go"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name %s, got: %v", want, err)
+		}
+	}
+}
+
+// A pattern that selects part of the module records only that part: the walk
+// that finds a package no build this host makes can see is the whole module's,
+// so it must not pull in a package the pattern did not ask for.
+func TestANarrowPatternDoesNotReadTheRestOfTheModule(t *testing.T) {
+	dir := writeModule(t, `module example.com/narrow
+
+go 1.26.0
+
+require github.com/anyweez/cairn v0.0.0
+
+replace github.com/anyweez/cairn => `+mustRepoRoot(t)+`
+`, map[string]string{
+		"pkg/events.go": `package pkg
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Pkg struct{ A int }
+
+func (Pkg) isEvent() {}
+
+var Events = codec.New[Event]()
+
+func init() { codec.Register[Pkg](Events, "narrow.pkg", 1) }
+`,
+		"other/events_darwin.go": `//go:build darwin
+
+package other
+
+import "github.com/anyweez/cairn/codec"
+
+type Event interface{ isEvent() }
+
+type Other struct{ B int }
+
+func (Other) isEvent() {}
+
+var Events = codec.New[Event]()
+
+func init() { codec.Register[Other](Events, "narrow.other", 1) }
+`,
+	})
+
+	m, err := Extract(dir, "./pkg/...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := codecNames(m); !slices.Equal(got, []string{"narrow.pkg"}) {
+		t.Errorf("a pattern selecting one package recorded %v, want only narrow.pkg", got)
+	}
+}
+
 func mustRepoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")
