@@ -214,6 +214,11 @@ func collect(opts []Option) (options, error) {
 // transaction. A refusal is recorded and committed, then returned as the error
 // (a *cairn.Refusal) alongside the populated Handled.
 //
+// A caller that gives up while its message is in flight is told whether the
+// message may still be recorded: an error wrapping ErrUnknownOutcome when a
+// recording group has taken it, and its own context error when the message
+// never reached one.
+//
 // It costs one round trip when the store's state cache holds the stream: the
 // message is decided at once, and recorded on condition that the stream is
 // still where the cache has it. Otherwise it costs two. The first begins the
@@ -256,6 +261,9 @@ type request[M, R any] struct {
 	meta    Meta
 	metaErr error
 	done    chan result[R]
+	// fate decides who owns the outcome when the caller gives up before the
+	// message is recorded; see requestFate.
+	fate requestFate
 }
 
 type result[R any] struct {

@@ -322,6 +322,12 @@ divergences, err := accounts.VerifyAll(ctx) // would today's code decide the sam
   which says the message may be in the ledger. A caller that holds data the
   entry would name keeps it, the same as for `ErrRecorded`, because the entry
   may point at it and a close is not a rollback.
+
+  A caller that gives up on its own request gets one of those two answers by
+  the same rule. If its message is still waiting its turn, nothing has
+  recorded it, so the error is the caller's own context error. If a group has
+  already taken it, that group may still commit it, so the error wraps
+  `ErrUnknownOutcome`.
 - **Replay verification.** `Aggregate.Verify` re-decides every stored message
   with today's code and reports each divergence. State between messages comes
   from the stored events, so one divergence doesn't cascade. A stored result

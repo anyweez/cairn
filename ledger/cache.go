@@ -190,10 +190,40 @@ func (a *Aggregate[S, M, R, Ev, Ef]) cacheKey(stream Stream) string {
 	return stream.String() + "\x00" + a.StateVersion
 }
 
+// requestFate is who decides a message's outcome when its caller gives up:
+// the lane claims it for a recording group first, or the caller abandons it
+// first. Both are a compare-and-swap from fateWaiting, so exactly one of them
+// wins, and a caller that gives up is never told a message it is still waiting
+// to record was dropped.
+type requestFate struct{ state atomic.Int32 }
+
+const (
+	fateWaiting   int32 = iota // in the lane, claimed by neither
+	fateGrouped                // a recording group holds it; it may be recorded
+	fateAbandoned              // its caller gave up first; it never will be
+)
+
+// claim takes the request for a recording group. It reports false when the
+// caller has already abandoned it, in which case the message is not recorded.
+func (f *requestFate) claim() bool {
+	return f.state.CompareAndSwap(fateWaiting, fateGrouped)
+}
+
+// abandon gives up on the request's result for a caller whose context has
+// ended. It reports whether no group holds the message: true means nothing
+// will record it, and false means one may still do so.
+func (f *requestFate) abandon() bool {
+	return f.state.CompareAndSwap(fateWaiting, fateAbandoned)
+}
+
 // handleCached hands r to the stream's lane and waits for its result. A
 // caller whose context ends while its message is in flight returns at once,
-// and the message may still be recorded, as with any write abandoned
-// mid-flight.
+// and whether the message may still be recorded depends on whether the lane
+// has taken it into a group. If it has, the group may still commit it, so the
+// caller gets an error wrapping ErrUnknownOutcome; if it has not, the message
+// is dropped from the lane and the caller gets its own context error. The
+// lane and the caller decide that with a compare-and-swap (see requestFate),
+// so neither can answer on the other's behalf.
 func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream Stream, r *request[M, R]) result[R] {
 	r.done = make(chan result[R], 1)
 	lane := laneKey{agg: a, name: stream.String()}
@@ -204,7 +234,10 @@ func (a *Aggregate[S, M, R, Ev, Ef]) handleCached(ctx context.Context, stream St
 	case res := <-r.done:
 		return res
 	case <-ctx.Done():
-		return result[R]{err: ctx.Err()}
+		if r.fate.abandon() {
+			return result[R]{err: ctx.Err()}
+		}
+		return result[R]{err: &unknownOutcomeError{err: ctx.Err()}}
 	}
 }
 
@@ -218,6 +251,11 @@ func (a *Aggregate[S, M, R, Ev, Ef]) drain(stream Stream, lane laneKey) {
 		var reqs []*request[M, R]
 		for _, item := range taken {
 			r := item.(*request[M, R])
+			if !r.fate.claim() {
+				// Its caller gave up while it was still waiting in the lane, and
+				// has been told nothing was recorded. Nothing is.
+				continue
+			}
 			if err := r.ctx.Err(); err != nil {
 				r.done <- result[R]{err: err}
 				continue

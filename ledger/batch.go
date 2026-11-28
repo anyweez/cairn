@@ -190,20 +190,24 @@ func (e *recordedError) Unwrap() error { return e.err }
 
 func (e *recordedError) Is(target error) bool { return target == ErrRecorded }
 
-// ErrUnknownOutcome reports that a batch failed after its COMMIT was sent, and
-// neither the COMMIT's result nor its connection could be read to tell whether
-// the transaction committed: the message may be in the ledger. It is wrapped
-// by the error naming what failed to read.
+// ErrUnknownOutcome reports that a message may be in the ledger although its
+// caller was not told that it is, and the ledger cannot say whether it is. It
+// is reported when a batch fails after its COMMIT was sent and neither the
+// COMMIT's result nor its connection could be read to tell whether the
+// transaction committed; the error naming what failed to read is then wrapped.
+// A caller that gives up while its message is in flight on a cached stream
+// gets it too, because the group holding the message may still commit it.
 //
 // A caller that stores data the entry would name must keep it, exactly as for
 // ErrRecorded; this error only stops short of promising that the message is
 // there. It must not replay the message unless it carries an idempotency key.
 var ErrUnknownOutcome = errors.New("cairn: whether the message was recorded is unknown")
 
-// unknownOutcomeError is an error from a batch whose COMMIT result could not be
-// read, sent over a connection that cannot be inspected to tell whether it
-// committed. It carries the error that says what could not be read, and
-// matches ErrUnknownOutcome.
+// unknownOutcomeError reports that whether a message was recorded is unknown:
+// from a batch whose COMMIT result could not be read over a connection that
+// cannot be inspected, or from a caller that gives up while a recording group
+// holds its message. It carries the error that says why, and matches
+// ErrUnknownOutcome.
 type unknownOutcomeError struct{ err error }
 
 func (e *unknownOutcomeError) Error() string { return fmt.Sprintf("%v: %v", ErrUnknownOutcome, e.err) }
