@@ -968,23 +968,25 @@ func unaliasedNamed(n *types.Named) types.Type {
 	return inst
 }
 
-// unaliasedInterface rebuilds an interface with its methods' parameter names
-// dropped. The empty interface is returned unchanged: rebuilding it would turn
-// the universe's `any` back into an `interface{}`.
+// unaliasedInterface rebuilds an interface as reflect exposes it: its method
+// set is flat and its methods' parameter names are dropped. reflect has already
+// flattened an embedded interface into the methods it contributes, so a sum
+// written `interface{fmt.Stringer}` is `interface{String() string}` to the
+// runtime; keeping the embed here would name one correct codec two ways and
+// fail codec.CheckRegistrations in both directions. The empty interface is
+// returned unchanged: rebuilding it would turn the universe's `any` back into
+// an `interface{}`.
 func unaliasedInterface(t *types.Interface) types.Type {
 	if t.NumMethods() == 0 && t.NumEmbeddeds() == 0 {
 		return t
 	}
-	methods := make([]*types.Func, t.NumExplicitMethods())
+	t.Complete()
+	methods := make([]*types.Func, t.NumMethods())
 	for i := range methods {
-		m := t.ExplicitMethod(i)
+		m := t.Method(i)
 		methods[i] = types.NewFunc(m.Pos(), m.Pkg(), m.Name(), withoutParamNames(m.Type().(*types.Signature)))
 	}
-	embeds := make([]types.Type, t.NumEmbeddeds())
-	for i := range embeds {
-		embeds[i] = unaliased(t.EmbeddedType(i))
-	}
-	iface := types.NewInterfaceType(methods, embeds)
+	iface := types.NewInterfaceType(methods, nil)
 	iface.Complete()
 	return iface
 }
