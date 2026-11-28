@@ -37,6 +37,10 @@
 # between. A takeover therefore claims the lock it inspected with an atomic
 # mkdir inside it, and only then moves it, and lock_release removes the
 # directory it created rather than whatever the name holds when it is called.
+# A dead claim is cleared by renaming it aside, so several callers recovering
+# the same one do not race each other's delete and recreate of that path, and
+# what was moved is checked before it is deleted: a claim another taker has
+# created and recorded in the meantime is not this caller's to clear.
 
 _lock_dir=
 _lock_held=
@@ -119,6 +123,14 @@ _lock_takeover() {
   local dir=$1 pid=$2 inode=$3 stale="$1.stale.$$" status=0
   _lock_claim "$dir" "$pid" "$inode" || status=$?
   [ "$status" -eq 0 ] || return "$status"
+  # Move only the lock this caller claimed. A caller that found this claim dead
+  # can clear it while this one prepares, so the claim is checked here and
+  # again after the move: a takeover whose claim did not travel with the lock
+  # must not go on to create one.
+  if [ "$(cat "$dir/claim/pid" 2>/dev/null || true)" != "$$" ]; then
+    _lock_unclaim "$dir"
+    return 2
+  fi
   if ! mv "$dir" "$stale" 2>/dev/null; then
     _lock_unclaim "$dir"
     # A move that failed with the directory still there cannot succeed later,
@@ -126,7 +138,51 @@ _lock_takeover() {
     [ -d "$dir" ] || return 2
     return 1
   fi
+  if [ "$(cat "$stale/claim/pid" 2>/dev/null || true)" != "$$" ]; then
+    # Another caller cleared the claim between the check and the move, so this
+    # caller never won the takeover. The stale lock has left the name and
+    # nothing was created at it, so the next mkdir settles who takes it.
+    rm -rf "$stale" 2>/dev/null || true
+    return 2
+  fi
   rm -rf "$stale" 2>/dev/null || true
+  return 0
+}
+
+# Clear a stale claim or a released lock directory. Renaming is atomic, so of
+# several callers that found the same one exactly one moves it aside; the rest
+# see it already gone and retry. A recursive delete would race another caller's
+# mkdir inside the same path, and could fail or remove a claim just taken.
+#
+# With PID given, the moved directory must record that PID in its own pid file.
+# A taker can clear the dead claim, create its own and record itself between
+# this caller's read and its move, and clearing by path would take that live
+# claim away and let two callers move the lock. Such a claim is deleted rather
+# than put back -- its owner checks that the claim is still at the path before
+# moving the lock, and restoring it could land it on a fresh empty claim -- and
+# the caller must not go on to take the lock.
+#
+# Returns 0 when the directory is gone, 2 when PID was given and the directory
+# moved aside records another PID or none, and 1 when it is still there.
+_lock_drop_dir() {
+  local target=$1 moved="$1.stale.$$" expect= found= check=
+  if [ "$#" -gt 1 ]; then
+    check=1
+    expect=$2
+  fi
+  rm -rf "$moved" 2>/dev/null || true
+  if ! mv "$target" "$moved" 2>/dev/null; then
+    [ -e "$target" ] && return 1
+    return 0
+  fi
+  if [ -n "$check" ]; then
+    found=$(cat "$moved/pid" 2>/dev/null || true)
+    if [ "$found" != "$expect" ]; then
+      rm -rf "$moved" 2>/dev/null || true
+      return 2
+    fi
+  fi
+  rm -rf "$moved" 2>/dev/null || true
   return 0
 }
 
@@ -141,7 +197,7 @@ _lock_takeover() {
 # through the same takeover (wait for it, and the live lock it leaves behind),
 # and 1 when the claim cannot be taken or cleared, so DIR cannot be taken over.
 _lock_claim() {
-  local dir=$1 pid=$2 inode=$3 claim=$1/claim owner now claim_ino
+  local dir=$1 pid=$2 inode=$3 claim=$1/claim owner now claim_ino status
   while :; do
     if mkdir "$claim" 2>/dev/null; then
       _lock_claim_seen=
@@ -162,14 +218,34 @@ _lock_claim() {
       fi
       # A taker killed while taking the lock over leaves a claim that nothing
       # would ever clear, so a claim whose taker is gone is removed and retried.
-      if ! rm -rf "$claim" 2>/dev/null; then
-        return 1
+      # The claim is identified after it has been moved aside: a contender can
+      # clear the dead one, create its own and record itself in between, and
+      # that live claim is not this caller's to delete.
+      status=0
+      _lock_drop_dir "$claim" "$owner" || status=$?
+      case $status in
+        0) continue ;;
+        2) return 2 ;;
+      esac
+      # Still there in a directory this caller can write: another taker cleared
+      # and recreated it while this one looked, so inspect the lock again
+      # rather than report a claim that cannot be cleared.
+      [ -d "$dir" ] || return 2
+      if [ -w "$dir" ] && [ -x "$dir" ]; then
+        return 2
       fi
-      continue
+      return 1
     fi
-    # Nothing to clear means the claim cannot be created at all, in a directory
-    # the caller cannot write; report that rather than spinning on it.
+    # Nothing to clear is either a claim another caller just cleared, or one
+    # that cannot be created at all in a directory the caller cannot write.
+    # Only the latter is a failure; let the caller retry the former.
     if [ ! -e "$claim" ]; then
+      # A directory that has gone since the test above was taken over, not
+      # left behind; the next mkdir settles which.
+      [ -d "$dir" ] || return 2
+      if [ -w "$dir" ] && [ -x "$dir" ]; then
+        return 2
+      fi
       _lock_claim_seen=
       _lock_claim_ino=
       return 1
@@ -189,16 +265,30 @@ _lock_claim() {
       return 2
     fi
     # A taker killed before it recorded itself leaves a claim nothing would
-    # ever clear, so one that has stayed empty past the window is removed.
-    if ! rm -rf "$claim" 2>/dev/null; then
-      return 1
-    fi
+    # ever clear, so one that has stayed empty past the window is removed. It
+    # must still be empty once it has been moved aside: a taker that recorded
+    # itself in the meantime is alive and keeps its claim.
+    status=0
+    _lock_drop_dir "$claim" "" || status=$?
     _lock_claim_seen=
     _lock_claim_ino=
+    case $status in
+      0) continue ;;
+      2) return 2 ;;
+    esac
+    [ -d "$dir" ] || return 2
+    if [ -w "$dir" ] && [ -x "$dir" ]; then
+      return 2
+    fi
+    return 1
   done
-  printf '%s\n' "$$" >"$claim/pid" 2>/dev/null || true
-  date +%s >"$claim/at" 2>/dev/null || true
+  # The claim's own write can lose a race with another caller clearing it, and
+  # the shell reports that redirection failure itself, so silence the group.
+  { printf '%s\n' "$$" >"$claim/pid"; date +%s >"$claim/at"; } 2>/dev/null || true
+  # Move only while this caller's claim still stands: another caller that
+  # cleared it must not leave two callers believing they won the takeover.
   if [ "$(_lock_inode "$dir")" = "$inode" ] &&
+     [ "$(cat "$claim/pid" 2>/dev/null || true)" = "$$" ] &&
      [ "$(cat "$dir/pid" 2>/dev/null || true)" = "$pid" ]; then
     return 0
   fi
@@ -209,7 +299,7 @@ _lock_claim() {
 # Give back a claim, and only a claim this caller wrote.
 _lock_unclaim() {
   [ "$(cat "$1/claim/pid" 2>/dev/null || true)" = "$$" ] || return 0
-  rm -rf "$1/claim" 2>/dev/null || true
+  _lock_drop_dir "$1/claim"
 }
 
 # An empty lock is aged before takeover, so this checks now whether that
@@ -233,13 +323,22 @@ lock_acquire() {
   _lock_claim_ino=
   while ! mkdir "$dir" 2>/dev/null; do
     if [ ! -d "$dir" ]; then
-      # mkdir failed with no lock directory to inspect. Either the directory
-      # holding the lock is unusable, or another caller released the lock
-      # between the mkdir and here. Report the former; retry the latter.
+      # mkdir failed with no lock directory to inspect. Anything that is not a
+      # lock directory at the name is not a caller that released it, and a
+      # parent that cannot be written cannot hold one either: report both at
+      # once rather than wait out the window below.
+      if [ -e "$dir" ] || [ -L "$dir" ] ||
+         [ ! -d "${dir%/*}" ] ||
+         [ ! -w "${dir%/*}" ] || [ ! -x "${dir%/*}" ]; then
+        echo "lock $dir: cannot create the lock directory" >&2
+        return 1
+      fi
+      # Otherwise another caller released the lock between the mkdir and here.
+      # Under contention a run of those is ordinary -- every one of them means
+      # a caller held or was taking the lock -- so the bound is the same minute
+      # an empty lock is aged for, not a handful of turns of the loop.
       missing=$((missing + 1))
-      if [ -e "$dir" ] || [ -L "$dir" ] || [ ! -d "${dir%/*}" ] ||
-         [ ! -w "${dir%/*}" ] || [ ! -x "${dir%/*}" ] ||
-         [ "$missing" -gt 10 ]; then
+      if [ "$missing" -gt 600 ]; then
         echo "lock $dir: cannot create the lock directory" >&2
         return 1
       fi
@@ -324,10 +423,12 @@ lock_acquire() {
 lock_release() {
   if [ -n "${_lock_held:-}" ]; then
     # Remove the lock this caller created, not whatever the name holds now: a
-    # lock taken over while this caller worked belongs to its new holder.
+    # lock taken over while this caller worked belongs to its new holder. The
+    # rename in _lock_drop_dir keeps a claim another caller is creating inside
+    # the directory from racing its removal.
     if [ "$(_lock_inode "$_lock_dir")" = "${_lock_ino:-}" ] &&
        [ "$(cat "$_lock_dir/pid" 2>/dev/null || true)" = "$$" ]; then
-      rm -rf "$_lock_dir"
+      _lock_drop_dir "$_lock_dir"
     fi
     _lock_held=
     _lock_dir=

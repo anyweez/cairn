@@ -72,6 +72,28 @@ if [ "$code" -ne 0 ]; then
 fi
 chmod 700 "$root"; rm -rf "$root"; root=
 
+# Something at the lock path that is not a directory -- a regular file or a
+# symlink -- is not a lock another caller released, and mkdir cannot replace
+# it. It must be reported at once, not after waiting out the empty-lock
+# window: a fixture run would otherwise sit silent for a minute first.
+for what in file symlink; do
+  root=$(mktemp -d)
+  case $what in
+    file) : >"$root/$name.lock" ;;
+    symlink) ln -s "$root/not-there" "$root/$name.lock" ;;
+  esac
+  acquire_for "$root" 5 ||
+    fail "lock_acquire spun on a $what at $root/$name.lock instead of reporting it"
+  cat "$logs/err"
+  [ "$code" -ne 0 ] ||
+    fail "lock_acquire acquired a lock with a $what at $root/$name.lock"
+  grep -q -- "cannot create the lock directory" "$logs/err" ||
+    fail "a $what at the lock path was not reported as a lock directory that cannot be created"
+  grep -q -- "$name.lock" "$logs/err" ||
+    fail "lock_acquire exited $code without naming the directory it could not use"
+  rm -rf "$root"; root=
+done
+
 # A lock left behind in a directory the caller cannot write: a takeover cannot
 # remove it, so the lock can be neither removed nor created.
 root=$(mktemp -d)
