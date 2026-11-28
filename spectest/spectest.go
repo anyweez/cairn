@@ -526,7 +526,10 @@ func (r *modelRun[MS, S, M, R]) agrees(impl S) spec.Verdict {
 	if _, failed := r.initial.Failed(); failed {
 		return r.initial
 	}
-	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(impl), r.state) })
+	// The model's state is the checker's, not the callback's: Agree is the
+	// natural place to sort a slice so two states compare as multisets, and a
+	// write through it must not change what the next Step computes.
+	v := modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(impl), clone(r.state)) })
 	_, r.diverged = v.Failed()
 	return v
 }
@@ -557,7 +560,7 @@ func (r *modelRun[MS, S, M, R]) step(msg M, result R, refusal *cairn.Refusal, af
 
 func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal, after S) []spec.Verdict {
 	step, ok := guard(func() modelStep[MS, R] {
-		next, want, wantRefusal := r.def.Step(r.state, clone(msg))
+		next, want, wantRefusal := r.def.Step(clone(r.state), clone(msg))
 		return modelStep[MS, R]{next: next, want: want, refusal: wantRefusal}
 	})
 	if !ok {
@@ -575,13 +578,15 @@ func (r *modelRun[MS, S, M, R]) compare(msg M, result R, refusal *cairn.Refusal,
 	}
 	if refusal == nil && wantRefusal == nil {
 		verdicts = append(verdicts, modelChecked("SameResult", func() spec.Verdict {
-			return spec.Check(r.def.SameResult(clone(result), want), "machine returned %+v, model %+v", result, want)
+			// want can share a slice or map with the state Step returned, so
+			// comparing it must not rewrite the model's next state either.
+			return spec.Check(r.def.SameResult(clone(result), clone(want)), "machine returned %+v, model %+v", result, want)
 		}))
 	}
 	if wantRefusal == nil {
 		r.state = next
 	}
-	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(after), r.state) }))
+	return append(verdicts, modelChecked("Agree", func() spec.Verdict { return r.def.Agree(clone(after), clone(r.state)) }))
 }
 
 // ---- report -----------------------------------------------------------------

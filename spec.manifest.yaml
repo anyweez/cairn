@@ -76,6 +76,11 @@ rules:
     status: proposed
     statement: A member whose position endorsed the chosen option records a disagree-and-commit answer.
     package: github.com/anyweez/cairn/examples/decisions
+  - id: ZR1
+    kind: refines
+    status: established
+    statement: The order model's next first item differs from the machine's.
+    package: github.com/anyweez/cairn/spectest_test
 codecs:
   - sum: github.com/anyweez/cairn/examples/decisions.Effect
     name: decision.index_references
